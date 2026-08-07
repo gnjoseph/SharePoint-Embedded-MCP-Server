@@ -43,6 +43,13 @@ afterEach(() => {
 });
 
 describe("plugin release version synchronization", () => {
+  it("stages every manifest changed by the npm version lifecycle", () => {
+    const pkg = readJson<{ scripts: { version: string } }>(join(REPO_ROOT, "package.json"));
+    for (const file of ["plugin.json", "mcp.json", "server.json", "package-lock.json"]) {
+      expect(pkg.scripts.version.split(/\s+/)).toContain(file);
+    }
+  });
+
   it("keeps the checked-in package and plugin versions synchronized", () => {
     execFileSync(process.execPath, [SCRIPT, "--check"], { cwd: REPO_ROOT });
   });
