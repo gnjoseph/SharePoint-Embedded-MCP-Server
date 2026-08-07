@@ -24,10 +24,12 @@ export function synchronizePluginVersion(root, { check = false } = {}) {
   const lockPath = resolve(root, "package-lock.json");
   const pluginPath = resolve(root, "plugin.json");
   const mcpPath = resolve(root, "mcp.json");
+  const serverPath = resolve(root, "server.json");
   const pkg = readJson(packagePath);
   const lock = readJson(lockPath);
   const plugin = readJson(pluginPath);
   const mcp = readJson(mcpPath);
+  const registry = readJson(serverPath);
   const server = mcp.mcpServers?.["sharepoint-embedded"];
 
   if (typeof pkg.version !== "string" || pkg.version.length === 0) {
@@ -50,12 +52,14 @@ export function synchronizePluginVersion(root, { check = false } = {}) {
     lock.version === pkg.version &&
     lock.packages?.[""]?.version === pkg.version &&
     plugin.version === pkg.version &&
+    registry.version === pkg.version &&
+    registry.packages?.every((entry) => entry.version === pkg.version) &&
     server.args[packageIndexes[0]] === packageSpec;
 
   if (check) {
     if (!synchronized) {
       throw new Error(
-        `Plugin version drift: expected package-lock.json and plugin.json ${pkg.version}, and mcp.json ${packageSpec}`,
+        `Plugin version drift: expected package-lock.json, plugin.json, and server.json ${pkg.version}, and mcp.json ${packageSpec}`,
       );
     }
     return false;
@@ -67,10 +71,13 @@ export function synchronizePluginVersion(root, { check = false } = {}) {
   }
   lock.packages[""].version = pkg.version;
   plugin.version = pkg.version;
+  registry.version = pkg.version;
+  for (const entry of registry.packages ?? []) entry.version = pkg.version;
   server.args[packageIndexes[0]] = packageSpec;
   writeFileSync(lockPath, serialized(lock), "utf8");
   writeFileSync(pluginPath, serialized(plugin), "utf8");
   writeFileSync(mcpPath, serialized(mcp), "utf8");
+  writeFileSync(serverPath, serialized(registry), "utf8");
   return !synchronized;
 }
 

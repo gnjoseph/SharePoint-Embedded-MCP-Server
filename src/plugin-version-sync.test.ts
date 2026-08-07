@@ -19,7 +19,7 @@ function readJson<T>(path: string): T {
 function fixture(): string {
   const root = mkdtempSync(join(tmpdir(), "spe-plugin-version-"));
   tempRoots.push(root);
-  for (const file of ["package.json", "plugin.json", "mcp.json"]) {
+  for (const file of ["package.json", "plugin.json", "mcp.json", "server.json"]) {
     cpSync(join(REPO_ROOT, file), join(root, file));
   }
   writeFileSync(
@@ -64,12 +64,18 @@ describe("plugin release version synchronization", () => {
     const mcp = readJson<{
       mcpServers: { "sharepoint-embedded": { args: string[] } };
     }>(join(root, "mcp.json"));
+    const registry = readJson<{
+      version: string;
+      packages: Array<{ version: string }>;
+    }>(join(root, "server.json"));
     expect(plugin.version).toBe("9.8.7-alpha.6");
     expect(lock.version).toBe("9.8.7-alpha.6");
     expect(lock.packages[""].version).toBe("9.8.7-alpha.6");
     expect(mcp.mcpServers["sharepoint-embedded"].args).toContain(
       "@microsoft/spe-mcp@9.8.7-alpha.6",
     );
+    expect(registry.version).toBe("9.8.7-alpha.6");
+    expect(registry.packages.every((entry) => entry.version === "9.8.7-alpha.6")).toBe(true);
   });
 
   it("fails the prepack check when any plugin version drifts", () => {

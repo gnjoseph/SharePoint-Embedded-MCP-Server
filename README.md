@@ -126,7 +126,7 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or
 
 Because clients run the package through `npx`, they pick up published updates
 without a global install. Pin a specific version with
-`@microsoft/spe-mcp@0.1.0-alpha.1`. To remove the server, delete the MCP
+`@microsoft/spe-mcp@0.2.0-alpha.1`. To remove the server, delete the MCP
 client config entry.
 
 ## Prerequisites
@@ -553,12 +553,6 @@ Microsoft takes security seriously. If you believe you have found a security
 vulnerability, please report it privately as described in [SECURITY.md](SECURITY.md) —
 **do not** file a public GitHub issue.
 
-<!--
-  MCP notices. The standardized notice/disclaimer wording for Microsoft MCP servers is
-  owned by frontline CELA (CELA-only guidance: https://aka.ms/MCP4CELA). The text below is
-  a good-faith draft that covers the required topics; the exact MCP disclaimer wording is
-  pending frontline-CELA confirmation for Matter-0000001599.
--->
 ## Important notices
 
 > **Preview software.** `@microsoft/spe-mcp` is an early (alpha) preview released for
