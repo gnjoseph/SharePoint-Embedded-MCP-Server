@@ -11,7 +11,8 @@
         "--read-only",
         "--data-dir",
         "${PLUGIN_DATA}"
-      ]
+      ],
+      "cwd": "${PLUGIN_DATA}"
     }
   }
 }

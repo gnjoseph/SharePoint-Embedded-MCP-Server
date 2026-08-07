@@ -4,12 +4,12 @@
 /**
  * Agent Plugins 1.0 packaging and launch-contract tests.
  *
- * These assertions intentionally mirror the closed 1.0.0 schemas. They remain
- * offline and deterministic while protecting the security-sensitive launch
- * defaults that a plugin client will execute.
+ * Schema assertions use deterministic vendored 1.0.0 schemas. The protocol
+ * regression intentionally exercises the exact immutable npm pin from the
+ * manifest, with bounded fetch and startup timeouts.
  */
-import { execSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -35,6 +35,7 @@ interface StdioServerConfig {
   type: string;
   command: string;
   args: string[];
+  cwd: string;
 }
 
 interface McpManifest {
@@ -55,6 +56,22 @@ interface PackageLock {
 
 function readJson<T>(relativePath: string): T {
   return JSON.parse(readFileSync(join(REPO_ROOT, relativePath), "utf8")) as T;
+}
+
+async function removeDirectoryAfterProcessExit(path: string): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      rmSync(path, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EPERM" || attempt === 19) {
+        throw error;
+      }
+      // On Windows, npm's grandchild can briefly retain its cwd after the MCP
+      // transport closes. Wait for that bounded shutdown before removing state.
+      await delay(250);
+    }
+  }
 }
 
 const plugin = readJson<PluginManifest>("plugin.json");
@@ -122,6 +139,7 @@ describe("Agent Plugins 1.0 packaging contract", () => {
     expect(server).not.toHaveProperty("url");
     expect(server).not.toHaveProperty("headers");
     expect(server.args).toContain("--read-only");
+    expect(server.cwd).toBe("${PLUGIN_DATA}");
     expect(server.args.slice(server.args.indexOf("--data-dir"))).toEqual([
       "--data-dir",
       "${PLUGIN_DATA}",
@@ -147,26 +165,41 @@ describe("Agent Plugins 1.0 packaging contract", () => {
   });
 });
 
-describe("Agent Plugins 1.0 local stdio launch", () => {
+describe("Agent Plugins 1.0 exact manifest stdio launch", () => {
   let client: Client;
   let transport: StdioClientTransport;
   let pluginData: string;
 
   beforeAll(async () => {
-    const cliEntry = join(REPO_ROOT, "dist", "cli.js");
-    if (!existsSync(cliEntry)) {
-      execSync("npm run build", { cwd: REPO_ROOT, stdio: "ignore" });
-    }
-
+    // Vitest starts in the plugin root, reproducing the package-self-resolution
+    // condition that fails on Windows when cwd is omitted. A conforming client
+    // creates PLUGIN_DATA, expands cwd/args, and launches the exact manifest
+    // command from that non-package directory.
+    expect(process.cwd()).toBe(REPO_ROOT);
     pluginData = mkdtempSync(join(tmpdir(), "spe-agent-plugin-data-"));
-    const launchArgs = server.args
-      .slice(2)
-      .map((arg: string) => arg.replaceAll("${PLUGIN_DATA}", pluginData));
+    const launchArgs = server.args.map((arg: string) =>
+      arg.replaceAll("${PLUGIN_DATA}", pluginData),
+    );
+    const launchCwd = server.cwd.replaceAll("${PLUGIN_DATA}", pluginData);
+    expect(launchCwd).toBe(pluginData);
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    );
+    env.PLUGIN_ROOT = REPO_ROOT;
+    env.PLUGIN_DATA = pluginData;
+    env.npm_config_audit = "false";
+    env.npm_config_fetch_retries = "0";
+    env.npm_config_fetch_timeout = "15000";
+    env.npm_config_fund = "false";
+    env.npm_config_update_notifier = "false";
 
     transport = new StdioClientTransport({
-      command: process.execPath,
-      args: [cliEntry, ...launchArgs],
-      cwd: REPO_ROOT,
+      command: server.command,
+      args: launchArgs,
+      cwd: launchCwd,
+      env,
       stderr: "ignore",
     });
     client = new Client({ name: "spe-agent-plugin-contract", version: "1.0.0" }, {});
@@ -176,10 +209,12 @@ describe("Agent Plugins 1.0 local stdio launch", () => {
   afterAll(async () => {
     await client?.close().catch(() => undefined);
     await transport?.close().catch(() => undefined);
-    if (pluginData) rmSync(pluginData, { recursive: true, force: true });
+    if (pluginData) {
+      await removeDirectoryAfterProcessExit(pluginData);
+    }
   });
 
-  it("starts over stdio and advertises only read-only tools", async () => {
+  it("starts the exact pinned npx command and advertises only read-only tools", async () => {
     expect(client.getServerVersion()?.name).toBe("spe-mcp-server");
     const { tools } = await client.listTools(undefined, { timeout: 8000 });
     expect(tools.length).toBeGreaterThan(0);

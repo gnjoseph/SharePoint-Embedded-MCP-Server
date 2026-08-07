@@ -14,7 +14,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   token/state files in the client-managed `${PLUGIN_DATA}` directory. Includes
   schema, packaging, startup, and security-contract tests plus installation and
   removal documentation. No skills, remote transport, OAuth, hooks, agents, or
-  server behavior changes are included.
+  server behavior changes are included. The subprocess also uses
+  `${PLUGIN_DATA}` as its working directory so `npx` cannot confuse the plugin
+  source root with an installed package on Windows.
 - **Release-safe plugin stamping and schema validation.** The npm version and
   prepack lifecycle now keep `package.json`, `plugin.json`, and the exact MCP
   package pin synchronized for prerelease and official packages. Manifest tests

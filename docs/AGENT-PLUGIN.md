@@ -53,6 +53,11 @@ When enabled, the client reads `mcp.json` and starts:
 npx -y @microsoft/spe-mcp@0.2.0-alpha.1 start --read-only --data-dir ${PLUGIN_DATA}
 ```
 
+The client expands `cwd` to `${PLUGIN_DATA}` before launch. This avoids npm
+self-package resolution when the plugin root is itself the
+`@microsoft/spe-mcp` source tree, while preserving the exact command and local
+`stdio` transport.
+
 The exact npm version was verified as published on August 7, 2026. It is
 intentionally pinned: plugin updates, not npm dist-tag movement, control server
 updates.
@@ -94,6 +99,9 @@ for each installed plugin and preserve it across plugin updates. The standard
 expands `${PLUGIN_DATA}` in `args`; it does not expand placeholders in
 `command`. Accordingly, `mcp.json` keeps `command` as the single executable
 token `npx` and passes `${PLUGIN_DATA}` as the separate value for `--data-dir`.
+It also uses `${PLUGIN_DATA}` as `cwd`; the standard requires clients to create
+that directory before launching the subprocess and supports placeholder
+expansion in `cwd` on Windows, macOS, and Linux.
 
 The SPE MCP server stores its token cache and provisioning state under that
 directory. Disabling the plugin stops the MCP process but preserves this state.
