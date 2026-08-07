@@ -92,6 +92,12 @@ The contract tests validate the closed 1.0.0 manifest fields, exact npm pin,
 package/lockfile alignment, local stdio startup, read-only tool exposure, and
 `${PLUGIN_DATA}` configuration.
 
+The authoritative Agent Plugins 1.0 JSON schemas are vendored under
+`schemas/agent-plugins/1.0.0` for deterministic offline validation. They are
+unmodified Apache-2.0 software material and are excluded from the npm package.
+The npm `version` lifecycle synchronizes `plugin.json` and the exact package pin
+in `mcp.json`; `prepack` fails if a release stamp leaves them out of sync.
+
 ## Disable, remove, or roll back
 
 Disable or uninstall **sharepoint-embedded-mcp** from the client's Agent

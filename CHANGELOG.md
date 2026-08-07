@@ -15,6 +15,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   schema, packaging, startup, and security-contract tests plus installation and
   removal documentation. No skills, remote transport, OAuth, hooks, agents, or
   server behavior changes are included.
+- **Release-safe plugin stamping and schema validation.** The npm version and
+  prepack lifecycle now keep `package.json`, `plugin.json`, and the exact MCP
+  package pin synchronized for prerelease and official packages. Manifest tests
+  validate against vendored, authoritative Agent Plugins 1.0 schemas. Safe
+  transitive lockfile updates clear all high-severity npm audit findings.
 
 ## [0.2.0-alpha.1]
 
