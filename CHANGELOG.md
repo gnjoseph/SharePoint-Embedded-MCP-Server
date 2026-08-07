@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Agent Plugins 1.0 MCP-only pilot.** Repository-level `plugin.json` and
+  `mcp.json` launch the exact published `@microsoft/spe-mcp@0.2.0-alpha.1`
+  package over local `stdio`, default to `--read-only`, and keep plugin-owned
+  token/state files in the client-managed `${PLUGIN_DATA}` directory. Includes
+  schema, packaging, startup, and security-contract tests plus installation and
+  removal documentation. No skills, remote transport, OAuth, hooks, agents, or
+  server behavior changes are included.
+
 ## [0.2.0-alpha.1]
 
 ### Added
