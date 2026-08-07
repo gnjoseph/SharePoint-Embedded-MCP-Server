@@ -131,6 +131,20 @@ describe("Agent Plugins 1.0 packaging contract", () => {
     expect(plugin).not.toHaveProperty("hooks");
     expect(plugin).not.toHaveProperty("oauth");
   });
+
+  it("documents a branch-aware pilot install without claiming main is ready", () => {
+    const docs = readFileSync(join(REPO_ROOT, "docs", "AGENT-PLUGIN.md"), "utf8");
+    const futureHeading = docs.indexOf("## Install from the repository after merge to main");
+    const sourceCommand = docs.indexOf("Chat: Install Plugin From");
+
+    expect(docs).toContain("git fetch origin pull/82/head:pilot/agent-plugin");
+    expect(docs).toContain("git switch pilot/agent-plugin");
+    expect(docs).toContain("chat.pluginLocations");
+    expect(docs).toContain("MCP: List Servers");
+    expect(futureHeading).toBeGreaterThan(0);
+    expect(sourceCommand).toBeGreaterThan(futureHeading);
+    expect(docs).toContain("do not use until the plugin manifests reach the default");
+  });
 });
 
 describe("Agent Plugins 1.0 local stdio launch", () => {

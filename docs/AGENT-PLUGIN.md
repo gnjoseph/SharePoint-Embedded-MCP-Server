@@ -5,7 +5,7 @@ that provides one local SharePoint Embedded MCP server. The pilot is additive:
 it does not change the server, add skills, agents, hooks, OAuth, or a remote
 transport.
 
-## Install and use
+## Install the pilot before merge
 
 Prerequisites:
 
@@ -15,14 +15,25 @@ Prerequisites:
 - an Agent Plugins 1.0 client, such as a current VS Code release with
   `chat.plugins.enabled`
 
-In VS Code, run **Chat: Install Plugin From Source** and enter:
+The pilot manifests are currently on PR
+[#82](https://github.com/microsoft/SharePoint-Embedded-MCP-Server/pull/82),
+not on the repository's default `main` branch. Clone the canonical repository
+and check out the PR head explicitly:
 
-```text
-https://github.com/microsoft/SharePoint-Embedded-MCP-Server
+```bash
+git clone https://github.com/microsoft/SharePoint-Embedded-MCP-Server.git
+cd SharePoint-Embedded-MCP-Server
+git fetch origin pull/82/head:pilot/agent-plugin
+git switch pilot/agent-plugin
+git show --no-patch --oneline HEAD
+test -f plugin.json && test -f mcp.json
 ```
 
-For local development, register the repository root with
-`chat.pluginLocations`:
+On PowerShell, use `Test-Path .\plugin.json` and
+`Test-Path .\mcp.json` for the final check.
+
+Register the absolute path of that checked-out repository with the supported
+VS Code `chat.pluginLocations` setting:
 
 ```json
 {
@@ -31,6 +42,10 @@ For local development, register the repository root with
   }
 }
 ```
+
+Reload VS Code, then run **MCP: List Servers** and confirm
+`sharepoint-embedded` appears. The registered directory must remain checked out
+at the PR head while testing the pilot.
 
 When enabled, the client reads `mcp.json` and starts:
 
@@ -41,6 +56,20 @@ npx -y @microsoft/spe-mcp@0.2.0-alpha.1 start --read-only --data-dir ${PLUGIN_DA
 The exact npm version was verified as published on August 7, 2026. It is
 intentionally pinned: plugin updates, not npm dist-tag movement, control server
 updates.
+
+## Install from the repository after merge to main
+
+**Future instruction — do not use until the plugin manifests reach the default
+`main` branch.** After that merge, VS Code's **Chat: Install Plugin From
+Source** command can use:
+
+```text
+https://github.com/microsoft/SharePoint-Embedded-MCP-Server
+```
+
+Before the merge, that plain URL resolves `main`, where the plugin manifests
+are absent, so use the explicit PR checkout and `chat.pluginLocations` flow
+above.
 
 ## Security boundaries
 
