@@ -8,6 +8,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Bounded install-source attribution.** The `start` command accepts optional
+  `--install-source`, `--install-content`, and `--install-campaign` arguments (plus
+  environment-variable equivalents) and appends their validated, non-personal labels to
+  the existing Graph/ARM request `User-Agent`. `--no-install-attribution` provides an
+  explicit opt-out. The README install links declare `github-readme` as their source.
 - **Per-instance data directory.** New `--data-dir <path>` flag and `SPE_DATA_DIR`
   environment variable select where the provisioning `state.json` and MSAL token
   cache are stored (precedence: flag > env > default `~/.spe-mcp`). Point each

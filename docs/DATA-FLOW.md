@@ -48,6 +48,7 @@ These never leave your machine:
 
 ## Telemetry
 
-The server opens **no telemetry channel** and sends **no usage analytics**. Outbound requests
-carry only a static product `User-Agent` (`spe-mcp-server/<version>`) with no personal,
-tenant, or usage data. See [PRIVACY.md](../PRIVACY.md) for details.
+The server opens **no telemetry channel** and sends **no event-level usage analytics**.
+Outbound requests carry a product `User-Agent` (`spe-mcp-server/<version>`). Install configurations can add
+bounded source, content, and campaign labels with no personal or tenant identifiers; users
+can omit them with `--no-install-attribution`. See [PRIVACY.md](../PRIVACY.md) for details.

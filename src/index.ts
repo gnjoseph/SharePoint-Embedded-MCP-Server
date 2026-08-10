@@ -26,7 +26,7 @@ import { initializeAuth, setAuthConfig } from "./auth.js";
 import { assertAzCli, getSignedInIdentity } from "./bootstrap.js";
 import { byoAppStartupNote, azLoginNotSignedInMessage } from "./onboarding-messages.js";
 import { readState } from "./state.js";
-import { USER_AGENT } from "./user-agent.js";
+import { appendUserAgent, getUserAgent, setInstallAttribution } from "./user-agent.js";
 import { PACKAGE_VERSION } from "./version.js";
 import type { McpTool, ServerConfig } from "./types.js";
 import { createLogger } from "./logger.js";
@@ -391,6 +391,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 
 export async function startServer(config: ServerConfig) {
   log("Starting SharePoint Embedded MCP Server...");
+  setInstallAttribution(config.installAttribution);
 
   // SAFE-003 (read-only mode) / SAFE-004 (tool allowlist): build the tool policy
   // once from config (read-only mode and/or an allowlist profile or CSV). When
@@ -407,12 +408,13 @@ export async function startServer(config: ServerConfig) {
     );
   }
 
-  // Stamp outbound `az` / `azd` traffic for aggregate attribution. The Azure
-  // CLI and Developer CLI append AZURE_HTTP_USER_AGENT to their User-Agent on
-  // every ARM request. Respect any value the user already set.
-  if (!process.env.AZURE_HTTP_USER_AGENT) {
-    process.env.AZURE_HTTP_USER_AGENT = USER_AGENT;
-  }
+  // The Azure CLI and Developer CLI append AZURE_HTTP_USER_AGENT to every ARM
+  // request. Preserve any caller-supplied value while adding this product's
+  // bounded product/install tokens.
+  process.env.AZURE_HTTP_USER_AGENT = appendUserAgent(
+    process.env.AZURE_HTTP_USER_AGENT,
+    getUserAgent(),
+  );
 
   // Connect transport first so MCP `initialize` handshake works immediately
   const transport = new StdioServerTransport();

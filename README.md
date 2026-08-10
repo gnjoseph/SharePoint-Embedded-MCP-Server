@@ -71,6 +71,17 @@ The server exposes **40 tools**, plus an MCP **Prompt** (`provision_spe_app`) an
 Run the published npm package directly from your MCP client with `npx`; no
 global install is required.
 
+### One-click install
+
+[Install in Visual Studio Code](https://vscode.dev/redirect?url=vscode:mcp/install?%7B%22name%22%3A%22spe%22%2C%22type%22%3A%22stdio%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40microsoft%2Fspe-mcp%22%2C%22start%22%2C%22--install-source%22%2C%22github-readme%22%2C%22--install-content%22%2C%22readme-install%22%2C%22--install-campaign%22%2C%22docs-install-buttons%22%5D%7D)
+
+One-click install is also available for [Visual Studio Code Insiders](https://vscode.dev/redirect?url=vscode-insiders:mcp/install?%7B%22name%22%3A%22spe%22%2C%22type%22%3A%22stdio%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40microsoft%2Fspe-mcp%22%2C%22start%22%2C%22--install-source%22%2C%22github-readme%22%2C%22--install-content%22%2C%22readme-install%22%2C%22--install-campaign%22%2C%22docs-install-buttons%22%5D%7D), [Visual Studio](https://aka.ms/vs/mcp-install?%7B%22name%22%3A%22spe%22%2C%22type%22%3A%22stdio%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40microsoft%2Fspe-mcp%22%2C%22start%22%2C%22--install-source%22%2C%22github-readme%22%2C%22--install-content%22%2C%22readme-install%22%2C%22--install-campaign%22%2C%22docs-install-buttons%22%5D%7D), and [Cursor](https://cursor.com/install-mcp?name=spe&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBtaWNyb3NvZnQvc3BlLW1jcCIsInN0YXJ0IiwiLS1pbnN0YWxsLXNvdXJjZSIsImdpdGh1Yi1yZWFkbWUiLCItLWluc3RhbGwtY29udGVudCIsInJlYWRtZS1pbnN0YWxsIiwiLS1pbnN0YWxsLWNhbXBhaWduIiwiZG9jcy1pbnN0YWxsLWJ1dHRvbnMiXX0). From the command line, run `claude mcp add spe -- npx -y @microsoft/spe-mcp start --install-source github-readme --install-content readme-install --install-campaign docs-install-buttons` for Claude Code or `codex mcp add spe -- npx -y @microsoft/spe-mcp start --install-source github-readme --install-content readme-install --install-campaign docs-install-buttons` for the Codex CLI.
+
+These configurations add bounded, non-personal install-source labels to the
+existing Graph and Azure request `User-Agent`; they create no separate telemetry
+channel. Remove the three install-attribution arguments, or add
+`--no-install-attribution`, to omit the labels.
+
 ### VS Code / Cursor
 
 Add an MCP server entry to `.vscode/mcp.json` (VS Code) or your Cursor MCP
@@ -82,7 +93,17 @@ configuration:
     "spe": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@microsoft/spe-mcp"]
+      "args": [
+        "-y",
+        "@microsoft/spe-mcp",
+        "start",
+        "--install-source",
+        "github-readme",
+        "--install-content",
+        "readme-install",
+        "--install-campaign",
+        "docs-install-buttons"
+      ]
     }
   }
 }
@@ -100,7 +121,17 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or
   "mcpServers": {
     "spe": {
       "command": "npx",
-      "args": ["-y", "@microsoft/spe-mcp"]
+      "args": [
+        "-y",
+        "@microsoft/spe-mcp",
+        "start",
+        "--install-source",
+        "github-readme",
+        "--install-content",
+        "readme-install",
+        "--install-campaign",
+        "docs-install-buttons"
+      ]
     }
   }
 }
@@ -191,6 +222,10 @@ The server accepts configuration via CLI flags or environment variables:
 | `--tenant-id` | `SPE_TENANT_ID` | Entra ID Tenant ID |
 | `--read-only` | `SPE_READ_ONLY` | Advertise/allow only read/list/get/search tools; reject mutating calls |
 | `--tools` | `SPE_TOOLS` | Restrict exposed tools to a profile (`readOnly`, `docsOnly`, `provisioning`, `content`, `admin`) or a comma-separated tool list |
+| `--install-source` | `SPE_INSTALL_SOURCE` | Optional bounded install surface: `microsoft-learn`, `github-readme`, `github-release`, `mcp-registry`, `npm`, or `other` |
+| `--install-content` | `SPE_INSTALL_CONTENT` | Optional bounded content identifier: `readme-install`, `sharepoint-embedded-mcp-server`, `quickstart-vscode`, `create-container-type`, or `create-manage-containers`; requires an install source |
+| `--install-campaign` | `SPE_INSTALL_CAMPAIGN` | Optional bounded campaign identifier: `docs-install-buttons`; requires an install source |
+| `--no-install-attribution` | `SPE_INSTALL_ATTRIBUTION=off` | Omit install-source labels from outbound request metadata |
 | `--data-dir` | `SPE_DATA_DIR` | Directory for the token cache + provisioning state (default `~/.spe-mcp`). Point each instance at a unique **absolute** path (or `~/...`; CWD-relative paths are rejected) to run multiple servers without clobbering state |
 
 > The CLI flag wins when both a flag and its env var are set. Run
@@ -271,7 +306,7 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or `~/Library/App
 
 ```bash
 # Start the MCP server (stdio transport)
-spe-mcp start [--client-id ID] [--tenant-id ID] [--read-only] [--tools <profileOrCsv>]
+spe-mcp start [--client-id ID] [--tenant-id ID] [--read-only] [--tools <profileOrCsv>] [--install-source <source>]
 
 # Authenticate interactively (cache tokens for headless use)
 spe-mcp auth --client-id ID --tenant-id ID [--reset]
@@ -289,6 +324,10 @@ Every command has built-in help — run `spe-mcp <command> --help` (e.g.
 | `--tenant-id <id>` | Entra ID Tenant ID. Discovered from the Azure CLI when omitted. |
 | `--read-only` | Read-only mode: only read/list/get/search tools are exposed and callable. |
 | `--tools <profileOrCsv>` | Tool allowlist: a profile (`readOnly`, `docsOnly`, `provisioning`, `content`, `admin`) or a comma-separated list of tool names. |
+| `--install-source <source>` | Add a bounded install surface to the existing Graph/ARM request `User-Agent`. |
+| `--install-content <id>` | Add one of the bounded content identifiers listed in [Configuration](#configuration); requires `--install-source`. |
+| `--install-campaign <id>` | Add the bounded `docs-install-buttons` campaign identifier; requires `--install-source`. |
+| `--no-install-attribution` | Omit install-source labels even when they are present in the client configuration or environment. |
 
 ## Authentication
 
@@ -335,12 +374,32 @@ The data directory holds a single provisioning `state.json` plus the token cache
   "servers": {
     "spe-tenantA": {
       "command": "npx",
-      "args": ["-y", "@microsoft/spe-mcp", "start"],
+      "args": [
+        "-y",
+        "@microsoft/spe-mcp",
+        "start",
+        "--install-source",
+        "github-readme",
+        "--install-content",
+        "readme-install",
+        "--install-campaign",
+        "docs-install-buttons"
+      ],
       "env": { "SPE_DATA_DIR": "~/.spe-mcp-tenantA", "SPE_TENANT_ID": "<tenant-A>" }
     },
     "spe-tenantB": {
       "command": "npx",
-      "args": ["-y", "@microsoft/spe-mcp", "start"],
+      "args": [
+        "-y",
+        "@microsoft/spe-mcp",
+        "start",
+        "--install-source",
+        "github-readme",
+        "--install-content",
+        "readme-install",
+        "--install-campaign",
+        "docs-install-buttons"
+      ],
       "env": { "SPE_DATA_DIR": "~/.spe-mcp-tenantB", "SPE_TENANT_ID": "<tenant-B>" }
     }
   }
@@ -586,11 +645,12 @@ Resource Manager — **on your behalf**; the content and directory data involved
 between your machine, your MCP client, and those Microsoft services in your own
 tenant/subscription.
 
-The server opens **no separate telemetry channel** and sends **no usage analytics** to
-Microsoft. Outbound Graph/ARM requests carry a **static product `User-Agent`**
-(`spe-mcp-server/<version>`) that contains **no personal, tenant, or usage data** and is
-used only for aggregate traffic attribution. Authentication tokens are cached locally with
-owner-only permissions (**SEC-003**). For details see [PRIVACY.md](PRIVACY.md) and
+The server opens **no separate telemetry channel** and sends **no event-level usage
+analytics** to Microsoft. Outbound Graph/ARM requests carry a product `User-Agent`
+(`spe-mcp-server/<version>`). An install configuration can add bounded source, content,
+and campaign labels; these contain no personal or tenant identifiers and can be omitted
+with `--no-install-attribution`. Authentication tokens are cached locally with owner-only
+permissions (**SEC-003**). For details see [PRIVACY.md](PRIVACY.md) and
 [docs/DATA-FLOW.md](docs/DATA-FLOW.md); Microsoft's handling of data you send to its online
 services is described in the
 [Microsoft Privacy Statement](https://privacy.microsoft.com/privacystatement).
