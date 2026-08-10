@@ -645,11 +645,12 @@ Resource Manager — **on your behalf**; the content and directory data involved
 between your machine, your MCP client, and those Microsoft services in your own
 tenant/subscription.
 
-The server opens **no separate telemetry channel** and sends **no event-level usage
-analytics** to Microsoft. Outbound Graph/ARM requests carry a product `User-Agent`
-(`spe-mcp-server/<version>`). An install configuration can add bounded source, content,
-and campaign labels; these contain no personal or tenant identifiers and can be omitted
-with `--no-install-attribution`. Authentication tokens are cached locally with owner-only
+The server opens **no separate telemetry channel**. Each authenticated Graph/ARM request
+carries a product `User-Agent` (`spe-mcp-server/<version>`). An install configuration can
+add bounded source, content, and campaign labels to that request header. The labels
+contain no personal or tenant identifiers, but Microsoft services can associate them
+with the authenticated request in normal service logs. Omit them with
+`--no-install-attribution`. Authentication tokens are cached locally with owner-only
 permissions (**SEC-003**). For details see [PRIVACY.md](PRIVACY.md) and
 [docs/DATA-FLOW.md](docs/DATA-FLOW.md); Microsoft's handling of data you send to its online
 services is described in the

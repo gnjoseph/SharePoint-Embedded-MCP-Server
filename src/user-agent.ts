@@ -143,6 +143,20 @@ export function appendUserAgent(existing: string | undefined, value: string): st
   return [...preserved, value].join(" ");
 }
 
+export function configureAzureUserAgentEnvironment(
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  const userAgent = getUserAgent();
+  env.AZURE_HTTP_USER_AGENT = appendUserAgent(
+    env.AZURE_HTTP_USER_AGENT,
+    userAgent,
+  );
+  env.AZURE_DEV_USER_AGENT = appendUserAgent(
+    env.AZURE_DEV_USER_AGENT,
+    userAgent,
+  );
+}
+
 export const __testing = {
   reset(): void {
     activeAttribution = undefined;

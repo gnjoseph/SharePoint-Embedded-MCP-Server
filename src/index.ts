@@ -26,7 +26,10 @@ import { initializeAuth, setAuthConfig } from "./auth.js";
 import { assertAzCli, getSignedInIdentity } from "./bootstrap.js";
 import { byoAppStartupNote, azLoginNotSignedInMessage } from "./onboarding-messages.js";
 import { readState } from "./state.js";
-import { appendUserAgent, getUserAgent, setInstallAttribution } from "./user-agent.js";
+import {
+  configureAzureUserAgentEnvironment,
+  setInstallAttribution,
+} from "./user-agent.js";
 import { PACKAGE_VERSION } from "./version.js";
 import type { McpTool, ServerConfig } from "./types.js";
 import { createLogger } from "./logger.js";
@@ -408,13 +411,9 @@ export async function startServer(config: ServerConfig) {
     );
   }
 
-  // The Azure CLI and Developer CLI append AZURE_HTTP_USER_AGENT to every ARM
-  // request. Preserve any caller-supplied value while adding this product's
-  // bounded product/install tokens.
-  process.env.AZURE_HTTP_USER_AGENT = appendUserAgent(
-    process.env.AZURE_HTTP_USER_AGENT,
-    getUserAgent(),
-  );
+  // Azure CLI (`az`) and Azure Developer CLI (`azd`) consume different
+  // User-Agent environment variables. Preserve caller values in both.
+  configureAzureUserAgentEnvironment();
 
   // Connect transport first so MCP `initialize` handshake works immediately
   const transport = new StdioServerTransport();

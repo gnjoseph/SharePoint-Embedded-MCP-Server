@@ -6,6 +6,7 @@ import {
   USER_AGENT,
   __testing,
   appendUserAgent,
+  configureAzureUserAgentEnvironment,
   getUserAgent,
   resolveInstallAttribution,
   setInstallAttribution,
@@ -85,5 +86,28 @@ describe("install attribution User-Agent", () => {
         `${USER_AGENT} spe-install-source/github-readme`,
       ),
     ).toBe(`caller/1.0 ${USER_AGENT} spe-install-source/github-readme`);
+  });
+
+  it("configures both az and azd User-Agent environment variables", () => {
+    setInstallAttribution(
+      resolveInstallAttribution({
+        source: "github-readme",
+        content: "readme-install",
+        campaign: "docs-install-buttons",
+      }),
+    );
+    const env: NodeJS.ProcessEnv = {
+      AZURE_HTTP_USER_AGENT: "existing-az/1.0",
+      AZURE_DEV_USER_AGENT: "existing-azd/1.0",
+    };
+
+    configureAzureUserAgentEnvironment(env);
+
+    expect(env.AZURE_HTTP_USER_AGENT).toMatch(
+      /^existing-az\/1\.0 spe-mcp-server\/\S+ spe-install-source\/github-readme/,
+    );
+    expect(env.AZURE_DEV_USER_AGENT).toMatch(
+      /^existing-azd\/1\.0 spe-mcp-server\/\S+ spe-install-source\/github-readme/,
+    );
   });
 });

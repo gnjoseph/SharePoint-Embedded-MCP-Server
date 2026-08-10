@@ -48,7 +48,9 @@ These never leave your machine:
 
 ## Telemetry
 
-The server opens **no telemetry channel** and sends **no event-level usage analytics**.
-Outbound requests carry a product `User-Agent` (`spe-mcp-server/<version>`). Install configurations can add
-bounded source, content, and campaign labels with no personal or tenant identifiers; users
-can omit them with `--no-install-attribution`. See [PRIVACY.md](../PRIVACY.md) for details.
+The server opens **no separate telemetry channel**. Each authenticated Graph/ARM request
+carries a product `User-Agent` (`spe-mcp-server/<version>`). Install configurations can
+add bounded source, content, and campaign labels to that request header. The labels contain
+no personal or tenant identifiers, but Microsoft services can associate them with the
+authenticated request in normal service logs. Users can omit them with
+`--no-install-attribution`. See [PRIVACY.md](../PRIVACY.md) for details.

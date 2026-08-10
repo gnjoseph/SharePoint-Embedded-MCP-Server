@@ -9,8 +9,7 @@ organization's agreements with Microsoft.
 
 ## What the tool collects and sends
 
-**The tool does not collect event-level usage analytics, and it opens no dedicated
-telemetry channel to send data to Microsoft.** Specifically:
+**The tool opens no dedicated telemetry channel to send data to Microsoft.** Specifically:
 
 - **No telemetry channel.** The tool does not implement application telemetry and does not
   "phone home." Diagnostic logs are written to the local process's **stderr only**, with
@@ -27,9 +26,10 @@ telemetry channel to send data to Microsoft.** Specifically:
 - **Product and install-source `User-Agent`.** Outbound Graph/ARM requests are stamped
   with `spe-mcp-server/<version>` (`src/user-agent.ts`). Install links can also configure
   bounded source, content, and campaign labels such as `microsoft-learn` and an article
-  slug. The labels contain **no personal or tenant identifiers** and exist only so the
-  service can measure aggregate traffic driven by published install surfaces. They ride
-  on calls you already make and are not a separate data feed.
+  slug. The labels contain **no personal or tenant identifiers**, but they accompany
+  each authenticated request and Microsoft services can associate them with that request
+  in normal service logs. They exist so the service can measure aggregate traffic driven
+  by published install surfaces; they are not a separate data feed.
 
 See [docs/DATA-FLOW.md](docs/DATA-FLOW.md) for the full list of network endpoints and what
 travels to each.
