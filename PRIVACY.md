@@ -26,10 +26,12 @@ organization's agreements with Microsoft.
 - **Product and install-source `User-Agent`.** Outbound Graph/ARM requests are stamped
   with `spe-mcp-server/<version>` (`src/user-agent.ts`). Install links can also configure
   bounded source, content, and campaign labels such as `microsoft-learn` and an article
-  slug. The labels contain **no personal or tenant identifiers**, but they accompany
-  each authenticated request and Microsoft services can associate them with that request
-  in normal service logs. They exist so the service can measure aggregate traffic driven
-  by published install surfaces; they are not a separate data feed.
+  slug. The MCP handshake's self-reported client name is mapped to a bounded agent-host
+  label; the raw name and client version are not transmitted in the request metadata.
+  These labels contain **no personal or tenant identifiers**, but they accompany each
+  authenticated request and Microsoft services can associate them with that request in
+  normal service logs. They exist so the service can measure aggregate traffic driven by
+  published install surfaces and agent hosts; they are not a separate data feed.
 
 See [docs/DATA-FLOW.md](docs/DATA-FLOW.md) for the full list of network endpoints and what
 travels to each.
@@ -55,7 +57,8 @@ terms, which are outside the control of this project.
 Because the tool has no telemetry channel, there is no separate telemetry stream to opt out
 of. To omit install-source labels from existing API requests, remove the
 `--install-source`, `--install-content`, and `--install-campaign` arguments from the MCP
-client configuration or add `--no-install-attribution`. To further limit outbound calls,
+client configuration. To omit both install-source and agent-host labels, add
+`--no-install-attribution`. To further limit outbound calls,
 run with `--read-only` (no mutating operations) or `--tools` (restrict the exposed tool
 set, including the optional Microsoft Learn documentation lookup). See
 [docs/DATA-FLOW.md](docs/DATA-FLOW.md) and

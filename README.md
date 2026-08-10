@@ -82,6 +82,13 @@ existing Graph and Azure request `User-Agent`; they create no separate telemetry
 channel. Remove the three install-attribution arguments, or add
 `--no-install-attribution`, to omit the labels.
 
+After the MCP handshake, the server also maps the client's self-reported
+`clientInfo.name` to a bounded agent-host value such as `vscode`, `cursor`, or
+`claude-code`. Unrecognized names become `other`; missing or generic SDK values
+become `unknown`. The raw client name and client version are not transmitted, and
+the classification is used only for attribution—not for authorization or any
+security decision.
+
 ### VS Code / Cursor
 
 Add an MCP server entry to `.vscode/mcp.json` (VS Code) or your Cursor MCP
@@ -225,7 +232,7 @@ The server accepts configuration via CLI flags or environment variables:
 | `--install-source` | `SPE_INSTALL_SOURCE` | Optional bounded install surface: `microsoft-learn`, `github-readme`, `github-release`, `mcp-registry`, `npm`, or `other` |
 | `--install-content` | `SPE_INSTALL_CONTENT` | Optional bounded content identifier: `readme-install`, `sharepoint-embedded-mcp-server`, `quickstart-vscode`, `create-container-type`, or `create-manage-containers`; requires an install source |
 | `--install-campaign` | `SPE_INSTALL_CAMPAIGN` | Optional bounded campaign identifier: `docs-install-buttons`; requires an install source |
-| `--no-install-attribution` | `SPE_INSTALL_ATTRIBUTION=off` | Omit install-source labels from outbound request metadata |
+| `--no-install-attribution` | `SPE_INSTALL_ATTRIBUTION=off` | Omit install-source and agent-host labels from outbound request metadata |
 | `--data-dir` | `SPE_DATA_DIR` | Directory for the token cache + provisioning state (default `~/.spe-mcp`). Point each instance at a unique **absolute** path (or `~/...`; CWD-relative paths are rejected) to run multiple servers without clobbering state |
 
 > The CLI flag wins when both a flag and its env var are set. Run
@@ -327,7 +334,7 @@ Every command has built-in help — run `spe-mcp <command> --help` (e.g.
 | `--install-source <source>` | Add a bounded install surface to the existing Graph/ARM request `User-Agent`. |
 | `--install-content <id>` | Add one of the bounded content identifiers listed in [Configuration](#configuration); requires `--install-source`. |
 | `--install-campaign <id>` | Add the bounded `docs-install-buttons` campaign identifier; requires `--install-source`. |
-| `--no-install-attribution` | Omit install-source labels even when they are present in the client configuration or environment. |
+| `--no-install-attribution` | Omit install-source and agent-host labels from outbound request metadata. |
 
 ## Authentication
 
@@ -647,9 +654,10 @@ tenant/subscription.
 
 The server opens **no separate telemetry channel**. Each authenticated Graph/ARM request
 carries a product `User-Agent` (`spe-mcp-server/<version>`). An install configuration can
-add bounded source, content, and campaign labels to that request header. The labels
-contain no personal or tenant identifiers, but Microsoft services can associate them
-with the authenticated request in normal service logs. Omit them with
+add bounded source, content, campaign, and self-reported agent-host labels to that
+request header. The raw MCP client name and version are not sent in these labels.
+The labels contain no personal or tenant identifiers, but Microsoft services can
+associate them with the authenticated request in normal service logs. Omit them with
 `--no-install-attribution`. Authentication tokens are cached locally with owner-only
 permissions (**SEC-003**). For details see [PRIVACY.md](PRIVACY.md) and
 [docs/DATA-FLOW.md](docs/DATA-FLOW.md); Microsoft's handling of data you send to its online

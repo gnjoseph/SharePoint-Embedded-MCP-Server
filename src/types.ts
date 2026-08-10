@@ -107,6 +107,8 @@ export interface ServerConfig {
   tools?: string;
   /** Optional, bounded install-source metadata added to existing Graph/ARM requests. */
   installAttribution?: InstallAttribution;
+  /** Whether install-source and self-reported agent-host attribution are enabled. */
+  attributionEnabled?: boolean;
 }
 
 // ─── Auth Config ─────────────────────────────────────────────────────────────

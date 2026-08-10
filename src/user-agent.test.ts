@@ -6,9 +6,12 @@ import {
   USER_AGENT,
   __testing,
   appendUserAgent,
+  classifyAgentHost,
   configureAzureUserAgentEnvironment,
   getUserAgent,
+  resolveAgentHostAttribution,
   resolveInstallAttribution,
+  setAgentHostAttribution,
   setInstallAttribution,
 } from "./user-agent.js";
 
@@ -28,6 +31,7 @@ describe("install attribution User-Agent", () => {
       content: "sharepoint-embedded-mcp-server",
       campaign: "docs-install-buttons",
     });
+
     setInstallAttribution(attribution);
 
     expect(getUserAgent()).toBe(
@@ -35,6 +39,41 @@ describe("install attribution User-Agent", () => {
         "spe-install-content/sharepoint-embedded-mcp-server " +
         "spe-install-campaign/docs-install-buttons",
     );
+  });
+
+  it.each([
+    ["Visual Studio Code", "vscode"],
+    ["Visual Studio Code - Insiders", "vscode"],
+    ["Code - OSS", "vscode"],
+    ["Code - OSS Dev", "vscode"],
+    ["Cursor", "cursor"],
+    ["claude-code", "claude-code"],
+    ["Claude Code", "claude-code"],
+    ["Claude", "claude-desktop"],
+    ["Claude Desktop", "claude-desktop"],
+    ["claude-ai", "claude-desktop"],
+    ["local-agent-mode-spe", "claude-desktop"],
+    ["OpenAI Codex CLI", "codex"],
+    ["GitHub Copilot CLI", "github-copilot-cli"],
+    ["copilot-cli", "github-copilot-cli"],
+    ["github-copilot-developer", "github-copilot-cli"],
+    ["Microsoft Visual Studio", "visual-studio"],
+    ["Azure AI Foundry", "azure-ai-foundry"],
+    ["mcp", "unknown"],
+    ["", "unknown"],
+    ["Future MCP Host", "other"],
+  ])("classifies MCP clientInfo name %j as %s", (clientName, expected) => {
+    expect(classifyAgentHost(clientName)).toBe(expected);
+  });
+
+  it("adds only the bounded host classification, not raw clientInfo", () => {
+    setAgentHostAttribution(classifyAgentHost("Future MCP Host with user text"));
+    expect(getUserAgent()).toBe(`${USER_AGENT} spe-agent-host/other`);
+    expect(getUserAgent()).not.toContain("future");
+  });
+
+  it("omits agent-host attribution when attribution is disabled", () => {
+    expect(resolveAgentHostAttribution("Visual Studio Code", false)).toBeUndefined();
   });
 
   it("normalizes identifiers and rejects unbounded or unsupported values", () => {
@@ -96,6 +135,7 @@ describe("install attribution User-Agent", () => {
         campaign: "docs-install-buttons",
       }),
     );
+    setAgentHostAttribution("vscode");
     const env: NodeJS.ProcessEnv = {
       AZURE_HTTP_USER_AGENT: "existing-az/1.0",
       AZURE_DEV_USER_AGENT: "existing-azd/1.0",
@@ -104,10 +144,10 @@ describe("install attribution User-Agent", () => {
     configureAzureUserAgentEnvironment(env);
 
     expect(env.AZURE_HTTP_USER_AGENT).toMatch(
-      /^existing-az\/1\.0 spe-mcp-server\/\S+ spe-install-source\/github-readme/,
+      /^existing-az\/1\.0 spe-mcp-server\/\S+ spe-install-source\/github-readme.*spe-agent-host\/vscode/,
     );
     expect(env.AZURE_DEV_USER_AGENT).toMatch(
-      /^existing-azd\/1\.0 spe-mcp-server\/\S+ spe-install-source\/github-readme/,
+      /^existing-azd\/1\.0 spe-mcp-server\/\S+ spe-install-source\/github-readme.*spe-agent-host\/vscode/,
     );
   });
 });

@@ -36,6 +36,21 @@ export const INSTALL_CONTENTS = [
 
 export const INSTALL_CAMPAIGNS = ["docs-install-buttons"] as const;
 
+export const AGENT_HOSTS = [
+  "vscode",
+  "visual-studio",
+  "cursor",
+  "claude-code",
+  "claude-desktop",
+  "codex",
+  "github-copilot-cli",
+  "azure-ai-foundry",
+  "other",
+  "unknown",
+] as const;
+
+export type AgentHost = (typeof AGENT_HOSTS)[number];
+
 export interface InstallAttribution {
   source: InstallSource;
   content?: (typeof INSTALL_CONTENTS)[number];
@@ -51,6 +66,7 @@ export interface InstallAttributionInput {
 
 const ATTRIBUTION_ID_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/;
 let activeAttribution: InstallAttribution | undefined;
+let activeAgentHost: AgentHost | undefined;
 
 function normalizeOptionalId(value: string | undefined, field: string): string | undefined {
   const normalized = value?.trim().toLowerCase();
@@ -118,17 +134,71 @@ export function setInstallAttribution(attribution: InstallAttribution | undefine
   activeAttribution = attribution;
 }
 
-export function getUserAgent(): string {
-  if (!activeAttribution) return USER_AGENT;
+/**
+ * Classify the self-reported MCP `initialize.params.clientInfo.name` into a
+ * bounded analytics dimension. This is advisory attribution only, never a
+ * security signal. Unknown raw values are not transmitted.
+ */
+export function classifyAgentHost(clientName: string | undefined): AgentHost {
+  const name = clientName?.trim().toLowerCase() ?? "";
+  if (!name || name === "mcp") return "unknown";
+  if (
+    name.includes("visual studio code") ||
+    name.startsWith("code - oss")
+  ) {
+    return "vscode";
+  }
+  if (name.includes("cursor")) return "cursor";
+  if (name === "claude-code" || name.includes("claude code")) {
+    return "claude-code";
+  }
+  if (
+    name === "claude" ||
+    name === "claude-ai" ||
+    name.includes("claude desktop") ||
+    name.startsWith("local-agent-mode-")
+  ) {
+    return "claude-desktop";
+  }
+  if (
+    name.includes("github copilot cli") ||
+    name.includes("copilot-cli") ||
+    name === "github-copilot-developer"
+  ) {
+    return "github-copilot-cli";
+  }
+  if (name.includes("codex")) return "codex";
+  if (name.includes("visual studio")) return "visual-studio";
+  if (name.includes("foundry")) return "azure-ai-foundry";
+  return "other";
+}
 
-  const tokens = [`spe-install-source/${activeAttribution.source}`];
-  if (activeAttribution.content) {
-    tokens.push(`spe-install-content/${activeAttribution.content}`);
+export function resolveAgentHostAttribution(
+  clientName: string | undefined,
+  enabled: boolean,
+): AgentHost | undefined {
+  return enabled ? classifyAgentHost(clientName) : undefined;
+}
+
+export function setAgentHostAttribution(agentHost: AgentHost | undefined): void {
+  activeAgentHost = agentHost;
+}
+
+export function getUserAgent(): string {
+  const tokens: string[] = [];
+  if (activeAttribution) {
+    tokens.push(`spe-install-source/${activeAttribution.source}`);
+    if (activeAttribution.content) {
+      tokens.push(`spe-install-content/${activeAttribution.content}`);
+    }
+    if (activeAttribution.campaign) {
+      tokens.push(`spe-install-campaign/${activeAttribution.campaign}`);
+    }
   }
-  if (activeAttribution.campaign) {
-    tokens.push(`spe-install-campaign/${activeAttribution.campaign}`);
+  if (activeAgentHost) {
+    tokens.push(`spe-agent-host/${activeAgentHost}`);
   }
-  return `${USER_AGENT} ${tokens.join(" ")}`;
+  return tokens.length > 0 ? `${USER_AGENT} ${tokens.join(" ")}` : USER_AGENT;
 }
 
 export function appendUserAgent(existing: string | undefined, value: string): string {
@@ -138,7 +208,8 @@ export function appendUserAgent(existing: string | undefined, value: string): st
       !token.startsWith("spe-mcp-server/") &&
       !token.startsWith("spe-install-source/") &&
       !token.startsWith("spe-install-content/") &&
-      !token.startsWith("spe-install-campaign/"),
+      !token.startsWith("spe-install-campaign/") &&
+      !token.startsWith("spe-agent-host/"),
   );
   return [...preserved, value].join(" ");
 }
@@ -160,5 +231,6 @@ export function configureAzureUserAgentEnvironment(
 export const __testing = {
   reset(): void {
     activeAttribution = undefined;
+    activeAgentHost = undefined;
   },
 };

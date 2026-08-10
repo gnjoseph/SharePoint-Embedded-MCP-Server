@@ -28,6 +28,8 @@ import { byoAppStartupNote, azLoginNotSignedInMessage } from "./onboarding-messa
 import { readState } from "./state.js";
 import {
   configureAzureUserAgentEnvironment,
+  resolveAgentHostAttribution,
+  setAgentHostAttribution,
   setInstallAttribution,
 } from "./user-agent.js";
 import { PACKAGE_VERSION } from "./version.js";
@@ -244,6 +246,7 @@ function toListToolEntry(tool: McpTool) {
  * startServer(). See docs/SECURITY-CONTROLS.md for the control-code legend.
  */
 let activePolicy: ResolvedToolPolicy | null = null;
+let attributionEnabled = true;
 
 /** Tools advertised to the client, filtered by the active policy. */
 function listVisibleTools() {
@@ -276,6 +279,22 @@ const server = new Server(
 // boundary where the concrete `Server` meets our interface — rather than
 // importing the SDK request type throughout the codebase.
 wireElicitation(server as unknown as ElicitationCapableServer);
+
+server.oninitialized = () => {
+  const agentHost = resolveAgentHostAttribution(
+    server.getClientVersion()?.name,
+    attributionEnabled,
+  );
+  setAgentHostAttribution(agentHost);
+  // Graph reads the User-Agent lazily per request. Refresh the Azure CLI
+  // variables now so future az/azd child processes carry the host as well.
+  configureAzureUserAgentEnvironment();
+  if (agentHost) {
+    console.error(
+      `[SPE MCP Server] Agent host attribution: ${agentHost} (self-reported MCP clientInfo)`,
+    );
+  }
+};
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   const tools = listVisibleTools();
@@ -394,7 +413,10 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 
 export async function startServer(config: ServerConfig) {
   log("Starting SharePoint Embedded MCP Server...");
-  setInstallAttribution(config.installAttribution);
+  attributionEnabled = config.attributionEnabled ?? true;
+  setInstallAttribution(
+    attributionEnabled ? config.installAttribution : undefined,
+  );
 
   // SAFE-003 (read-only mode) / SAFE-004 (tool allowlist): build the tool policy
   // once from config (read-only mode and/or an allowlist profile or CSV). When

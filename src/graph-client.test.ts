@@ -28,6 +28,7 @@ import {
 import {
   __testing as userAgentTesting,
   resolveInstallAttribution,
+  setAgentHostAttribution,
   setInstallAttribution,
 } from "./user-agent.js";
 
@@ -142,12 +143,13 @@ describe("request attribution", () => {
         campaign: "docs-install-buttons",
       }),
     );
+    setAgentHostAttribution("vscode");
 
     await createApplication("Test App", getToken);
 
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     expect((init.headers as Record<string, string>)["User-Agent"]).toMatch(
-      /spe-mcp-server\/\S+ spe-install-source\/microsoft-learn spe-install-content\/sharepoint-embedded-mcp-server spe-install-campaign\/docs-install-buttons/,
+      /spe-mcp-server\/\S+ spe-install-source\/microsoft-learn spe-install-content\/sharepoint-embedded-mcp-server spe-install-campaign\/docs-install-buttons spe-agent-host\/vscode/,
     );
   });
 });

@@ -135,7 +135,14 @@ program
       // the Azure CLI provides the control-plane token and the owning app is
       // provisioned on demand.
       const { startServer } = await import("./index.js");
-      await startServer({ clientId, tenantId, readOnly, tools, installAttribution });
+      await startServer({
+        clientId,
+        tenantId,
+        readOnly,
+        tools,
+        installAttribution,
+        attributionEnabled,
+      });
     } catch (error) {
       console.error("Failed to start SPE MCP server:");
       if (error instanceof Error) {
