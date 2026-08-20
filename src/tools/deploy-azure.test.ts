@@ -109,6 +109,32 @@ describe("project_deploy", () => {
     expect(r.content[0].text).toContain("subscription-scoped");
   });
 
+  it("passes a punctuation-heavy environment name to azd as one discrete argv element", async () => {
+    // An azd environment name is not the validated az subscription/RG boundary,
+    // so a punctuation-bearing value flows through to azd. It must still reach
+    // the process as a SINGLE argv element (defended by the shell-free launcher),
+    // never split into multiple arguments or interpreted by a shell.
+    const packed = "spe & calc | whoami ; $(x)";
+
+    stateStore.azureSubscriptionId = "sub-123";
+    stateStore.containerTypeId = "ct-456";
+
+    const r = await deployAzureTool.handler({ projectDir: "/proj", environmentName: packed, location: "eastus" });
+
+    expect(r.isError).toBeFalsy();
+    expect(runCommand).toHaveBeenCalledTimes(1);
+    const [cmd, args, opts] = vi.mocked(runCommand).mock.calls[0] as unknown as [
+      string,
+      string[],
+      { env?: NodeJS.ProcessEnv },
+    ];
+    expect(cmd).toBe("azd");
+    expect(args).toEqual(["up", "--no-prompt", "--environment", packed]);
+    expect(args[3]).toBe(packed); // one discrete element, unmodified
+    expect(opts.env?.AZURE_ENV_NAME).toBe(packed);
+    expect(opts).not.toHaveProperty("shell");
+  });
+
   it("retries the deploy alone when azd up loses the Resource Graph indexing race", async () => {
     vi.useFakeTimers();
     runImpl = async (_cmd, args) => {

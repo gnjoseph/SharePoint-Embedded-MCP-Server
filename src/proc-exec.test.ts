@@ -51,6 +51,25 @@ describe("runCommand", () => {
     expect(opts.cwd).toBe("/tmp");
   });
 
+  it("passes a punctuation-heavy argument through as one discrete argv element (never a shell string)", async () => {
+    const child = new FakeChild();
+    spawnMock.mockReturnValue(child);
+
+    // A single argument packed with shell-significant punctuation must reach the
+    // child verbatim as ONE argv element — never split, expanded, or interpreted.
+    const packed = "rg & calc.exe | whoami ; $(x) `y` (sub)";
+    const promise = runCommand("az", ["group", "show", "--name", packed]);
+    child.emit("close", 0);
+    await promise;
+
+    const [command, args, opts] = spawnMock.mock.calls[0];
+    expect(command).toBe("az");
+    // Exactly one element per logical argument; the packed value is untouched.
+    expect(args).toEqual(["group", "show", "--name", packed]);
+    expect(args[3]).toBe(packed);
+    expect(opts.shell).toBe(false);
+  });
+
   it("rejects on a non-zero exit with stdout/stderr/code and stderr in the message", async () => {
     const child = new FakeChild();
     spawnMock.mockReturnValue(child);
@@ -112,6 +131,20 @@ describe("spawnProcess", () => {
     expect(command).toBe("npm");
     expect(args).toEqual(["run", "dev"]);
     expect(opts.detached).toBe(true);
+    expect(opts.shell).toBe(false);
+  });
+
+  it("passes a punctuation-heavy argument through as one discrete argv element", () => {
+    const child = new FakeChild();
+    spawnMock.mockReturnValue(child);
+
+    const packed = "run & calc | whoami ; $(x) `y`";
+    spawnProcess("npm", ["run", packed], { detached: true });
+
+    const [command, args, opts] = spawnMock.mock.calls[0];
+    expect(command).toBe("npm");
+    expect(args).toEqual(["run", packed]);
+    expect(args[1]).toBe(packed);
     expect(opts.shell).toBe(false);
   });
 });
