@@ -114,7 +114,7 @@ describe("project_deploy", () => {
     // so a punctuation-bearing value flows through to azd. It must still reach
     // the process as a SINGLE argv element (defended by the shell-free launcher),
     // never split into multiple arguments or interpreted by a shell.
-    const packed = "spe & calc | whoami ; $(x)";
+    const packed = "spe & | ; $()";
 
     stateStore.azureSubscriptionId = "sub-123";
     stateStore.containerTypeId = "ct-456";

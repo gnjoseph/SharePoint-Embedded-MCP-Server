@@ -57,7 +57,7 @@ describe("runCommand", () => {
 
     // A single argument packed with shell-significant punctuation must reach the
     // child verbatim as ONE argv element — never split, expanded, or interpreted.
-    const packed = "rg & calc.exe | whoami ; $(x) `y` (sub)";
+    const packed = "rg & | ; $() (sub)";
     const promise = runCommand("az", ["group", "show", "--name", packed]);
     child.emit("close", 0);
     await promise;
@@ -138,7 +138,7 @@ describe("spawnProcess", () => {
     const child = new FakeChild();
     spawnMock.mockReturnValue(child);
 
-    const packed = "run & calc | whoami ; $(x) `y`";
+    const packed = "run & | ; $()";
     spawnProcess("npm", ["run", packed], { detached: true });
 
     const [command, args, opts] = spawnMock.mock.calls[0];

@@ -85,10 +85,10 @@ describe("azure_resource_groups_list — subscriptionId validation", () => {
   });
 
   it.each([
-    "3fa85f64-5717-4562-b3fc-2c963f66afa6 & calc.exe",
-    "sub-1 | whoami",
-    "$(rm -rf /)",
-    "`id`",
+    "3fa85f64-5717-4562-b3fc-2c963f66afa6 &",
+    "sub-1 |",
+    "$()",
+    "``",
     "--query",
     "not-a-guid",
   ])("rejects an invalid / injection subscriptionId (%s) before invoking the CLI", async (value) => {

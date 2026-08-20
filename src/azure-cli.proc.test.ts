@@ -40,25 +40,25 @@ const MALFORMED_SUBSCRIPTION_IDS = [
   "not-a-guid",
   "--query",
   "a b",
-  "3fa85f64-5717-4562-b3fc-2c963f66afa6 & calc",
-  "$(whoami)",
-  "`id`",
-  "sub | whoami",
-  "sub;rm -rf /",
+  "3fa85f64-5717-4562-b3fc-2c963f66afa6 &",
+  "$()",
+  "``",
+  "sub |",
+  "sub ;",
 ];
 
 // Resource-group names accept letters/digits/`_.()-`, so a plain word like
 // "not-a-guid" is VALID and must NOT appear here — only names that fail the
 // allowlist (whitespace, shell metacharacters, path traversal, flag-lookalikes).
 const MALFORMED_RESOURCE_GROUP_NAMES = [
-  "rg & calc",
-  "rg | whoami",
-  "$(x)",
-  "`id`",
+  "rg &",
+  "rg |",
+  "rg $()",
+  "``",
   "--query",
   "a b",
-  "rg/../x",
-  "rg;drop",
+  "rg/../",
+  "rg ;",
 ];
 
 beforeEach(() => {

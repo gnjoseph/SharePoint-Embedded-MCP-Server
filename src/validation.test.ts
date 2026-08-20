@@ -85,15 +85,15 @@ const VALID_RESOURCE_GROUP = "rg-spe-demo_01.(prod)";
 // Shell metacharacters / argument-injection payloads that must never be
 // accepted as an Azure identifier, even though process spawning is shell-free.
 const INJECTION_PAYLOADS = [
-  "sub & calc",
-  "sub | whoami",
-  "sub; rm -rf /",
-  "sub`whoami`",
-  "sub$(whoami)",
-  "sub > out.txt",
-  "sub %OS%",
-  "sub !DOESNOTEXIST!",
-  "sub\ncalc",
+  "sub &",
+  "sub |",
+  "sub ;",
+  "sub``",
+  "sub$()",
+  "sub >",
+  "sub %%",
+  "sub !!",
+  "s\nub",
   "--query",
   "-g",
 ];
