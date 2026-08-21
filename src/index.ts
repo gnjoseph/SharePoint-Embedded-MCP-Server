@@ -216,6 +216,10 @@ function withDuration(structuredContent: unknown, durationMs: number): unknown {
  * This never waits on the network: `takePendingUpdateNotice()` only reads
  * already-resolved in-memory state and returns `null` when the check is
  * disabled, still running, failed, or found nothing newer.
+ *
+ * When the tool produced no structured content, a fresh `{ updateAvailable }`
+ * object is created rather than dropping the machine-readable twin: a client
+ * that only reads `structuredContent` would otherwise never see the update.
  */
 function withUpdateNotice(
   content: { type: "text"; text: string }[],
@@ -227,7 +231,7 @@ function withUpdateNotice(
   const merged =
     structuredContent && typeof structuredContent === "object" && !Array.isArray(structuredContent)
       ? { ...(structuredContent as Record<string, unknown>), updateAvailable }
-      : structuredContent;
+      : { updateAvailable };
   return {
     content: [...content, { type: "text" as const, text: notice.text }],
     structuredContent: merged,
@@ -538,3 +542,6 @@ export async function startServer(config: ServerConfig) {
     }
   }
 }
+
+/** Test-only hooks. Not part of the public API and not used at runtime. */
+export const __testing = { withUpdateNotice };

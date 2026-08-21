@@ -75,9 +75,11 @@ also be turned off. Specifically:
   *notifies* you; applying an update is always a manual `npm install` you run yourself.
 
   **Local retention.** The result is cached on your machine at
-  `<data dir>/update-check.json` (owner-only permissions, control **SEC-008**;
-  `<data dir>` is `%LOCALAPPDATA%\spe-mcp` on Windows or `~/.local/share/spe-mcp` elsewhere,
-  and is reported by `status_get`). The cache contains only the checked version strings, the
+  `<data dir>/update-check.json`, written with the same owner-only permissions as the token
+  cache (0700 directory / 0600 file, control **SEC-003**; the check itself is control
+  **SEC-008**). `<data dir>` defaults to `%USERPROFILE%\.spe-mcp` on Windows or `~/.spe-mcp`
+  elsewhere, can be overridden with `SPE_DATA_DIR`, and the exact path in use is reported by
+  `status_get`. The cache contains only the checked version strings, the
   registry URL, a timestamp, and which versions you have already been told about — **no
   identifier**. It is **retained locally until you delete it**: there is no automatic expiry of
   the file itself, only of its freshness. Run `spe-mcp logout` or `spe-mcp auth --reset` to

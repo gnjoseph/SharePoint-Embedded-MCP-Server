@@ -58,9 +58,9 @@
  *   over-long keys/values are dropped, and every version is validated by the
  *   strict SemVer parser before it is compared or shown.
  * - Results are cached under the server data dir with the same owner-only
- *   secure-fs primitives as the token cache (0700 dir / 0600 file, no symlink
- *   traversal), with a TTL plus a shorter failure backoff so a broken network is
- *   not re-probed on every start.
+ *   secure-fs primitives as the token cache (SEC-003: 0700 dir / 0600 file, no
+ *   symlink traversal), with a 24h TTL applied to successes *and* failures so
+ *   the "at most one request per day" promise holds even offline.
  *
  * KNOWN LIMITATION (accepted tradeoff, not a sign-off)
  * - Node's built-in `fetch` does not honour `HTTP_PROXY` / `HTTPS_PROXY` /
@@ -68,6 +68,10 @@
  *   which this package deliberately does not take. On a proxy-only network the
  *   probe simply fails closed (silent no-op) rather than bypassing the proxy.
  *   Operators who must not egress at all should turn the check off outright.
+ * - Cache writes are last-writer-wins. `secure-fs` has no compare-and-swap, and
+ *   this change deliberately does not alter that shared primitive. Two servers
+ *   delivering a notice at the same instant can therefore drop one suppression
+ *   entry, costing at most one extra notice; tracked as follow-up work.
  *
  * ZERO-NETWORK OPT-OUTS — each skips the check entirely (no request, no notice,
  * no cache read, no cache write): `--no-update-check`, `SPE_MCP_UPDATE_CHECK=false`,
@@ -97,8 +101,15 @@ export const MAX_RESPONSE_BYTES = 64 * 1024;
 /** How long a successful probe is reused before re-checking. */
 export const CHECK_TTL_MS = 24 * 60 * 60 * 1000;
 
-/** How long a failed probe is remembered before retrying (shorter than the TTL). */
-export const FAILURE_BACKOFF_MS = 6 * 60 * 60 * 1000;
+/**
+ * How long a failed probe is remembered before retrying.
+ *
+ * Deliberately identical to {@link CHECK_TTL_MS}: the documented promise is "at
+ * most one request per day", and a shorter failure backoff would quietly make
+ * that promise false for anyone who is offline (a failing probe would be retried
+ * several times a day). Success and failure are both remembered for 24h.
+ */
+export const FAILURE_BACKOFF_MS = CHECK_TTL_MS;
 
 /** Cap on remembered "already told the user about this version" entries. */
 const MAX_NOTIFIED_ENTRIES = 10;
@@ -389,6 +400,24 @@ async function readCappedText(response: Response, cap: number): Promise<string |
 }
 
 /**
+ * Whether a value is a tag name we are willing to use as a map key.
+ *
+ * Rejects non-strings, empty/oversized names, and prototype-pollution keys such
+ * as `__proto__`. Applied to both freshly fetched packument keys and to tag
+ * names read back from the on-disk cache, which is treated as untrusted input.
+ */
+function isSafeTagName(name: unknown): name is string {
+  if (typeof name !== "string") return false;
+  if (name.length === 0 || name.length > MAX_TAG_NAME_LENGTH) return false;
+  return !FORBIDDEN_KEYS.has(name);
+}
+
+/** A fresh `name -> version` map that cannot inherit anything from `Object`. */
+function emptyTagMap(): Record<string, string> {
+  return Object.create(null) as Record<string, string>;
+}
+
+/**
  * Extract a trustworthy `name -> version` map from a raw packument body.
  *
  * Everything here treats the input as hostile: the JSON may be any shape, keys
@@ -397,7 +426,7 @@ async function readCappedText(response: Response, cap: number): Promise<string |
  * valid SemVer string is dropped silently.
  */
 function extractDistTags(raw: string): Record<string, string> {
-  const result: Record<string, string> = Object.create(null) as Record<string, string>;
+  const result = emptyTagMap();
 
   let parsed: unknown;
   try {
@@ -411,8 +440,7 @@ function extractDistTags(raw: string): Record<string, string> {
   if (typeof tags !== "object" || tags === null || Array.isArray(tags)) return result;
 
   for (const [name, value] of Object.entries(tags as Record<string, unknown>)) {
-    if (FORBIDDEN_KEYS.has(name)) continue;
-    if (name.length === 0 || name.length > MAX_TAG_NAME_LENGTH) continue;
+    if (!isSafeTagName(name)) continue;
     if (typeof value !== "string" || value.length > MAX_TAG_VALUE_LENGTH) continue;
     if (parseSemver(value) === null) continue;
     result[name] = value;
@@ -526,7 +554,9 @@ function readCache(): UpdateCache | null {
       registry: candidate.registry,
       outcome: candidate.outcome,
       latest: typeof candidate.latest === "string" ? candidate.latest : undefined,
-      channelTag: typeof candidate.channelTag === "string" ? candidate.channelTag : undefined,
+      // The cache file is untrusted input: a tampered `channelTag` is used as a
+      // map key later, so it goes through the same guard as packument keys.
+      channelTag: isSafeTagName(candidate.channelTag) ? candidate.channelTag : undefined,
       channelVersion:
         typeof candidate.channelVersion === "string" ? candidate.channelVersion : undefined,
       notifiedFor: notified.slice(-MAX_NOTIFIED_ENTRIES),
@@ -600,10 +630,7 @@ function newerTagVersion(
  * cache file only and never touches the network.
  */
 function cachedTargetVersion(cache: UpdateCache): string | undefined {
-  const tags: Record<string, string> = {};
-  if (cache.latest) tags["latest"] = cache.latest;
-  if (cache.channelTag && cache.channelVersion) tags[cache.channelTag] = cache.channelVersion;
-
+  const tags = buildTagsFromCache(cache);
   const current = parseSemver(PACKAGE_VERSION);
   if (current) {
     const channel = releaseChannel(current);
@@ -793,21 +820,13 @@ async function runUpdateCheck(options: StartUpdateCheckOptions): Promise<void> {
     };
 
     // Per-target suppression: each newer version is announced exactly once, even
-    // across restarts, so the notice never becomes background noise.
+    // across restarts. The suppression entry is persisted by
+    // `takePendingUpdateNotice()` at *delivery* time, not here: a process that
+    // probes and then exits before any tool call would otherwise burn the only
+    // announcement without the user ever seeing it.
     if (notifiedFor.includes(latest)) return;
 
     pendingNotice = { text: renderNotice(update), updateAvailable: update };
-    writeCache({
-      version: 1,
-      checkedAt,
-      currentVersion: PACKAGE_VERSION,
-      registry,
-      outcome: "success",
-      latest: tags?.["latest"],
-      channelTag: channel ?? undefined,
-      channelVersion: channel ? tags?.[channel] : undefined,
-      notifiedFor: [...notifiedFor, latest],
-    });
     logger.debug(`Update available: ${PACKAGE_VERSION} -> ${latest}`);
   } catch {
     // A best-effort courtesy must never affect the server.
@@ -816,9 +835,11 @@ async function runUpdateCheck(options: StartUpdateCheckOptions): Promise<void> {
 
 /** Rebuild the tag map from a fresh success cache entry (no network). */
 function buildTagsFromCache(cache: UpdateCache): Record<string, string> {
-  const tags: Record<string, string> = Object.create(null) as Record<string, string>;
+  const tags = emptyTagMap();
   if (cache.latest) tags["latest"] = cache.latest;
-  if (cache.channelTag && cache.channelVersion) tags[cache.channelTag] = cache.channelVersion;
+  if (isSafeTagName(cache.channelTag) && cache.channelVersion) {
+    tags[cache.channelTag] = cache.channelVersion;
+  }
   return tags;
 }
 
@@ -829,8 +850,12 @@ function buildTagsFromCache(cache: UpdateCache): Record<string, string> {
 /**
  * Kick off the update check. Returns immediately and is never awaited by the
  * server; the work happens on a detached promise that swallows all errors.
+ *
+ * Re-entrant calls are ignored while a probe is still in flight, so a caller
+ * that wires this up more than once can never produce a duplicate request.
  */
 export function startUpdateCheck(options: StartUpdateCheckOptions = {}): void {
+  if (inFlight) return;
   try {
     inFlight = runUpdateCheck(options).catch(() => undefined);
   } catch {
@@ -844,33 +869,69 @@ export function startUpdateCheck(options: StartUpdateCheckOptions = {}): void {
  * Returning-and-clearing is what makes the notice appear on exactly one tool
  * result: whichever call happens to run after the probe resolves gets it, and
  * every later call sees `null`.
+ *
+ * Cross-process suppression is persisted *here*, at delivery, rather than when
+ * the probe found the update: a process that exits before any tool call leaves
+ * the cache untouched, so the next process still announces the version. The
+ * cache is re-read immediately before writing so a concurrent process's entries
+ * are merged rather than clobbered. Known residual risk: two processes that
+ * deliver at the same instant can still interleave (last writer wins) and one
+ * suppression entry may be lost, costing at most one extra notice; fixing that
+ * needs compare-and-swap support in `secure-fs`, tracked as follow-up work.
+ *
+ * An absent cache file is never re-created here: `spe-mcp logout` deletes it,
+ * and delivery must not resurrect state the user just erased.
  */
 export function takePendingUpdateNotice(): UpdateNotice | null {
   const notice = pendingNotice;
   pendingNotice = null;
+  if (notice) persistNotified(notice.updateAvailable.latest);
   return notice;
+}
+
+/** Record `version` as announced, merging into whatever is on disk right now. */
+function persistNotified(version: string): void {
+  try {
+    const cache = readCache();
+    // No cache (never written, or deleted by logout) => nothing to update.
+    if (!cache) return;
+    if (cache.notifiedFor.includes(version)) return;
+    writeCache({ ...cache, notifiedFor: [...cache.notifiedFor, version] });
+  } catch {
+    // Best-effort: at worst the notice is shown once more next run.
+  }
 }
 
 /**
  * Current check state, for `status_get` and diagnostics.
  *
  * Read-only and strictly local: this never makes a network request. When the
- * live status has nothing to say (opted out, or a fresh process that has not
- * probed yet) the locally cached result is surfaced instead, so a user can
- * always see what is stored, when it was stored, and where the file lives.
+ * live status has nothing to say (a fresh process that has not probed yet) the
+ * locally cached result is surfaced instead, so a user can always see what is
+ * stored, when it was stored, and where the file lives.
  */
 export function getUpdateStatus(): UpdateCheckStatus {
   const cacheFile = getUpdateCacheFile();
-  const cache = readCache();
 
+  // Opted out: report the local file location only. No disk read, and no
+  // registry is named — nothing would ever be contacted. `startUpdateCheck`
+  // resolves a skip synchronously before its first `await`, so this is already
+  // accurate by the time any tool can call in.
+  if (!status.enabled) return { ...status, cacheFile };
+
+  // This process already has a result, so the in-memory status is at least as
+  // current as the file: skip the disk read entirely.
+  if (status.lastCheckedAt) {
+    return { ...status, cacheFile, registry: resolveRegistry() ?? DEFAULT_REGISTRY };
+  }
+
+  const cache = readCache();
   return {
     ...status,
     cacheFile,
-    registry: status.registry ?? cache?.registry ?? resolveRegistry() ?? DEFAULT_REGISTRY,
-    latestVersion: status.latestVersion ?? (cache ? cachedTargetVersion(cache) : undefined),
-    lastCheckedAt:
-      status.lastCheckedAt ??
-      (cache ? new Date(cache.checkedAt).toISOString() : undefined),
+    registry: cache?.registry ?? resolveRegistry() ?? DEFAULT_REGISTRY,
+    latestVersion: cache ? cachedTargetVersion(cache) : undefined,
+    lastCheckedAt: cache ? new Date(cache.checkedAt).toISOString() : undefined,
   };
 }
 

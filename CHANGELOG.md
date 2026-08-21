@@ -28,7 +28,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cache-file path, and the opt-out controls — all read from disk, with **no network access**.
 - **Update-check cache lifecycle.** The cached result at `<data dir>/update-check.json`
   contains **no identifier** and is retained until deleted; `spe-mcp logout` and
-  `spe-mcp auth --reset` now remove it alongside the cached tokens.
+  `spe-mcp auth --reset` now remove it alongside the cached tokens. A version is recorded
+  as "already notified" only when the notice is actually delivered on a tool result, so a
+  process that exits before any tool call replays the notice on the next run instead of
+  losing it.
 - **Boundary disclosure.** `README.md`, `PRIVACY.md`, `docs/DATA-FLOW.md`,
   `docs/SECURITY-CONTROLS.md`, and `docs/TROUBLESHOOTING.md` document that
   `registry.npmjs.org` (npm, Inc./GitHub) is the only endpoint **outside the Microsoft 365 /
@@ -53,7 +56,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   correlation, or session identifier**, and omits the product `User-Agent` when
   `SPE_MCP_COLLECT_TELEMETRY=false`. It is bounded by a 2-second timeout and a 64 KB response
   cap, parsed with strict SemVer and prototype-pollution-safe key filtering, and cached
-  owner-only (SEC-003) with a 24-hour TTL and a failure backoff, deleted on `logout` /
+  owner-only (SEC-003) with a 24-hour TTL — a failed check backs off for the same 24 hours,
+  so at most one request per day is made either way — deleted on `logout` /
   `auth --reset`. `SPE_NPM_REGISTRY` values carrying credentials, a query string, or a
   fragment are rejected. **Known limitation:** Node's built-in `fetch` ignores
   `HTTP(S)_PROXY`/`NO_PROXY`, so the request cannot be routed through an egress proxy; it

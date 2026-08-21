@@ -420,11 +420,21 @@ describe("cache", () => {
     expect(__testing.isCacheFresh(base, DEFAULT_REGISTRY, base.checkedAt + CHECK_TTL_MS - 1)).toBe(true);
   });
 
-  it("expires a failure at the shorter backoff boundary", () => {
+  it("expires a failure at the same 24h boundary as a success", () => {
     const failure = { ...base, outcome: "failure" as const };
-    expect(FAILURE_BACKOFF_MS).toBeLessThan(CHECK_TTL_MS);
+    // The failure backoff MUST equal the TTL: every doc promises "at most one
+    // request per day", which a shorter backoff would silently break.
+    expect(FAILURE_BACKOFF_MS).toBe(CHECK_TTL_MS);
+    expect(FAILURE_BACKOFF_MS).toBe(24 * 60 * 60 * 1000);
     expect(__testing.isCacheFresh(failure, DEFAULT_REGISTRY, base.checkedAt + FAILURE_BACKOFF_MS)).toBe(false);
     expect(__testing.isCacheFresh(failure, DEFAULT_REGISTRY, base.checkedAt + FAILURE_BACKOFF_MS - 1)).toBe(true);
+  });
+
+  it("suppresses a repeat network probe for a whole day after a failure", async () => {
+    const failure = { ...base, outcome: "failure" as const, checkedAt: Date.now() - 23 * 60 * 60 * 1000 };
+    writeFileSync(getUpdateCacheFile(), JSON.stringify(failure), "utf8");
+    await __testing.runUpdateCheck({});
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("rejects a cache written by a different build", () => {
@@ -571,6 +581,7 @@ describe("runUpdateCheck", () => {
     respondWith(packument(tagsFixture()));
     await __testing.runUpdateCheck({});
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(takePendingUpdateNotice()).not.toBeNull();
 
     __testing.reset();
     __testing.setInstalled(true);
@@ -578,6 +589,7 @@ describe("runUpdateCheck", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(getUpdateStatus().state).toBe("update-available");
+    // Already delivered before the restart, so it is not repeated.
     expect(takePendingUpdateNotice()).toBeNull();
   });
 
@@ -1126,5 +1138,204 @@ describe("privacy: status_get reporting is offline", () => {
 
     rmSync(getUpdateCacheFile(), { force: true });
     expect(getUpdateStatus().cacheFile).toBe(getUpdateCacheFile());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Code review follow-ups: the notice is only "spent" once a caller has actually
+// received it, one probe per process, and hostile cache content stays inert.
+// ---------------------------------------------------------------------------
+
+describe("notice delivery is what marks a version as notified", () => {
+  it("does not record the target while the notice is still pending", async () => {
+    respondWith(packument(tagsFixture()));
+    await __testing.runUpdateCheck({});
+
+    // The probe found something, but nobody has been told yet.
+    expect(getUpdateStatus().state).toBe("update-available");
+    expect(readCacheFile()["notifiedFor"]).toEqual([]);
+  });
+
+  it("records the target only when the notice is handed to a caller", async () => {
+    respondWith(packument(tagsFixture()));
+    await __testing.runUpdateCheck({});
+    expect(readCacheFile()["notifiedFor"]).toEqual([]);
+
+    expect(takePendingUpdateNotice()).not.toBeNull();
+    expect(readCacheFile()["notifiedFor"]).toEqual([EXPECTED_LATEST]);
+  });
+
+  it("survives a process exit before the notice was delivered", async () => {
+    respondWith(packument(tagsFixture()));
+    await __testing.runUpdateCheck({});
+    // Server exits here: no tool call ever consumed the notice.
+
+    __testing.reset();
+    __testing.setInstalled(true);
+    await __testing.runUpdateCheck({}); // fresh cache, no network
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const notice = takePendingUpdateNotice();
+    expect(notice?.updateAvailable.latest).toBe(EXPECTED_LATEST);
+    expect(readCacheFile()["notifiedFor"]).toEqual([EXPECTED_LATEST]);
+  });
+
+  it("keeps replaying the notice until one restart actually delivers it", async () => {
+    respondWith(packument(tagsFixture()));
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      __testing.reset();
+      __testing.setInstalled(true);
+      await __testing.runUpdateCheck({});
+      expect(readCacheFile()["notifiedFor"]).toEqual([]);
+    }
+
+    expect(takePendingUpdateNotice()).not.toBeNull();
+    expect(readCacheFile()["notifiedFor"]).toEqual([EXPECTED_LATEST]);
+  });
+
+  it("merges with the cache written by another process before delivery", async () => {
+    respondWith(packument(tagsFixture()));
+    await __testing.runUpdateCheck({});
+
+    // Another server instance notified about a different build meanwhile.
+    const concurrent = { ...readCacheFile(), notifiedFor: ["7.7.7"] };
+    writeFileSync(getUpdateCacheFile(), JSON.stringify(concurrent), "utf8");
+
+    expect(takePendingUpdateNotice()).not.toBeNull();
+    expect(readCacheFile()["notifiedFor"]).toEqual(["7.7.7", EXPECTED_LATEST]);
+  });
+
+  it("does not recreate a cache that logout deleted", async () => {
+    respondWith(packument(tagsFixture()));
+    await __testing.runUpdateCheck({});
+
+    removeUpdateCache();
+    expect(cacheExists()).toBe(false);
+
+    // The pending notice is still delivered, but no file comes back.
+    expect(takePendingUpdateNotice()).not.toBeNull();
+    expect(cacheExists()).toBe(false);
+  });
+
+  it("never writes on delivery when there is nothing to deliver", async () => {
+    respondWith(packument({ latest: PACKAGE_VERSION, ...(CHANNEL ? { [CHANNEL]: PACKAGE_VERSION } : {}) }));
+    await __testing.runUpdateCheck({});
+
+    const before = readFileSync(getUpdateCacheFile(), "utf8");
+    expect(takePendingUpdateNotice()).toBeNull();
+    expect(readFileSync(getUpdateCacheFile(), "utf8")).toBe(before);
+  });
+});
+
+describe("startUpdateCheck runs at most one probe per process", () => {
+  it("ignores a second call while the first is still in flight", async () => {
+    respondWith(packument(tagsFixture()));
+
+    startUpdateCheck({});
+    startUpdateCheck({});
+    startUpdateCheck({});
+    await __testing.settle();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores a second call after the first has completed", async () => {
+    respondWith(packument(tagsFixture()));
+    startUpdateCheck({});
+    await __testing.settle();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    startUpdateCheck({});
+    await __testing.settle();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("hostile cache content stays inert", () => {
+  const hostile = {
+    version: 1,
+    checkedAt: Date.now(),
+    currentVersion: PACKAGE_VERSION,
+    registry: DEFAULT_REGISTRY,
+    outcome: "success" as const,
+    latest: NEWER_STABLE,
+    channelVersion: NEWER_CHANNEL ?? NEWER_STABLE,
+    notifiedFor: [] as string[],
+  };
+
+  it("ignores a prototype-polluting channel tag from the cache file", async () => {
+    writeFileSync(
+      getUpdateCacheFile(),
+      JSON.stringify({ ...hostile, channelTag: "__proto__" }),
+      "utf8",
+    );
+
+    await __testing.runUpdateCheck({});
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(({} as Record<string, unknown>)["polluted"]).toBeUndefined();
+    expect(Object.prototype).not.toHaveProperty("latest");
+    // Falls back to the stable tag rather than trusting the hostile name.
+    expect(getUpdateStatus().latestVersion).toBe(NEWER_STABLE);
+  });
+
+  it("ignores an over-long or non-string channel tag from the cache file", async () => {
+    writeFileSync(
+      getUpdateCacheFile(),
+      JSON.stringify({ ...hostile, channelTag: "a".repeat(500) }),
+      "utf8",
+    );
+    await __testing.runUpdateCheck({});
+    expect(getUpdateStatus().latestVersion).toBe(NEWER_STABLE);
+
+    __testing.reset();
+    __testing.setInstalled(true);
+    writeFileSync(getUpdateCacheFile(), JSON.stringify({ ...hostile, channelTag: 42 }), "utf8");
+    await __testing.runUpdateCheck({});
+    expect(getUpdateStatus().latestVersion).toBe(NEWER_STABLE);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("getUpdateStatus stays cheap and quiet", () => {
+  it("omits the registry and any cached version when disabled", async () => {
+    process.env.SPE_MCP_UPDATE_CHECK = "false";
+    writeFileSync(
+      getUpdateCacheFile(),
+      JSON.stringify({
+        version: 1,
+        checkedAt: Date.now(),
+        currentVersion: PACKAGE_VERSION,
+        registry: DEFAULT_REGISTRY,
+        outcome: "success",
+        latest: NEWER_STABLE,
+        notifiedFor: [],
+      }),
+      "utf8",
+    );
+    await __testing.runUpdateCheck({});
+
+    const status = getUpdateStatus();
+
+    expect(status.enabled).toBe(false);
+    expect(status.state).toBe("disabled");
+    expect(status.registry).toBeUndefined();
+    expect(status.latestVersion).toBeUndefined();
+    expect(status.lastCheckedAt).toBeUndefined();
+    expect(status.cacheFile).toBe(getUpdateCacheFile());
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("serves an in-memory result without re-reading the cache file", async () => {
+    respondWith(packument(tagsFixture()));
+    await __testing.runUpdateCheck({});
+
+    // Corrupting the file must not disturb an already-resolved status.
+    writeFileSync(getUpdateCacheFile(), "{not json", "utf8");
+
+    const status = getUpdateStatus();
+    expect(status.state).toBe("update-available");
+    expect(status.latestVersion).toBe(EXPECTED_LATEST);
+    expect(status.registry).toBe(DEFAULT_REGISTRY);
   });
 });
