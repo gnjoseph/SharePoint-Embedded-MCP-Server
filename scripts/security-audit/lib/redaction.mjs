@@ -1,12 +1,13 @@
 /**
  * Rejection and redaction rules applied to every model response before it is
- * written anywhere, uploaded, or rendered into a job summary.
+ * written anywhere or submitted as a private vulnerability report.
  *
  * Two distinct mechanisms:
  *
  * - REJECT: the finding is discarded entirely and the run fails closed. These
  *   patterns indicate the model has either echoed a real credential out of the
- *   corpus or produced a weaponized payload. Neither belongs in an artifact.
+ *   corpus or produced a weaponized payload. Neither belongs in a report, even
+ *   a private one.
  * - REDACT: the value is replaced in place with a labeled placeholder. These are
  *   lower-risk identifiers that still should not be persisted verbatim.
  */

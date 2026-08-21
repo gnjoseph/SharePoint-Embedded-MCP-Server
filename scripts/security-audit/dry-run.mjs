@@ -4,16 +4,23 @@
  *
  * This script exercises the *entire* untrusted-output path -- corpus
  * collection, nonce fence integrity, prompt assembly, response schema
- * validation, redaction and SARIF conversion -- without invoking any model,
- * without any credential and without any network
- * access. It exists so the fail-closed behaviour of the pipeline can be tested
- * locally and in CI while the AI layer is still NOT_CONFIGURED.
+ * validation and redaction -- without invoking any model, without any
+ * credential and without any network access. It exists so the fail-closed
+ * behaviour of the pipeline can be tested locally and in CI while the AI layer
+ * is still NOT_CONFIGURED.
  *
  * The synthetic response is generated at run time from
  * `fixtures/dry-run-findings.json` by binding each finding body to a real file
  * and line taken from the freshly collected corpus manifest. That keeps the
  * fixture honest: the validator still enforces "file must be in the corpus"
  * and "line must be within range" rather than being handed a pre-baked answer.
+ *
+ * Disclosure policy: the dry run validates the schema *privately*. Stage output
+ * is captured rather than inherited and is echoed only when a stage fails, and
+ * the success path prints a single generic line with no file paths, rule names,
+ * finding counts or redaction counts. Even though the dry-run corpus is
+ * synthetic, the same code path runs in CI against the audited tree, so it must
+ * never be capable of printing finding-shaped detail to a public log.
  *
  * `--repo-root` selects the tree that is *audited*. It defaults to `.` for local
  * use, and the workflow passes `target` so the dry run reads the separately
@@ -58,6 +65,10 @@ function parseArgs(argv) {
 /**
  * Runs one pipeline stage in a child Node process.
  *
+ * Stage output is captured, not inherited. It is written to this process's
+ * streams only when the stage fails, so a successful run cannot leak stage
+ * detail (paths, counts, rule names) into a public log.
+ *
  * @param {string} label
  * @param {string} script
  * @param {string[]} scriptArgs
@@ -65,10 +76,10 @@ function parseArgs(argv) {
  * @returns {number}
  */
 function runStage(label, script, scriptArgs, allowedExitCodes = [0]) {
-  process.stdout.write(`\n--- ${label} ---\n`);
   const result = spawnSync(process.execPath, [join(SCRIPT_DIR, script), ...scriptArgs], {
     cwd: REPO_ROOT,
-    stdio: 'inherit',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    encoding: 'utf8',
     env: { ...process.env, GITHUB_OUTPUT: '' },
   });
 
@@ -77,6 +88,11 @@ function runStage(label, script, scriptArgs, allowedExitCodes = [0]) {
   }
   const code = result.status ?? 1;
   if (!allowedExitCodes.includes(code)) {
+    // Failure path only: surface the captured stage output so a maintainer
+    // running this locally can diagnose it. CI treats a dry-run failure as a
+    // configuration failure, not as a published finding.
+    process.stderr.write(result.stdout ?? '');
+    process.stderr.write(result.stderr ?? '');
     throw new Error(`${label} exited with ${code} (expected one of ${allowedExitCodes.join(', ')})`);
   }
   return code;
@@ -108,7 +124,7 @@ export function buildSyntheticResponse(manifest, bodies) {
   return [
     'SYNTHETIC DRY RUN -- no model was invoked and no credential was used.',
     'The findings below are fixture data bound to the collected corpus so that the',
-    'schema validator, the redaction pass and the SARIF converter all execute.',
+    'schema validator and the redaction pass both execute.',
     '',
     '```json',
     JSON.stringify({ findings }, null, 2),
@@ -133,10 +149,6 @@ function main() {
   // The audited tree. Defaults to this repository so the dry run is usable
   // locally; the workflow passes `target`, the separate audited checkout.
   const repoRoot = (args['repo-root'] ?? '').trim() || '.';
-
-  process.stdout.write(
-    `security-audit dry run\n  scope: ${scope}\n  root:  ${repoRoot}\n  out:   ${outDir}\n`,
-  );
 
   runStage('collect corpus', 'collect-corpus.mjs', [
     '--scope',
@@ -219,35 +231,17 @@ function main() {
     reportPath,
   ]);
 
-  const sarifPath = join(outDir, 'model-report.sarif');
-  runStage('convert to SARIF', 'to-sarif.mjs', [
-    '--report',
-    reportPath,
-    '--out',
-    sarifPath,
-    '--synthetic',
-  ]);
-
+  // The validated report stays on disk for local inspection only. It is never
+  // printed, never summarised and never uploaded: the workflow publishes no
+  // dry-run artifact, so nothing finding-shaped can reach a public surface.
+  // Read it back so a malformed report still fails the dry run.
   const report = JSON.parse(readFileSync(reportPath, 'utf8'));
-  const sarif = JSON.parse(readFileSync(sarifPath, 'utf8'));
+  if (!Array.isArray(report.findings) || report.schemaVersion !== 1) {
+    throw new Error('validated report did not match the expected schema');
+  }
 
   process.stdout.write(
-    [
-      '',
-      '--- dry run summary ---',
-      `corpus files:    ${manifest.fileCount}`,
-      `corpus bytes:    ${manifest.totalBytes}`,
-      `neutralized:     ${manifest.neutralized}`,
-      `accepted:        ${report.acceptedCount}`,
-      `rejected:        ${report.rejectedCount}`,
-      `redactions:      ${report.redactionCount}`,
-      `SARIF results:   ${sarif.runs[0].results.length}`,
-      `report:          ${reportPath}`,
-      `sarif:           ${sarifPath}`,
-      '',
-      'AI status: DRY_RUN (synthetic response; no model, no credential, no network).',
-      '',
-    ].join('\n'),
+    'security-audit: dry run passed. AI status: DRY_RUN (synthetic response; no model, no credential, no network).\n',
   );
 }
 

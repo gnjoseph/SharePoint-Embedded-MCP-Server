@@ -2,9 +2,10 @@
 /**
  * Validates, redacts and normalizes a model response into a sanitized report.
  *
- * This is the trust boundary between untrusted model output and everything that
- * follows (artifacts, SARIF, job summaries). Nothing downstream reads the raw
- * response.
+ * This is the trust boundary between untrusted model output and the only
+ * consumer that follows it: the private advisory report submitted to
+ * maintainers via `submit-report.mjs`. Nothing downstream reads the raw
+ * response, and nothing derived from it reaches a public surface.
  *
  * Enforced:
  *  - Response parses as a JSON object with a `findings` array (code fences and

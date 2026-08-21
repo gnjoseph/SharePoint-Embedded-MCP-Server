@@ -206,12 +206,56 @@ export function neutralizeDelimiters(text) {
   };
 }
 
-/** SARIF tool driver name, surfaced in code scanning. */
-export const TOOL_NAME = 'SPE MCP Security Audit';
+/**
+ * Private reporting (GitHub Private Vulnerability Reporting).
+ *
+ * Validated model findings are submitted as a single aggregate repository
+ * security advisory *report*, visible only to maintainers. Nothing about a
+ * finding is ever written to a public surface: no SARIF, no code scanning, no
+ * Actions artifact, no job summary, no issue, no external tracker.
+ */
 
-/** SARIF tool driver information URI. */
-export const TOOL_URI =
-  'https://github.com/microsoft/SharePoint-Embedded-MCP-Server/blob/main/docs/SECURITY-AUDIT.md';
+/** GitHub REST base URL. Overridable only by tests, never by workflow input. */
+export const GITHUB_API_BASE_URL = 'https://api.github.com';
+
+/**
+ * Prefix of the advisory report title. The full summary is this prefix followed
+ * by the first 12 hex characters of the audited commit, which makes the title a
+ * stable dedup key: one aggregate report per audited commit, re-runs included.
+ */
+export const REPORT_SUMMARY_PREFIX = 'SPE automated security audit — ';
+
+/** GitHub caps advisory report summaries at 1024 characters. */
+export const REPORT_SUMMARY_MAX_CHARS = 1024;
+
+/** GitHub caps advisory report descriptions at 65535 characters. */
+export const REPORT_DESCRIPTION_MAX_CHARS = 65535;
+
+/** The only tokens the submitter is permitted to print. */
+export const REPORT_RESULTS = Object.freeze({
+  submitted: 'submitted',
+  existing: 'existing',
+  none: 'none',
+  failed: 'failed',
+});
+
+/** Retries are attempted for transient 5xx responses only. */
+export const REPORT_RETRY_LIMIT = 2;
+
+/** Fixed delay between retries; deliberately not randomised or exponential. */
+export const REPORT_RETRY_DELAY_MS = 5000;
+
+/**
+ * The only two strings this workflow may publish to a step or job summary.
+ * Anything that identifies a scanner, path, rule, count, advisory, commit or
+ * scope is withheld — a public summary is world-readable on a public
+ * repository.
+ */
+export const PUBLIC_SUMMARY_PASS = 'Security audit: PASS';
+
+/** Failure counterpart of {@link PUBLIC_SUMMARY_PASS}. */
+export const PUBLIC_SUMMARY_FAIL =
+  'Security audit: FAIL — details were reported privately to maintainers.';
 
 /** Status literals emitted by the audit; asserted by tests and the summary job. */
 export const STATUS = Object.freeze({

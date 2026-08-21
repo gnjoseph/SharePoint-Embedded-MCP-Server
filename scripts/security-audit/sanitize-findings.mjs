@@ -1,12 +1,19 @@
 #!/usr/bin/env node
 /**
- * Reduces raw scanner output to counts and non-sensitive identifiers.
+ * Reduces raw scanner output to counts only.
  *
- * Rationale: `npm audit --json` embeds dependency graph detail, and a Gitleaks
- * report embeds the matched secret material itself. Neither may be retained as a
- * build artifact on a public repository. This script converts either into a
- * summary that is safe to publish, and the raw report is discarded by the caller.
- * For Gitleaks the published summary is counts only — see `sanitizeGitleaks`.
+ * Rationale: `npm audit --json` embeds dependency graph detail and advisory
+ * URLs, and a Gitleaks report embeds the matched secret material itself.
+ * Neither may be retained as a build artifact, echoed to a public log or
+ * rendered into a job summary on a public repository. This script converts
+ * either into a counts-only summary, and the raw report is discarded by the
+ * caller.
+ *
+ * Neither sanitiser emits an identifier that can be resolved to a specific
+ * weakness: no advisory URL, no GHSA or CVE identifier, no package name, no
+ * rule identifier and no file path. Counts alone let a maintainer judge blast
+ * radius; reproduction happens locally against a private checkout, as
+ * documented in `docs/SECURITY-AUDIT.md`.
  *
  * Usage:
  *   node scripts/security-audit/sanitize-findings.mjs \
@@ -38,19 +45,19 @@ function parseArgs(argv) {
 }
 
 /**
- * Keeps only severity counts and advisory identifiers.
+ * Reduces an `npm audit` report to severity counts only.
+ *
+ * Advisory URLs, GHSA/CVE identifiers, package names and dependency paths are
+ * deliberately dropped. A single advisory URL names the vulnerable package and
+ * the vulnerable version range, which on a public repository tells an observer
+ * exactly which unpatched weakness this repository currently ships. Counts
+ * convey blast radius without naming the weakness; maintainers reproduce the
+ * detail locally with `npm audit --audit-level=high`.
  *
  * @param {unknown} raw Parsed `npm audit --json` output.
  */
 export function sanitizeNpmAudit(raw) {
   const metadata = raw?.metadata?.vulnerabilities ?? {};
-  const advisories = new Set();
-
-  for (const entry of Object.values(raw?.vulnerabilities ?? {})) {
-    for (const via of entry?.via ?? []) {
-      if (via && typeof via === 'object' && via.url) advisories.add(String(via.url));
-    }
-  }
 
   return {
     kind: 'npm-audit',
@@ -61,7 +68,6 @@ export function sanitizeNpmAudit(raw) {
       low: Number(metadata.low ?? 0),
       info: Number(metadata.info ?? 0),
     },
-    advisories: [...advisories].sort(),
   };
 }
 
@@ -70,17 +76,16 @@ export function sanitizeNpmAudit(raw) {
  *
  * Nothing that locates a finding survives this function: not the matched
  * secret, not its surrounding context, not the commit author or message, and
- * — deliberately — not the rule identifier or the file path either. On a
- * public repository the summary is written to the job summary and uploaded as
- * an artifact, both of which are world-readable for the lifetime of the run.
- * A rule identifier plus a file path is enough to tell an observer which file
- * holds which class of credential before the credential can be rotated, so
- * that pairing is withheld rather than published.
+ * — deliberately — not the rule identifier or the file path either. A rule
+ * identifier plus a file path is enough to tell an observer which file holds
+ * which class of credential before the credential can be rotated, so that
+ * pairing is withheld rather than published.
  *
  * `ruleCount` and `fileCount` are cardinalities, not identities: they let a
  * reader judge blast radius ("14 findings across 2 rules in 9 files") without
- * disclosing where to look. Triage uses the run logs of the scan step, which
- * are visible only to accounts with repository write access.
+ * disclosing where to look. This summary is consumed only by the fail gate;
+ * it is not written to a job summary, not uploaded and not echoed. Triage
+ * happens locally against a private checkout.
  *
  * @param {unknown} raw Parsed Gitleaks JSON report.
  */

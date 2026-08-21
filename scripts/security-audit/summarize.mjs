@@ -2,28 +2,35 @@
 /**
  * Renders the audit run summary and decides the overall exit status.
  *
- * The deterministic jobs (CodeQL, dependency audit, secret scan, action pinning)
- * gate the run. The model job is advisory: when it is skipped because no
- * credential is provisioned the summary states `AI NOT_CONFIGURED` explicitly
- * rather than implying the audit passed.
+ * Disclosure policy: the rendered summary is written to the job summary and to
+ * the console, both of which are world-readable on a public repository. It is
+ * therefore deliberately reduced to one of exactly two literals — no scanner
+ * identity, no file path, no rule identifier, no count, no advisory URL, no
+ * commit and no scope. A failing run says only that it failed; the detail lives
+ * in the private vulnerability report submitted to maintainers, or (for the
+ * deterministic checks) in a maintainer's local reproduction. See
+ * docs/SECURITY-AUDIT.md.
+ *
+ * `Security audit: PASS` states that the deterministic checks succeeded. It
+ * makes no claim about model-detectable issues: the model layer ships disabled,
+ * and when it does not run no inference is attempted at all.
  *
  * Usage:
  *   node scripts/security-audit/summarize.mjs \
- *     --codeql success --dependency-audit success --secret-scan success \
- *     --action-pins success --model skipped [--out <file>]
+ *     --dependency-audit success --secret-scan success \
+ *     --action-pins success --model skipped [--dry-run true] [--out <file>]
  */
 
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { STATUS } from './lib/constants.mjs';
+import { PUBLIC_SUMMARY_FAIL, PUBLIC_SUMMARY_PASS, STATUS } from './lib/constants.mjs';
 
-/** Deterministic jobs whose failure fails the run. */
-const REQUIRED_JOBS = Object.freeze([
-  ['codeql', 'CodeQL (security-extended)'],
-  ['dependency-audit', 'Dependency audit (npm audit --audit-level=high)'],
-  ['secret-scan', 'Secret scan (gitleaks, checksum-verified)'],
-  ['action-pins', 'Action pinning'],
-]);
+/**
+ * Deterministic jobs whose failure fails the run. Keys only: the human-readable
+ * scanner names used to live here and were rendered into the public summary,
+ * which told a reader which control had found something.
+ */
+const REQUIRED_JOBS = Object.freeze(['dependency-audit', 'secret-scan', 'action-pins']);
 
 /**
  * @param {string[]} argv
@@ -68,67 +75,27 @@ export function modelStatus(result, dryRun) {
 }
 
 /**
+ * Builds the public summary.
+ *
+ * `status` is returned for the caller's own control flow only. It is not
+ * rendered into `markdown`, because the markdown is published verbatim to a
+ * world-readable job summary.
+ *
  * @param {Record<string, string>} args
  * @returns {{ markdown: string, failed: boolean, status: string }}
  */
 export function buildSummary(args) {
   const dryRun = args['dry-run'] === 'true';
   const status = modelStatus(args.model ?? 'skipped', dryRun);
+  const failed = REQUIRED_JOBS.some((key) => (args[key] ?? 'skipped') !== 'success');
+  const markdown = `${failed ? PUBLIC_SUMMARY_FAIL : PUBLIC_SUMMARY_PASS}\n`;
 
-  const rows = REQUIRED_JOBS.map(([key, label]) => {
-    const result = args[key] ?? 'skipped';
-    const icon = result === 'success' ? '✅' : result === 'skipped' ? '⏭️' : '❌';
-    return `| ${label} | ${icon} ${result} |`;
-  });
-
-  const failed = REQUIRED_JOBS.some(([key]) => (args[key] ?? 'skipped') !== 'success');
-
-  const lines = [
-    '## Weekly repository security audit',
-    '',
-    `Target commit: \`${args.target ?? 'unknown'}\``,
-    `Scope: \`${args.scope ?? 'unknown'}\``,
-    '',
-    '### Deterministic checks',
-    '',
-    '| Check | Result |',
-    '| --- | --- |',
-    ...rows,
-    '',
-    '### Model-assisted review',
-    '',
-    `Status: **${status}**`,
-    '',
-  ];
-
-  if (status === STATUS.notConfigured) {
-    lines.push(
-      'The model-assisted pass did not run. It requires a protected `security-audit-ai`',
-      'environment holding a least-scope `COPILOT_PAT`, plus repository variable',
-      '`SECURITY_AUDIT_AI_ENABLED=true`. No inference was attempted and no model',
-      'findings were produced — this run makes **no** claim about model-detectable issues.',
-      '',
-    );
-  } else if (status === STATUS.dryRun) {
-    lines.push(
-      'Synthetic dry run: the schema, redaction and SARIF conversion path was exercised',
-      'against a fixture. No credential was used and no inference was performed, so these',
-      'results carry no security signal.',
-      '',
-    );
-  }
-
-  lines.push(
-    'Model findings are advisory and require human triage. They never gate pull requests.',
-    '',
-  );
-
-  return { markdown: `${lines.join('\n')}\n`, failed, status };
+  return { markdown, failed, status };
 }
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
-  const { markdown, failed, status } = buildSummary(args);
+  const { markdown, failed } = buildSummary(args);
 
   if (args.out) writeFileSync(args.out, markdown, 'utf8');
   if (process.env.GITHUB_STEP_SUMMARY) {
@@ -136,11 +103,9 @@ function main() {
   }
   process.stdout.write(markdown);
 
-  if (failed) {
-    process.stderr.write('security-audit: one or more deterministic checks did not succeed\n');
-    process.exit(1);
-  }
-  process.stdout.write(`security-audit: deterministic checks passed; model status ${status}\n`);
+  // No detail on either stream: which control failed is itself a signal on a
+  // public repository, and the model status is not published at all.
+  if (failed) process.exit(1);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

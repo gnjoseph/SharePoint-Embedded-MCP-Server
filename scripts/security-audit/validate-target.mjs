@@ -35,7 +35,7 @@ import { pathToFileURL } from 'node:url';
 import { ALLOWED_MODELS, DEFAULT_MODEL, DEFAULT_SCOPE, SCOPES } from './lib/constants.mjs';
 
 const BASE_REF = 'refs/remotes/origin/main';
-/** The only ref SARIF results are ever attributed to. */
+/** The only ref the audit ever targets. */
 const TARGET_REF = 'refs/heads/main';
 /**
  * The only ref the controller half of the run may be loaded from.
@@ -120,7 +120,8 @@ function assertReachableFromMain(sha) {
  *    re-applies the full-SHA shape check and the reachability check to it (the
  *    tip is trivially its own ancestor, so the check is satisfied without being
  *    weakened).
- * 2. The `is_main_tip` gate that decides whether SARIF may be published.
+ * 2. The `is_main_tip` output, which records whether the audited commit is the
+ *    current tip or a historical ancestor.
  * 3. The `controller_sha` output that every downstream job pins its *controller*
  *    checkout to, so the helper scripts always come from protected main rather
  *    than from whatever branch the dispatch was started on.
@@ -145,11 +146,12 @@ function requireMainTip() {
  * Resolves the current tip of `origin/main`, returning an empty string instead
  * of exiting when it cannot be determined.
  *
- * Used for the `is_main_tip` output, which gates SARIF publication. Code
- * scanning documents its `sha` input as "the sha of the HEAD of the ref", so a
- * historical ancestor cannot be attributed honestly to `refs/heads/main`; when
- * the tip cannot be resolved we report `false` and the workflow withholds the
- * upload rather than mis-attributing results.
+ * Used for the `is_main_tip` output, which records whether the audited commit
+ * is the current tip. Nothing is published on the basis of that flag — findings
+ * are delivered privately and name the audited commit explicitly — so an
+ * unresolvable tip degrades to `false` rather than being fatal here. The fatal
+ * case is handled by `requireMainTip()`, which needs the tip to pin the
+ * controller checkout.
  *
  * @returns {string} 40-hex SHA, or `''` when unresolvable.
  */
@@ -246,14 +248,12 @@ function main() {
 
   const outputs = {
     target_sha: ref,
-    // Code scanning attributes SARIF to a ref/sha pair. The audit only ever
-    // targets commits reachable from main, so the ref is a constant; exporting
-    // it keeps the workflow free of hard-coded branch names.
+    // The audit only ever targets commits reachable from main, so the ref is a
+    // constant; exporting it keeps the workflow free of hard-coded branch names.
     target_ref: TARGET_REF,
-    // True only when the target *is* the current main tip. Code scanning
-    // documents `sha` as "the sha of the HEAD of the ref", so uploading an
-    // ancestor would mis-attribute findings to main's tip. When false the
-    // workflow withholds the upload (fail closed) instead of lying.
+    // True only when the target *is* the current main tip. Nothing is published
+    // publicly on the basis of this flag; it exists so callers can tell a
+    // scheduled tip audit apart from a dispatched historical audit.
     is_main_tip: String(ref !== '' && ref === mainTip),
     // The commit the *trusted controller* checkout must pin to. Every job that
     // runs audit helpers checks this commit out at the repository root so the

@@ -3,7 +3,7 @@ dist/
 coverage/
 *.tgz
 
-# Security audit run outputs (corpus, model report, SARIF) — never committed
+# Security audit run outputs (corpus, model report, scanner reports) — never committed
 .security-audit/
 
 # Sample app build outputs (the sample SOURCES under samples/ are committed)

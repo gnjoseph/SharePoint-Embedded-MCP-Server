@@ -54,15 +54,27 @@ test('audit workflow denies all permissions at workflow level', () => {
   assert.deepEqual(audit.doc.permissions, {});
 });
 
-test('audit workflow grants no write permission other than security-events', () => {
+test('audit workflow grants no write permission at all', () => {
+  // Every job is read-only. `security-events: write` was removed along with the
+  // SARIF path: model findings must never reach code scanning, and the private
+  // vulnerability report is authenticated by a step-scoped secret rather than by
+  // a `GITHUB_TOKEN` permission (GITHUB_TOKEN cannot request
+  // `repository-advisories` in the first place).
   for (const [name, job] of Object.entries(audit.doc.jobs)) {
     assert.ok(job.permissions, `job ${name} must declare explicit permissions`);
     for (const [scope, level] of Object.entries(job.permissions)) {
-      if (level !== 'write') continue;
-      assert.equal(
+      assert.notEqual(level, 'write', `job ${name} must not request ${scope}: write`);
+    }
+  }
+});
+
+test('no job requests the security-events scope at any level', () => {
+  for (const [name, job] of Object.entries(audit.doc.jobs)) {
+    for (const scope of Object.keys(job.permissions ?? {})) {
+      assert.notEqual(
         scope,
         'security-events',
-        `job ${name} must not request ${scope}: write`,
+        `job ${name} must not request security-events`,
       );
     }
   }
@@ -159,7 +171,11 @@ test('model output is never interpolated into a shell command', () => {
 test('the model job is gated, environment-protected and tool-less', () => {
   const job = audit.doc.jobs['model-audit'];
   assert.match(job.if, /vars\.SECURITY_AUDIT_AI_ENABLED == 'true'/);
-  assert.equal(job.environment, 'security-audit-ai');
+  // Private reporting is the only egress for model findings, so the job cannot
+  // start unless private reporting is switched on as well. Two independent repo
+  // variables must be set before the environment is ever exercised.
+  assert.match(job.if, /vars\.SECURITY_AUDIT_PRIVATE_REPORTING_ENABLED == 'true'/);
+  assert.equal(job.environment, 'security-audit-private-report');
   assert.equal(
     /copilot-allow-tools/.test(audit.code),
     false,
@@ -168,13 +184,20 @@ test('the model job is gated, environment-protected and tool-less', () => {
   assert.equal(/--allow-all-tools/.test(audit.code), false);
 });
 
-test('the dry-run job holds no secret and never uploads to code scanning', () => {
+test('the model job is read-only and cannot publish findings anywhere', () => {
+  const job = audit.doc.jobs['model-audit'];
+  assert.deepEqual(job.permissions, { contents: 'read' });
+});
+
+test('the dry-run job holds no secret and publishes nothing', () => {
   const job = audit.doc.jobs['model-audit-dry-run'];
   assert.deepEqual(job.permissions, { contents: 'read' });
   assert.equal(job.environment, undefined);
   const rendered = JSON.stringify(job);
   assert.equal(/COPILOT_PAT/.test(rendered), false);
+  assert.equal(/SECURITY_ADVISORY_TOKEN/.test(rendered), false);
   assert.equal(/upload-sarif/.test(rendered), false);
+  assert.equal(/upload-artifact/.test(rendered), false);
 });
 
 test('dependency install in the audit path never runs repository scripts', () => {
@@ -314,20 +337,13 @@ test('jobs that run helper scripts check out the controller before the target', 
   }
 });
 
-test('the CodeQL job checks out the target only and analyses target/', () => {
-  const job = audit.doc.jobs.codeql;
-  const checkouts = checkoutSteps(job);
-  assert.equal(checkouts.length, 1, 'CodeQL runs no helper script');
-  assert.equal(checkouts[0].with.path, 'target');
-
-  const init = job.steps.find((step) =>
-    /codeql-action\/init@/.test(step.uses ?? ''),
-  );
-  assert.equal(
-    init.with['source-root'],
-    'target',
-    'CodeQL must analyse the audited tree, not the controller checkout',
-  );
+test('every job in the workflow is a known controller job', () => {
+  // The CodeQL job was removed rather than silently scan-and-discard: on a
+  // public repository, code scanning alerts are world-readable, so uploading
+  // SARIF publishes vulnerability locations. Any new job added here must be
+  // reviewed against the same non-publication policy.
+  const expected = [...CONTROLLER_JOBS, 'validate-inputs', 'summary'].sort();
+  assert.deepEqual(Object.keys(audit.doc.jobs).sort(), expected);
 });
 
 test('no helper script is ever executed from the target checkout', () => {
@@ -380,46 +396,90 @@ test('npm operations against the audited tree are confined to target/', () => {
 });
 
 // ---------------------------------------------------------------------------
-// SARIF attribution.
+// Private report attribution.
 //
-// Without explicit ref/sha, code scanning attributes findings to the event SHA
-// (current main tip) even when an older commit was analysed. `sha` must be the
-// HEAD of `ref`, so historical audits cannot be represented safely and are not
-// uploaded at all.
+// The workflow no longer publishes findings to code scanning at all: there is no
+// CodeQL job and no SARIF upload. The only egress for a model finding is a
+// private vulnerability report, whose summary embeds the audited commit, so a
+// historical audit can never be mis-attributed to the current main tip.
 // ---------------------------------------------------------------------------
 
-test('CodeQL results carry an explicit target ref, sha and checkout path', () => {
-  const analyze = audit.doc.jobs.codeql.steps.find((step) =>
-    /codeql-action\/analyze@/.test(step.uses ?? ''),
+test('no job publishes to code scanning', () => {
+  assert.equal(audit.doc.jobs.codeql, undefined, 'the CodeQL job must stay removed');
+  assert.equal(
+    /codeql-action\//.test(audit.code),
+    false,
+    'code scanning uploads would publish vulnerability locations on a public repository',
   );
-  assert.match(analyze.with.ref, /needs\.validate-inputs\.outputs\.target_ref/);
-  assert.match(analyze.with.sha, /needs\.validate-inputs\.outputs\.target_sha/);
-  assert.match(analyze.with.checkout_path, /github\.workspace.*target/);
+  assert.equal(/upload-sarif/.test(audit.code), false);
+  assert.equal(/\.sarif\b/.test(audit.code), false);
+});
+
+test('no job uploads an artifact from either security workflow', () => {
+  // Artifacts on a public repository are downloadable by anyone, so an audit
+  // artifact is a publication channel regardless of intent.
+  const files = readdirSync(WORKFLOW_DIR).filter((f) => /\.ya?ml$/.test(f));
+  for (const file of files) {
+    const code = stripComments(readFileSync(path.join(WORKFLOW_DIR, file), 'utf8'));
+    assert.equal(
+      /actions\/upload-artifact@/.test(code),
+      false,
+      `${file}: security findings must not be uploaded as an artifact`,
+    );
+  }
+});
+
+test('the model job submits a private report attributed to the audited commit', () => {
+  const job = audit.doc.jobs['model-audit'];
+  const submit = (job.steps ?? []).find((step) =>
+    /submit-report\.mjs/.test(step.run ?? ''),
+  );
+  assert.ok(submit, 'the model job must submit a private vulnerability report');
+  assert.match(submit.run, /--sha\s+"\$\{TARGET_SHA\}"/);
+  assert.match(submit.env.TARGET_SHA, /needs\.validate-inputs\.outputs\.target_sha/);
   assert.match(
-    analyze.with.upload,
-    /is_main_tip == 'true'/,
-    'uploads must be suppressed when the target is not the current main tip',
+    submit.env.SECURITY_ADVISORY_TOKEN,
+    /secrets\.SECURITY_ADVISORY_TOKEN/,
   );
 });
 
-test('model SARIF upload is attributed to the target and gated on main tip', () => {
+test('the advisory credential is scoped to the submit step, never to inference', () => {
   const job = audit.doc.jobs['model-audit'];
-  const upload = (job.steps ?? []).find((step) =>
-    /codeql-action\/upload-sarif@/.test(step.uses ?? ''),
+  assert.equal(
+    job.env?.SECURITY_ADVISORY_TOKEN,
+    undefined,
+    'a job-level advisory token would be visible to the model step',
   );
-  assert.ok(upload, 'the model job must upload through code scanning');
-  assert.match(upload.if, /is_main_tip == 'true'/);
-  assert.match(upload.with.ref, /needs\.validate-inputs\.outputs\.target_ref/);
-  assert.match(upload.with.sha, /needs\.validate-inputs\.outputs\.target_sha/);
-  assert.match(upload.with.checkout_path, /github\.workspace.*target/);
+  for (const step of job.steps ?? []) {
+    const usesInference = /actions\/ai-inference@|copilot/i.test(step.uses ?? '');
+    if (!usesInference) continue;
+    assert.equal(
+      JSON.stringify(step.env ?? {}).includes('SECURITY_ADVISORY_TOKEN'),
+      false,
+      `step "${step.name}" must not see the advisory credential`,
+    );
+  }
+  // Only the pre-flight capability guard and the submit step may name it.
+  const holders = (job.steps ?? []).filter((step) =>
+    JSON.stringify(step).includes('SECURITY_ADVISORY_TOKEN'),
+  );
+  assert.equal(holders.length, 2, 'exactly the guard and the submit step may hold it');
+});
 
-  // Findings for a historical target must fail closed rather than be published
-  // (public repository: no raw-findings artifact) or mis-attributed.
-  const fallback = (job.steps ?? []).find(
-    (step) => /is_main_tip != 'true'/.test(step.if ?? ''),
+test('the model job fails closed when the advisory credential is missing', () => {
+  const job = audit.doc.jobs['model-audit'];
+  const guard = (job.steps ?? []).find(
+    (step) =>
+      /SECURITY_ADVISORY_TOKEN/.test(JSON.stringify(step)) &&
+      !/submit-report\.mjs/.test(step.run ?? ''),
   );
-  assert.ok(fallback, 'historical targets need an explicit fail-closed path');
-  assert.match(fallback.run, /exit 1/);
+  assert.ok(guard, 'the model job needs a credential pre-flight guard');
+  assert.match(guard.run, /exit 1/);
+  assert.equal(
+    /continue-on-error/.test(JSON.stringify(guard)),
+    false,
+    'the guard must be able to fail the job',
+  );
 });
 
 test('validate-inputs publishes the outputs the attribution gates depend on', () => {
@@ -496,41 +556,46 @@ test('the model job cannot run before the secret scan succeeds', () => {
   );
 });
 
-// Secret-scan output is the one artifact that can disclose an unrotated
-// credential's location. Everything published outside the job log must be
-// counts only: a rule identifier paired with a file path tells a reader which
-// file holds which credential class, which is pre-rotation disclosure.
-test('the secret-scan job publishes counts only and deletes the raw report first', () => {
+// Secret-scan output is the one file that can disclose an unrotated
+// credential's location. It never leaves the job: the raw report is deleted
+// in-job, the sanitized summary is counts only and is consumed solely by the
+// fail gate, and nothing is uploaded or written to a job summary. A rule
+// identifier paired with a file path tells a reader which file holds which
+// credential class, which is pre-rotation disclosure.
+test('the secret-scan job keeps every report inside the job', () => {
   const steps = audit.doc.jobs['secret-scan'].steps;
   const sanitizeIndex = steps.findIndex(
     (step) => typeof step.run === 'string' && /rm -f \.security-audit\/gitleaks\.json/.test(step.run),
   );
-  const uploadIndex = steps.findIndex(
-    (step) => typeof step.uses === 'string' && step.uses.startsWith('actions/upload-artifact@'),
-  );
   assert.ok(sanitizeIndex >= 0, 'the raw gitleaks report must be deleted in-job');
-  assert.ok(uploadIndex >= 0, 'the sanitized summary is uploaded');
-  assert.ok(
-    sanitizeIndex < uploadIndex,
-    'the raw report must be gone before any upload step runs',
-  );
-
-  const uploadPath = steps[uploadIndex].with.path;
-  assert.equal(uploadPath, '.security-audit/gitleaks-summary.json');
-  assert.equal(
-    /gitleaks\.json$/.test(uploadPath),
-    false,
-    'the raw report must never be uploaded',
-  );
 
   for (const step of steps) {
+    assert.equal(
+      /actions\/upload-artifact@/.test(step.uses ?? ''),
+      false,
+      'no scan output may leave the job as an artifact',
+    );
     if (typeof step.run !== 'string') continue;
     assert.equal(
-      /gitleaks\.json"? >> "?\$\{?GITHUB_STEP_SUMMARY/.test(step.run),
+      /GITHUB_STEP_SUMMARY/.test(step.run),
       false,
-      'the raw report must never reach the public job summary',
+      'no scan output may reach the public job summary',
     );
   }
+
+  // The console log is a disclosure channel too: gitleaks prints matches.
+  const scan = steps.find((step) => step.id === 'scan');
+  assert.ok(scan, 'the scan step must be identifiable for the fail gate');
+  assert.match(scan.run, /gitleaks-console\.log 2>&1/);
+  assert.match(scan.run, /rm -f \.security-audit\/gitleaks-console\.log/);
+});
+
+test('the secret-scan failure message names no rule, path or count', () => {
+  const steps = audit.doc.jobs['secret-scan'].steps;
+  const gate = steps.find((step) => /steps\.scan\.outcome == 'failure'/.test(step.if ?? ''));
+  assert.ok(gate, 'a fail gate must re-raise the suppressed scan failure');
+  assert.match(gate.run, /Security audit: FAIL — details were reported privately to maintainers\./);
+  assert.equal(/gitleaks-summary|RuleID|jq /.test(gate.run), false);
 });
 
 // `npm install -g <pkg>@<version>` still resolves ranged transitive
@@ -783,6 +848,10 @@ test('the model layer remains disabled: nothing in the repository enables it', (
     audit.code.includes("vars.SECURITY_AUDIT_AI_ENABLED == 'true'"),
     'the model job must stay gated on an opt-in repository variable',
   );
+  assert.ok(
+    audit.code.includes("vars.SECURITY_AUDIT_PRIVATE_REPORTING_ENABLED == 'true'"),
+    'the model job must also stay gated on private reporting being enabled',
+  );
 
   for (const file of readdirSync(WORKFLOW_DIR)) {
     if (!/\.ya?ml$/.test(file)) continue;
@@ -791,6 +860,11 @@ test('the model layer remains disabled: nothing in the repository enables it', (
       raw,
       /SECURITY_AUDIT_AI_ENABLED\s*[:=]\s*['"]?true/,
       `${file} must not set the model-layer variable`,
+    );
+    assert.doesNotMatch(
+      raw,
+      /SECURITY_AUDIT_PRIVATE_REPORTING_ENABLED\s*[:=]\s*['"]?true/,
+      `${file} must not set the private-reporting variable`,
     );
   }
 

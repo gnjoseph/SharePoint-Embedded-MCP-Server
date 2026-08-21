@@ -3,8 +3,9 @@
  *
  * Every assertion here exercises a trust boundary: what the model is allowed to
  * see (corpus collection), what it is allowed to say (schema validation and
- * redaction), and what leaves the workflow (sanitised findings and SARIF).
- * They run entirely offline and require no credential.
+ * redaction), and what leaves the workflow (counts-only deterministic summaries
+ * and a fixed public verdict; findings themselves leave only as a private
+ * vulnerability report). They run entirely offline and require no credential.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -30,9 +31,9 @@ import {
   DELIMITER_NEUTRALIZED,
   DELIMITER_SENTINEL,
   MAX_FINDINGS,
+  PUBLIC_SUMMARY_FAIL,
+  PUBLIC_SUMMARY_PASS,
   SEVERITIES,
-  TOOL_NAME,
-  TOOL_URI,
   corpusDelimiters,
   generateCorpusNonce,
   neutralizeDelimiters,
@@ -43,7 +44,6 @@ import { validateFindings, extractJson } from '../validate-response.mjs';
 import { FULL_SHA } from '../validate-target.mjs';
 import { renderTemplate, templateValues } from '../build-prompt.mjs';
 import { checkCompositeActions, checkWorkflowSource, collectFiles } from '../check-action-pins.mjs';
-import { toSarif } from '../to-sarif.mjs';
 import { sanitizeNpmAudit, sanitizeGitleaks } from '../sanitize-findings.mjs';
 import { modelStatus, buildSummary } from '../summarize.mjs';
 
@@ -219,15 +219,16 @@ test('an ancestor commit without the audit helpers is still a valid target', () 
   assert.match(result.stdout, new RegExp(`target_sha=${HISTORICAL_TARGET}\\b`));
 });
 
-test('target ref and main-tip status are published for SARIF attribution', () => {
+test('target ref and main-tip status are recorded for the audited commit', () => {
   const tip = runScript('validate-target.mjs', []);
   assert.equal(tip.status, 0, tip.stderr);
   assert.match(tip.stdout, /target_ref=refs\/heads\/main\b/);
   assert.match(tip.stdout, /is_main_tip=true\b/);
 
-  // A historical target cannot be represented in code scanning: `sha` must be
-  // the HEAD of `ref`. The flag lets the workflow suppress the upload instead of
-  // mis-attributing findings to the current tip.
+  // Nothing is published on the basis of this flag: model findings leave the
+  // workflow only as a private vulnerability report whose summary names the
+  // audited commit explicitly, so a historical target cannot be mis-attributed.
+  // The output survives as run provenance for the maintainer reading a report.
   const historical = runScript('validate-target.mjs', ['--ref', HISTORICAL_TARGET]);
   assert.equal(historical.status, 0, historical.stderr);
   assert.match(historical.stdout, /target_ref=refs\/heads\/main\b/);
@@ -714,6 +715,21 @@ test('npm audit reports are reduced to counts', () => {
   const text = JSON.stringify(sanitized);
   assert.equal(/some-pkg/.test(text), false, 'package names must not leak');
   assert.match(text, /"high":\s*3/);
+
+  // A sanitized report is the only thing a maintainer sees about a dependency
+  // failure, and an advisory link names the vulnerable package and the exact
+  // weakness. Counts only: no URLs, no GHSA or CVE identifiers, no severity
+  // titles, and no key other than `kind` and the five count buckets.
+  assert.equal(/https?:/.test(text), false, 'advisory URLs must not leak');
+  assert.equal(/GHSA-|CVE-/i.test(text), false, 'advisory identifiers must not leak');
+  assert.deepEqual(Object.keys(sanitized).sort(), ['counts', 'kind']);
+  assert.deepEqual(Object.keys(sanitized.counts).sort(), [
+    'critical',
+    'high',
+    'info',
+    'low',
+    'moderate',
+  ]);
 });
 
 test('gitleaks reports never carry secret material', () => {
@@ -734,12 +750,13 @@ test('gitleaks reports never carry secret material', () => {
   assert.equal(sanitized.total, 1);
 });
 
-// The sanitized gitleaks summary reaches two public surfaces: the job summary
-// and the `secret-scan-summary` artifact. Before the secret is rotated, a rule
-// identifier paired with a path states which file holds which class of
-// credential, which is itself disclosure. The summary therefore carries counts
-// only. Actions logs are world-readable on a public repository, so the scanner
-// console output is discarded in the job as well; triage is a local re-run.
+// The sanitized gitleaks summary exists so a maintainer can be told *that* the
+// scan fired without being told what fired. It reaches no public surface at all
+// — there is no artifact and no job summary write — but it is still reduced to
+// counts, because a rule identifier paired with a path states which file holds
+// which class of credential, which is itself disclosure. Actions logs are
+// world-readable on a public repository, so the scanner console output is
+// discarded in the job as well; triage is a local re-run by a maintainer.
 test('the sanitized gitleaks summary publishes counts without locations', () => {
   const sanitized = sanitizeGitleaks([
     { RuleID: 'generic-api-key', File: 'src/a.ts', StartLine: 3, Secret: 'x' },
@@ -768,6 +785,11 @@ test('the sanitized gitleaks summary publishes counts without locations', () => 
 // Status reporting when no credential exists
 // ---------------------------------------------------------------------------
 
+// `modelStatus` still exists because the workflow needs to decide whether the
+// model layer ran, but its value is deliberately *not* rendered: publishing
+// "AI COMPLETED" against a run that produced findings tells a reader that this
+// commit has open, unfixed model findings. The status is retained for the
+// summarize unit contract and for local debugging only.
 test('a skipped model job reports NOT_CONFIGURED rather than success', () => {
   assert.equal(modelStatus('skipped', false), 'AI NOT_CONFIGURED');
   assert.equal(modelStatus('', false), 'AI NOT_CONFIGURED');
@@ -777,61 +799,81 @@ test('a skipped model job reports NOT_CONFIGURED rather than success', () => {
   assert.equal(modelStatus('success', false), 'AI COMPLETED');
 });
 
-test('the summary passes on deterministic jobs while flagging the missing model', () => {
+// The public verdict is one of exactly two fixed literals. Anything else — a
+// scanner name, a path, a rule identifier, a count, an advisory link, the
+// audited commit, the audited scope, even the model status — would let a reader
+// of the public run page infer something about an unfixed weakness.
+test('a passing summary renders the generic PASS literal and nothing else', () => {
   const summary = buildSummary({
-    codeql: 'success',
     'dependency-audit': 'success',
     'secret-scan': 'success',
     'action-pins': 'success',
     model: 'skipped',
     'dry-run': 'false',
-    target: 'a'.repeat(40),
-    scope: 'server-core',
   });
   assert.equal(summary.failed, false);
   assert.equal(summary.status, 'AI NOT_CONFIGURED');
-  assert.match(summary.markdown, /AI NOT_CONFIGURED/);
-  assert.equal(/AI (PASS|passed|clean)/i.test(summary.markdown), false);
-  assert.match(summary.markdown, /no\*\* claim|no claim/i);
+  assert.equal(summary.markdown, `${PUBLIC_SUMMARY_PASS}\n`);
+  assert.equal(/AI |NOT_CONFIGURED|COMPLETED/.test(summary.markdown), false);
 });
 
-test('a failed deterministic job fails the summary', () => {
+test('a failing summary renders the generic FAIL literal that points at private reporting', () => {
   const summary = buildSummary({
-    codeql: 'failure',
-    'dependency-audit': 'success',
+    'dependency-audit': 'failure',
     'secret-scan': 'success',
     'action-pins': 'success',
     model: 'skipped',
     'dry-run': 'false',
-    target: 'a'.repeat(40),
-    scope: 'server-core',
   });
   assert.equal(summary.failed, true);
+  assert.equal(summary.markdown, `${PUBLIC_SUMMARY_FAIL}\n`);
+  assert.match(summary.markdown, /reported privately to maintainers/);
+});
+
+// Whatever the inputs, the rendered markdown must be one of the two approved
+// literals. A summary that grew a per-job table or an interpolated commit would
+// be a disclosure regression that no single-case assertion would catch.
+test('every summary permutation renders one of exactly two approved literals', () => {
+  const results = ['success', 'failure', 'skipped', 'cancelled', ''];
+  const approved = new Set([`${PUBLIC_SUMMARY_PASS}\n`, `${PUBLIC_SUMMARY_FAIL}\n`]);
+  for (const dependency of results) {
+    for (const secret of results) {
+      for (const pins of results) {
+        for (const model of results) {
+          const summary = buildSummary({
+            'dependency-audit': dependency,
+            'secret-scan': secret,
+            'action-pins': pins,
+            model,
+            'dry-run': 'false',
+            // Deliberately supply the fields the old renderer interpolated: a
+            // caller passing them must not be able to reach the summary text.
+            target: 'a'.repeat(40),
+            scope: 'server-core',
+            codeql: 'failure',
+          });
+          assert.ok(
+            approved.has(summary.markdown),
+            `unexpected summary markdown: ${JSON.stringify(summary.markdown)}`,
+          );
+          assert.equal(/a{40}|server-core|codeql/i.test(summary.markdown), false);
+        }
+      }
+    }
+  }
 });
 
 test('a missing deterministic job result is treated as a failure, never a pass', () => {
   const summary = buildSummary({ model: 'success' });
   assert.equal(summary.failed, true);
+  assert.equal(summary.markdown, `${PUBLIC_SUMMARY_FAIL}\n`);
 });
 
 // ---------------------------------------------------------------------------
-// SARIF conversion and the offline dry run
+// The offline dry run
 // ---------------------------------------------------------------------------
 
-test('sarif conversion emits locations and marks synthetic runs', () => {
-  const sarif = toSarif({ findings: [finding()] }, { synthetic: true });
-  assert.equal(sarif.version, '2.1.0');
-  assert.match(sarif.$schema, /sarif/);
-  const run = sarif.runs[0];
-  assert.equal(run.tool.driver.name, TOOL_NAME);
-  assert.equal(run.tool.driver.informationUri, TOOL_URI);
-  const location = run.results[0].locations[0].physicalLocation;
-  assert.equal(location.artifactLocation.uri, 'src/index.ts');
-  assert.equal(location.region.startLine, 12);
-  assert.match(JSON.stringify(run).toLowerCase(), /synthetic/);
-});
-
-test('the offline dry run produces a validated report and SARIF without credentials', () => {
+test('the offline dry run produces a validated report without credentials', () => {
   const out = tempDir('spe-dryrun-');
   const result = runScript('dry-run.mjs', ['--scope', 'server-core', '--out', out]);
   assert.equal(result.status, 0, result.stderr);
@@ -839,55 +881,43 @@ test('the offline dry run produces a validated report and SARIF without credenti
 
   const produced = readdirSync(out);
   assert.ok(produced.includes('model-report.json'));
-  assert.ok(produced.includes('model-report.sarif'));
+
+  // No SARIF, ever: a SARIF file is the artefact that would be uploaded to code
+  // scanning, and code scanning alerts are world-readable on a public
+  // repository. The converter was deleted rather than left unwired.
+  assert.equal(
+    produced.some((name) => /\.sarif$/i.test(name)),
+    false,
+    'the dry run must not produce a SARIF file',
+  );
+  assert.equal(existsSync(path.join(SCRIPT_DIR, 'to-sarif.mjs')), false);
 
   const report = JSON.parse(readFileSync(path.join(out, 'model-report.json'), 'utf8'));
+  assert.equal(report.schemaVersion, 1);
+  assert.ok(Array.isArray(report.findings));
   assert.ok(report.findings.length > 0, 'the dry run must exercise the accept path');
 
-  const sarif = JSON.parse(readFileSync(path.join(out, 'model-report.sarif'), 'utf8'));
-  assert.equal(sarif.runs[0].tool.driver.name, TOOL_NAME);
-  assert.equal(sarif.runs[0].results.length, report.findings.length);
-
   const manifest = JSON.parse(readFileSync(path.join(out, 'corpus-manifest.json'), 'utf8'));
-  for (const result_ of sarif.runs[0].results) {
-    const uri = result_.locations[0].physicalLocation.artifactLocation.uri;
-    assert.ok(manifest.files[uri], `${uri} escaped the corpus`);
+  for (const item of report.findings) {
+    assert.ok(manifest.files[item.file], `${item.file} escaped the corpus`);
   }
 });
 
-test('sarif messages carry the finding detail rather than a dropped field', () => {
-  const detail = 'The handler concatenates unvalidated input into a shell string.';
-  const sarif = toSarif({ findings: [finding({ detail })] }, {});
-  const message = sarif.runs[0].results[0].message.text;
-  assert.ok(message.includes(detail), 'the detail field must reach the SARIF message');
-  assert.ok(!message.includes('undefined'), 'no required field may serialize to undefined');
-});
+// The dry run is the one path a contributor is invited to run locally, so it is
+// also the path most likely to print a finding onto a terminal that is later
+// pasted into a public issue. Its stdout is a single generic line.
+test('the dry run prints no finding detail on stdout', () => {
+  const out = tempDir('spe-dryrun-quiet-');
+  const result = runScript('dry-run.mjs', ['--scope', 'server-core', '--out', out]);
+  assert.equal(result.status, 0, result.stderr);
 
-// The SARIF writer used to carry its own severity table with a silent `??`
-// fallback, so a vocabulary change in constants.mjs would have downgraded an
-// unmapped severity to `warning` / 5.0 instead of failing. One canonical
-// vocabulary now spans prompt, validator, SARIF and tests: every severity must
-// map, and anything outside the vocabulary must be a hard error.
-test('sarif maps every canonical severity and refuses an unmapped one', () => {
-  const levels = new Set();
-  for (const severity of SEVERITIES) {
-    const sarif = toSarif({ findings: [finding({ severity })] }, {});
-    const result_ = sarif.runs[0].results[0];
-    assert.ok(result_.level, `severity ${severity} produced no SARIF level`);
-    assert.match(
-      result_.properties['security-severity'],
-      /^\d+(\.\d+)?$/,
-      `severity ${severity} produced no numeric security-severity`,
-    );
-    levels.add(result_.level);
+  const report = JSON.parse(readFileSync(path.join(out, 'model-report.json'), 'utf8'));
+  for (const item of report.findings) {
+    assert.equal(result.stdout.includes(item.title), false, 'finding titles must not print');
+    assert.equal(result.stdout.includes(item.detail), false, 'finding detail must not print');
+    assert.equal(result.stdout.includes(item.file), false, 'finding paths must not print');
   }
-  assert.ok(levels.size > 1, 'the severity vocabulary must not collapse to one SARIF level');
-
-  assert.throws(
-    () => toSarif({ findings: [finding({ severity: 'info' })] }, {}),
-    /Unmapped finding severity/,
-    'an out-of-vocabulary severity must fail closed rather than default',
-  );
+  assert.equal(result.stdout.trim().split('\n').length, 1, 'stdout must be a single line');
 });
 
 // ---------------------------------------------------------------------------
@@ -1017,8 +1047,12 @@ test('the action-pin scan refuses a symlinked directory and cannot loop', (t) =>
   assert.throws(() => collectFiles(workflows, (name) => name.endsWith('.yml')), /symlink/i);
 });
 
-test('no audit script creates issues, comments or performs repository writes', () => {
-  const offenders = [];
+/**
+ * Walks every non-test audit script and hands each one to the visitor as a
+ * `{ relative, source }` pair. Fixtures and tests are skipped so that sample
+ * data never counts as production behaviour.
+ */
+const walkAuditScripts = (visit) => {
   const walk = (dir) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
@@ -1028,12 +1062,57 @@ test('no audit script creates issues, comments or performs repository writes', (
         continue;
       }
       if (!/\.mjs$/.test(entry.name)) continue;
-      const source = readFileSync(full, 'utf8');
-      if (/gh\s+issue|createIssue|createComment|octokit|api\.github\.com|git\s+push/.test(source)) {
-        offenders.push(full);
-      }
+      visit({
+        relative: path.relative(SCRIPT_DIR, full).split(path.sep).join('/'),
+        source: readFileSync(full, 'utf8'),
+      });
     }
   };
   walk(SCRIPT_DIR);
+};
+
+test('no audit script creates issues, comments or performs repository writes', () => {
+  const offenders = [];
+  walkAuditScripts(({ relative, source }) => {
+    if (/gh\s+issue|createIssue|createComment|octokit|git\s+push/.test(source)) {
+      offenders.push(relative);
+    }
+  });
   assert.deepEqual(offenders, []);
+});
+
+test('only the private reporting submitter may name the GitHub API host', () => {
+  // The audit publishes nothing. The single permitted egress is the private
+  // vulnerability report, so `api.github.com` may appear in exactly two files:
+  // the constant that defines the base URL, and the submitter that posts to it.
+  const allowed = new Set(['lib/constants.mjs', 'submit-report.mjs']);
+  const offenders = [];
+  walkAuditScripts(({ relative, source }) => {
+    if (/api\.github\.com/.test(source) && !allowed.has(relative)) {
+      offenders.push(relative);
+    }
+  });
+  assert.deepEqual(offenders, []);
+});
+
+test('the only GitHub endpoint referenced anywhere is the private report endpoint', () => {
+  // A positive assertion rather than a negative one: enumerate every REST path
+  // the scripts mention and require that the private advisory endpoints are the
+  // complete set. This catches a future edit that adds issue creation, PR
+  // comments or a code scanning upload without having to guess at its shape.
+  const forbiddenSurfaces = /\/(issues|comments|pulls|code-scanning|check-runs|statuses)\b/;
+  const offenders = [];
+  const endpoints = new Set();
+  walkAuditScripts(({ relative, source }) => {
+    if (forbiddenSurfaces.test(source)) offenders.push(relative);
+    for (const match of source.matchAll(/\/repos\/\$\{[^}]+\}\/([A-Za-z0-9/-]+)/g)) {
+      endpoints.add(match[1]);
+    }
+  });
+  assert.deepEqual(offenders, []);
+  assert.deepEqual(
+    [...endpoints].sort(),
+    // The list endpoint used for deduplication, and the private report endpoint.
+    ['security-advisories', 'security-advisories/reports'],
+  );
 });

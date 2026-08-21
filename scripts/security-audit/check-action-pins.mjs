@@ -4,7 +4,8 @@
  * full 40-character commit SHA and carries a human-readable version comment.
  *
  * A floating tag (`@v4`) is mutable: whoever controls the tag controls what runs
- * inside the workflow, including in jobs that hold `security-events: write`.
+ * inside the workflow, including in the job that holds the advisory credential
+ * used to file a private vulnerability report.
  * Local (`./…`) and Docker (`docker://…`) references are out of scope.
  *
  * The check is line-based rather than YAML-based so that it still fires on files
