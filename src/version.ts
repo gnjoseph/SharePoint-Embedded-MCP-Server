@@ -33,7 +33,7 @@ export const PACKAGE_VERSION: string = packageJson.version;
  * The published npm package name, sourced from `package.json`.
  *
  * Consumed by the update-awareness check (update-check.ts) so the registry it
- * queries and the `npm install` hint it prints always name the package this
- * build was actually cut from, even if the package is ever renamed.
+ * queries and the package spec it reports always name the package this build was
+ * actually cut from, even if the package is ever renamed.
  */
 export const PACKAGE_NAME: string = packageJson.name;

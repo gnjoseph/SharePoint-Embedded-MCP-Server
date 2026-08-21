@@ -82,7 +82,9 @@ newer releases, which can also be turned off. Specifically:
   bounced to a different host.
 
   **No auto-update.** Nothing is downloaded, installed, executed, or modified. The tool only
-  *notifies* you; applying an update is always a manual `npm install` you run yourself.
+  *notifies* you; the notice is informational, and acting on it is a human decision — updating
+  means pointing your MCP client configuration (or reinstalling the copy it actually launches)
+  at a newer package spec.
 
   **Local retention.** The result is cached on your machine at
   `<data dir>/update-check.json`, written with the same owner-only permissions as the token
@@ -120,7 +122,12 @@ travels to each.
 > completeness; **this build opens no usage-analytics channel** — the only Microsoft-bound
 > signal is the product `User-Agent` attribution token described above, which is on by default
 > and can be turned off (see [Turning it off](#turning-it-off) and the
-> [Telemetry configuration](NOTICE.md#telemetry-configuration) note).
+> [Telemetry configuration](NOTICE.md#telemetry-configuration) note). Separately from anything
+> sent to Microsoft, the default-on update check contacts the public npm registry, which is
+> **not a Microsoft 365 or Azure Online Service** and is outside the M365/Azure compliance
+> boundary, the Product Terms/DPA, and the EU Data Boundary — see
+> [Update check (public npm registry)](#what-the-tool-collects-and-sends) above and
+> [NOTICE.md — Third-party services contacted](NOTICE.md#third-party-services-contacted).
 
 ## Service-side data handling
 

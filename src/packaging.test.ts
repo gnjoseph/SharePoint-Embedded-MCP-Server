@@ -146,6 +146,31 @@ describe("packaging: disclosure documents are published", () => {
     // absence is what makes the allow-list above authoritative.
     expect(existsSync(join(pkgRoot, ".npmignore"))).toBe(false);
   });
+
+  /**
+   * CELA B2: NOTICE.md is the canonical legal notice file and must both ship in
+   * the tarball and carry the third-party-services disclosure for the default-on
+   * update check. README and PRIVACY.md deep-link to that anchor, so silently
+   * dropping the section would leave dangling links in an installed copy.
+   */
+  it("packs NOTICE.md with the third-party services disclosure", () => {
+    expect((pkg.files ?? []) as string[]).toContain("NOTICE.md");
+
+    const notice = readFileSync(join(pkgRoot, "NOTICE.md"), "utf8");
+    // The anchor README.md and PRIVACY.md link to.
+    expect(notice).toMatch(/^##\s+Third-party services contacted\s*$/m);
+    // Endpoint and operator.
+    expect(notice).toContain("registry.npmjs.org");
+    expect(notice).toMatch(/npm, Inc/i);
+    // Boundary language required by CELA/Privacy review.
+    expect(notice).toMatch(/not\s+(a\s+)?Microsoft 365 or Azure Online Service/i);
+    expect(notice).toMatch(/EU Data Boundary/i);
+    expect(notice).toMatch(/Product Terms/i);
+    // No identifiers, no auto-update, and an opt-out must all be stated.
+    expect(notice).toMatch(/unauthenticated and carries no user identifier/i);
+    expect(notice).toMatch(/never downloads, installs, executes, or self-updates/i);
+    expect(notice).toContain("SPE_MCP_UPDATE_CHECK=false");
+  });
 });
 
 describe("packaging: complete metadata", () => {

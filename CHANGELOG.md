@@ -33,7 +33,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as "already notified" only when the notice is actually delivered on a tool result, so a
   process that exits before any tool call replays the notice on the next run instead of
   losing it.
-- **Boundary disclosure.** `README.md`, `PRIVACY.md`, `docs/DATA-FLOW.md`,
+- **Boundary disclosure.** `NOTICE.md` (new **Third-party services contacted** section),
+  `README.md`, `PRIVACY.md`, `docs/DATA-FLOW.md`,
   `docs/SECURITY-CONTROLS.md`, and `docs/TROUBLESHOOTING.md` document that
   `registry.npmjs.org` (npm, Inc./GitHub) is **not a Microsoft 365 or Azure Online Service** and
   is therefore the only endpoint **outside the Microsoft 365 / Azure compliance boundary** and
@@ -42,6 +43,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   metadata, and the request time; that no auto-update exists; and
   that Node's built-in `fetch` cannot route through `HTTP(S)_PROXY` — an open, unresolved
   tradeoff accepted to preserve the zero-runtime-dependency budget.
+- **Informational-only update guidance.** The update notice and `status_get` state that the
+  message is informational, that nothing is installed or changed automatically, and that
+  updating requires a person to change the MCP client configuration (or reinstall the copy the
+  client actually launches) — it is never phrased as a command to run. The guidance is
+  execution-mode neutral (`npx`, global install, or project-local install) and reports the
+  package spec to target rather than a single install command. The published package now also
+  ships `NOTICE.md`, `PRIVACY.md`, `CHANGELOG.md`, `SUPPORT.md`, `SECURITY.md`,
+  `docs/DATA-FLOW.md`, `docs/SECURITY-CONTROLS.md`, and `docs/TROUBLESHOOTING.md`, so the
+  disclosure links in the installed `README.md` resolve.
 - **Per-instance data directory.** New `--data-dir <path>` flag and `SPE_DATA_DIR`
   environment variable select where the provisioning `state.json` and MSAL token
   cache are stored (precedence: flag > env > default `~/.spe-mcp`). Point each

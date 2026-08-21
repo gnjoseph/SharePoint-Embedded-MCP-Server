@@ -40,7 +40,7 @@ function versionRows(): string {
       updateCell = "✅ up to date";
       break;
     case "update-available":
-      updateCell = `⬆️ ${status.latestVersion ?? "newer version"} available — update the package spec your MCP client launches to \`${status.updateAvailable?.packageSpec ?? ""}\``;
+      updateCell = `⬆️ ${status.latestVersion ?? "newer version"} available — informational only; updating requires a person to point the MCP client config (or the installed copy) at \`${status.updateAvailable?.packageSpec ?? ""}\``;
       break;
     default:
       updateCell = "— unavailable (registry not reachable)";

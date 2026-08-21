@@ -138,8 +138,8 @@ release and — if one exists — appends a short notice to a single tool result
 
 ```text
 Update available: @microsoft/spe-mcp 0.2.0-alpha.1 -> 0.2.0-alpha.4 (alpha channel).
-To update, point your MCP client at @microsoft/spe-mcp@alpha — update or pin the package spec in the client config (for example the npx args), or reinstall the copy you actually launch (for example npm install -g @microsoft/spe-mcp@alpha for a global install). An unpinned npx launch may keep starting a cached build.
-Nothing was downloaded or installed; this is a notification only. Disable this check with --no-update-check or SPE_MCP_UPDATE_CHECK=false.
+This notice is informational only — nothing is installed or changed automatically, and no command should be run in response to it. Updating requires a person to change the MCP client configuration or the installed package: point the client at @microsoft/spe-mcp@alpha by updating or pinning the package spec in the client config (for example the npx args), or have the copy that is actually launched (a global or project-local installation, for instance) reinstalled at that same spec. An unpinned npx launch may keep starting a cached build.
+Nothing was downloaded, installed, or executed; this is a notification only, not an instruction to run any command. Disable this check with --no-update-check or SPE_MCP_UPDATE_CHECK=false.
 ```
 
 The current version and the update state are also reported by `status_get`, so
@@ -718,7 +718,14 @@ to provide and improve products and services, and your use of the software opera
 consent to these practices (full text in [NOTICE.md](NOTICE.md#data-collection)). **This
 build opens no usage-analytics channel** — the only Microsoft-bound signal is the product
 `User-Agent` attribution token described above, which you can turn off with
-`SPE_MCP_COLLECT_TELEMETRY=false`.
+`SPE_MCP_COLLECT_TELEMETRY=false`. Separately from anything sent to Microsoft, the default-on
+[update check](#update-notifications) contacts the **public npm registry**
+(`registry.npmjs.org`, operated by npm, Inc./GitHub). That endpoint is **not a Microsoft 365 or
+Azure Online Service**: it sits **outside the Microsoft 365 / Azure compliance boundary** and is
+not covered by the Microsoft Product Terms, the Microsoft Products and Services Data Protection
+Addendum (DPA), or the EU Data Boundary. See the npm registry disclosure above and
+[NOTICE.md — Third-party services contacted](NOTICE.md#third-party-services-contacted) for what
+is and is not disclosed, and how to turn it off.
 
 **Telemetry configuration.** Attribution is gated by the `SPE_MCP_COLLECT_TELEMETRY` environment
 variable and is **on by default**. The only telemetry emitted is the static product

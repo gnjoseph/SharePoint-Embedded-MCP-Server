@@ -490,10 +490,31 @@ describe("renderNotice", () => {
     // ...warns about the unpinned npx caching trap...
     expect(text).toMatch(/npx/i);
     expect(text).toMatch(/cached build/i);
-    // ...and offers the global install only as one example among modes.
-    expect(text).toContain("for example npm install -g");
+    // ...and names the installation modes without dictating a shell command.
+    expect(text).toMatch(/global or project-local installation/i);
+    expect(text).toMatch(/reinstalled/i);
     // Still explicitly notify-only.
-    expect(text).toContain("Nothing was downloaded or installed");
+    expect(text).toContain("Nothing was downloaded, installed, or executed");
+  });
+
+  // CELA R2: the notice rides a tool result an agent may act on, so it must read
+  // as information, never as a command an autonomous client should execute.
+  it("frames remediation as informational and human-driven, not an executable command", () => {
+    const text = __testing.renderNotice({
+      package: PACKAGE_NAME,
+      current: "1.0.0-alpha.1",
+      latest: "1.0.0-alpha.2",
+      channel: "alpha",
+      packageSpec: `${PACKAGE_NAME}@alpha`,
+    });
+    expect(text).toMatch(/informational only/i);
+    expect(text).toMatch(/no command should be run in response/i);
+    expect(text).toMatch(/not an instruction to run any command/i);
+    // Updating is a person changing config, not the server acting.
+    expect(text).toMatch(/requires a person/i);
+    // No copy-pasteable install command anywhere in the notice.
+    expect(text).not.toMatch(/npm install/i);
+    expect(text).not.toMatch(/npm i\b/i);
   });
 
   it("calls out a separate stable target when one exists", () => {
