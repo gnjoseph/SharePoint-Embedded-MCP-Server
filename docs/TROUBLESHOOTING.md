@@ -100,8 +100,9 @@ Common situations:
 - **No notice appears, but a newer version exists.** The check is skipped by design when
   running from a source checkout, in CI (`CI`, `GITHUB_ACTIONS`, `TF_BUILD`, …), or when any
   opt-out is set: `SPE_MCP_UPDATE_CHECK=false` (preferred), `--no-update-check`,
-  `SPE_NO_UPDATE_CHECK=1` (alias), `NO_UPDATE_NOTIFIER=1`, or
-  `SPE_MCP_COLLECT_TELEMETRY=false`. The notice is also shown only once per detected version
+  `SPE_NO_UPDATE_CHECK=1` (legacy alias), `NO_UPDATE_NOTIFIER=1`, or
+  `SPE_MCP_COLLECT_TELEMETRY=false` (the telemetry opt-out suppresses the registry request
+  entirely; it does not merely omit the `User-Agent`). The notice is also shown only once per detected version
   per cache. Run `status_get` to see the **Update check** row, which reports the exact state
   and skip reason. When skipped, **no network request, stderr notice, or cache write occurs**.
 - **Offline, proxied, or firewalled registry.** The lookup has a 2-second timeout and fails

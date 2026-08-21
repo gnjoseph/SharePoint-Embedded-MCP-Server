@@ -18,7 +18,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reported separately), adds **zero new runtime dependencies**, and is skipped
   automatically in CI and when running from a source checkout. Disable it with
   `SPE_MCP_UPDATE_CHECK=false` (preferred), `--no-update-check`, `SPE_NO_UPDATE_CHECK=1`
-  (backward-compatible alias), `NO_UPDATE_NOTIFIER=1`, or `SPE_MCP_COLLECT_TELEMETRY=false`;
+  (legacy alias), `NO_UPDATE_NOTIFIER=1`, or `SPE_MCP_COLLECT_TELEMETRY=false` (the telemetry
+  opt-out suppresses the registry request entirely);
   when disabled, **no network request, stderr notice, or cache write occurs**. Point it at a
   mirror with `SPE_NPM_REGISTRY` (HTTPS-only).
 - **Transparency for the update check.** Before the first registry request in a process, the
@@ -34,9 +35,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   losing it.
 - **Boundary disclosure.** `README.md`, `PRIVACY.md`, `docs/DATA-FLOW.md`,
   `docs/SECURITY-CONTROLS.md`, and `docs/TROUBLESHOOTING.md` document that
-  `registry.npmjs.org` (npm, Inc./GitHub) is the only endpoint **outside the Microsoft 365 /
-  Azure compliance boundary** and outside EU Data Boundary commitments, that the connection
-  discloses IP address / static `User-Agent` / request time, that no auto-update exists, and
+  `registry.npmjs.org` (npm, Inc./GitHub) is **not a Microsoft 365 or Azure Online Service** and
+  is therefore the only endpoint **outside the Microsoft 365 / Azure compliance boundary** and
+  not covered by the Microsoft Product Terms, the DPA, or EU Data Boundary commitments; that the
+  connection discloses IP address, the static `User-Agent`, standard TLS/HTTP connection
+  metadata, and the request time; that no auto-update exists; and
   that Node's built-in `fetch` cannot route through `HTTP(S)_PROXY` — an open, unresolved
   tradeoff accepted to preserve the zero-runtime-dependency budget.
 - **Per-instance data directory.** New `--data-dir <path>` flag and `SPE_DATA_DIR`
@@ -53,8 +56,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   exactly one fixed package path with no query string; redirects and cross-host responses are
   rejected. It is unauthenticated (no `Authorization`, cookies, `credentials: "omit"`, no
   `.npmrc`, no `npm` subprocess), sends **no install GUID, machine, user, tenant, subscription,
-  correlation, or session identifier**, and omits the product `User-Agent` when
-  `SPE_MCP_COLLECT_TELEMETRY=false`. It is bounded by a 2-second timeout and a 64 KB response
+  correlation, or session identifier**, and discloses only what any HTTPS connection reveals
+  (IP address, the static product `User-Agent`, and standard TLS/HTTP connection metadata).
+  Setting `SPE_MCP_COLLECT_TELEMETRY=false` suppresses the registry request entirely.
+  It is bounded by a 2-second timeout and a 64 KB response
   cap, parsed with strict SemVer and prototype-pollution-safe key filtering, and cached
   owner-only (SEC-003) with a 24-hour TTL — a failed check backs off for the same 24 hours,
   so at most one request per day is made either way — deleted on `logout` /

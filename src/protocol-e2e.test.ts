@@ -81,8 +81,10 @@ describe("MCP protocol-level e2e (spawned dist/cli.js start)", () => {
     delete env.SPE_TOOLS;
     // SEC-008: keep this suite hermetic. The update check is fire-and-forget and
     // would otherwise reach registry.npmjs.org from a test process. Opting out
-    // also exercises the documented kill switch over the real wire.
-    env.SPE_NO_UPDATE_CHECK = "1";
+    // also exercises the documented kill switch over the real wire — using the
+    // preferred public control (`SPE_NO_UPDATE_CHECK` is only a legacy alias).
+    env.SPE_MCP_UPDATE_CHECK = "false";
+    delete env.SPE_NO_UPDATE_CHECK;
     delete env.SPE_NPM_REGISTRY;
 
     transport = new StdioClientTransport({

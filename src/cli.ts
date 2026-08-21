@@ -78,7 +78,7 @@ program
   .option("--data-dir <path>", DATA_DIR_OPTION)
   .option(
     "--no-update-check",
-    "Do not contact the public npm registry to check whether a newer version of this server has been published. Can also be set via SPE_NO_UPDATE_CHECK or NO_UPDATE_NOTIFIER (truthy).",
+    "Do not contact the public npm registry to check whether a newer version of this server has been published. Can also be set via SPE_MCP_UPDATE_CHECK=false (preferred), SPE_NO_UPDATE_CHECK=1 (legacy alias), NO_UPDATE_NOTIFIER=1, or SPE_MCP_COLLECT_TELEMETRY=false.",
   )
   .action(
     async (options: {

@@ -150,8 +150,11 @@ How it behaves:
   redirects rejected. No credentials, cookies, `.npmrc`, or `npm` subprocess are
   involved, and **no install GUID, machine, user, tenant, subscription, or
   session identifier** is sent. As with any HTTPS request, npm sees your IP
-  address, the static `User-Agent` `spe-mcp-server/<version>` (omitted when
-  telemetry is off), and the time of the request.
+  address, the static `User-Agent` `spe-mcp-server/<version>`, standard TLS/HTTP
+  connection metadata (TLS handshake and SNI, `Host`/`Accept` headers, timing),
+  and the time of the request. Opting out of telemetry
+  (`SPE_MCP_COLLECT_TELEMETRY=false`) suppresses the request entirely, so none of
+  that is disclosed.
 - **Announced.** Before the first check in a process, a one-time notice is
   printed to **stderr** naming the endpoint, the boundary, and the opt-out.
 - **Cached locally.** The result is stored owner-only at
@@ -160,9 +163,11 @@ How it behaves:
   the path.
 
 > ⚠️ **Boundary note.** `registry.npmjs.org` is operated by npm, Inc. (GitHub).
-> It is the **only** endpoint this server contacts that is **outside the
-> Microsoft 365 / Azure compliance boundary** and outside EU Data Boundary
-> commitments. Disable the update check to remove it entirely.
+> It is **not a Microsoft 365 or Azure Online Service**, so it is not covered by
+> the Microsoft Product Terms, the Microsoft Products and Services Data
+> Protection Addendum (DPA), or the EU Data Boundary. It is the **only** endpoint
+> this server contacts that is **outside the Microsoft 365 / Azure compliance
+> boundary**. Disable the update check to remove it entirely.
 
 > **Known limitation.** Node's built-in `fetch` does not honour `HTTP_PROXY` /
 > `HTTPS_PROXY` / `NO_PROXY`, so this request cannot be routed through an egress
@@ -177,9 +182,9 @@ CI, and can be turned off explicitly:
 ```bash
 SPE_MCP_UPDATE_CHECK=false spe-mcp start     # preferred env var
 spe-mcp start --no-update-check              # flag
-SPE_NO_UPDATE_CHECK=1 spe-mcp start          # backward-compatible alias
+SPE_NO_UPDATE_CHECK=1 spe-mcp start          # legacy alias
 NO_UPDATE_NOTIFIER=1 spe-mcp start           # community-standard opt-out
-SPE_MCP_COLLECT_TELEMETRY=false spe-mcp start # telemetry opt-out also disables it
+SPE_MCP_COLLECT_TELEMETRY=false spe-mcp start # telemetry opt-out suppresses the request entirely
 ```
 
 When disabled, **no network request, no stderr notice, and no cache write happen
@@ -262,9 +267,9 @@ The server accepts configuration via CLI flags or environment variables:
 | `--read-only` | `SPE_READ_ONLY` | Advertise/allow only read/list/get/search tools; reject mutating calls |
 | `--tools` | `SPE_TOOLS` | Restrict exposed tools to a profile (`readOnly`, `docsOnly`, `provisioning`, `content`, `admin`) or a comma-separated tool list |
 | `--data-dir` | `SPE_DATA_DIR` | Directory for the token cache + provisioning state (default `~/.spe-mcp`). Point each instance at a unique **absolute** path (or `~/...`; CWD-relative paths are rejected) to run multiple servers without clobbering state |
-| `--no-update-check` | `SPE_MCP_UPDATE_CHECK=false` | Disable the once-a-day npm version check that tells you when a newer server release is published (see [Update notifications](#update-notifications)). Also honours `SPE_NO_UPDATE_CHECK=1` (alias), the community-standard `NO_UPDATE_NOTIFIER=1`, and `SPE_MCP_COLLECT_TELEMETRY=false`. When disabled, no network request, stderr notice, or cache write occurs |
-| _(none)_ | `SPE_NPM_REGISTRY` | Registry base URL for the update check (default `https://registry.npmjs.org` — npm, Inc./GitHub, **outside the Microsoft 365 / Azure compliance boundary**). **HTTPS only**; credentials, query strings, and fragments are rejected |
-| _(none)_ | `SPE_MCP_COLLECT_TELEMETRY` | Product `User-Agent` attribution token on outbound Graph/ARM requests. On by default; set to `false` to opt out — this also disables the update check entirely (see [PRIVACY.md](PRIVACY.md)) |
+| `--no-update-check` | `SPE_MCP_UPDATE_CHECK=false` | Disable the once-a-day npm version check that tells you when a newer server release is published (see [Update notifications](#update-notifications)). Also honours `SPE_NO_UPDATE_CHECK=1` (**legacy alias**), the community-standard `NO_UPDATE_NOTIFIER=1`, and `SPE_MCP_COLLECT_TELEMETRY=false`. When disabled, no network request, stderr notice, or cache write occurs |
+| _(none)_ | `SPE_NPM_REGISTRY` | Registry base URL for the update check (default `https://registry.npmjs.org` — npm, Inc./GitHub, **not a Microsoft 365 or Azure Online Service** and outside the Microsoft 365 / Azure compliance boundary). **HTTPS only**; credentials, query strings, and fragments are rejected |
+| _(none)_ | `SPE_MCP_COLLECT_TELEMETRY` | Product `User-Agent` attribution token on outbound Graph/ARM requests. On by default; set to `false` to opt out — this also suppresses the update-check request entirely (see [PRIVACY.md](PRIVACY.md)) |
 
 > The CLI flag wins when both a flag and its env var are set. Run
 > `spe-mcp start --help` to see the authoritative option list and descriptions.
@@ -669,22 +674,26 @@ details see [PRIVACY.md](PRIVACY.md) and [docs/DATA-FLOW.md](docs/DATA-FLOW.md);
 handling of data you send to its online services is described in the
 [Microsoft Privacy Statement](https://privacy.microsoft.com/privacystatement).
 
-The one **non-Microsoft** destination is the public npm registry
-(`https://registry.npmjs.org`, operated by npm, Inc./GitHub), contacted at most once a day by
-the [update check](#update-notifications) to read the published version list for
-`@microsoft/spe-mcp`. ⚠️ This endpoint is **outside the Microsoft 365 / Azure compliance
-boundary**, is not covered by the Microsoft Product Terms or DPA, and is outside EU Data
-Boundary commitments. The request is **unauthenticated and anonymous** — exactly
+The one destination that is **not a Microsoft 365 or Azure Online Service** is the public npm
+registry (`https://registry.npmjs.org`, operated by npm, Inc./GitHub), contacted at most once a
+day by the [update check](#update-notifications) to read the published version list for
+`@microsoft/spe-mcp`. ⚠️ Because it is not a Microsoft Online Service, it is **not covered by the
+Microsoft Product Terms, the Microsoft Products and Services Data Protection Addendum (DPA), or
+the EU Data Boundary**, and it is **outside the Microsoft 365 / Azure compliance
+boundary**. The request is **unauthenticated and anonymous** — exactly
 `GET https://registry.npmjs.org/@microsoft%2fspe-mcp` with no query string, no credentials or
 cookies, redirects rejected, and **no install GUID, machine, user, tenant, subscription,
 correlation, or session identifier**; it is an ordinary public package lookup, identical to
 what `npm view` would issue. As with any HTTPS request, npm can observe your **IP address**,
-the static `User-Agent` (omitted when telemetry is off), and the **time of the request**;
+the static `User-Agent`, **standard TLS/HTTP connection metadata** (TLS handshake and SNI,
+`Host`/`Accept` headers, request timing), and the **time of the request**;
 those are disclosed by the connection itself, not added by this tool. Nothing is downloaded,
 installed, or executed — there is **no auto-update**. Before the first check, a one-time
 notice naming the endpoint and the opt-out is printed to **stderr**. Disable it with
-`SPE_MCP_UPDATE_CHECK=false` (preferred), `--no-update-check`, `SPE_NO_UPDATE_CHECK=1`,
-`NO_UPDATE_NOTIFIER=1`, or `SPE_MCP_COLLECT_TELEMETRY=false`; when disabled, the request is
+`SPE_MCP_UPDATE_CHECK=false` (preferred), `--no-update-check`, `SPE_NO_UPDATE_CHECK=1` (legacy
+alias), `NO_UPDATE_NOTIFIER=1`, or `SPE_MCP_COLLECT_TELEMETRY=false` — the telemetry opt-out
+suppresses the registry request **entirely**, it does not merely drop the `User-Agent`. When
+disabled, the request is
 never made and nothing is cached. It is also skipped automatically in CI and in source
 checkouts. The cached result lives at `<data dir>/update-check.json`, is retained until you
 delete it, and is removed by `spe-mcp logout` / `spe-mcp auth --reset`. npm's own handling of
@@ -713,10 +722,12 @@ This tool performs **no independent cross-region processing** and stores no cust
 of its own. Because it calls your own tenant's Microsoft Graph and Azure endpoints, data
 location, residency, and **EU Data Boundary (EUDB)** commitments follow the underlying
 Microsoft Online Services and your tenant configuration — not this tool. The only additional
-endpoint is the read-only, public [Microsoft Learn MCP](https://learn.microsoft.com/api/mcp)
+Microsoft endpoint is the read-only, public [Microsoft Learn MCP](https://learn.microsoft.com/api/mcp)
 documentation service (no authentication, no customer data; host-validated per **SEC-007**),
-which can be disabled with `--tools`. All outbound calls target Microsoft-operated services;
-the server contacts **no non-Microsoft services**.
+which can be disabled with `--tools`. Apart from the opt-out-able npm update check described
+above, all outbound calls target Microsoft-operated services; the public npm registry is the
+**only** endpoint that is **not a Microsoft 365 or Azure Online Service** and therefore the only
+one outside Product Terms / DPA / EUDB coverage.
 
 ### Compliance responsibility
 

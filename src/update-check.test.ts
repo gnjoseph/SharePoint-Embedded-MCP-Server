@@ -1086,6 +1086,34 @@ describe("privacy: cache retention and deletion", () => {
     }).not.toThrow();
   });
 
+  // Deleting the cache is a privacy promise: after logout there must be no
+  // residue, and delivering a notice that was already in flight must not quietly
+  // recreate the file the user just asked to be removed.
+  it("does not recreate the cache when a pending notice is delivered after deletion", async () => {
+    respondWith(packument(tagsFixture()));
+    await __testing.runUpdateCheck({});
+    expect(cacheExists()).toBe(true);
+
+    removeUpdateCache();
+    expect(cacheExists()).toBe(false);
+
+    const notice = takePendingUpdateNotice();
+    expect(notice, "a notice was pending before the deletion").not.toBeNull();
+    expect(cacheExists(), "delivery must not resurrect a deleted cache").toBe(false);
+  });
+
+  // The CLI is where the deletion is actually triggered. Spawning `logout` would
+  // touch real credential state, so assert the wiring statically instead: both
+  // credential-clearing paths must call the cache removal.
+  it("is wired into both CLI credential-clearing paths", () => {
+    const cli = readFileSync(new URL("./cli.ts", import.meta.url), "utf8");
+    const calls = cli.match(/removeUpdateCache\(\)/g) ?? [];
+    expect(calls.length, "logout and auth --reset must both clear the cache").toBeGreaterThanOrEqual(
+      2,
+    );
+    expect(cli).toMatch(/removeUpdateCache/);
+  });
+
   it("persists no identifier and only the fields the feature needs", async () => {
     respondWith(packument(tagsFixture()));
     await __testing.runUpdateCheck({});

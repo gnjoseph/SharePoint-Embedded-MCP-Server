@@ -23,13 +23,20 @@
  * WHERE THE DATA GOES (disclosure)
  * - The only endpoint contacted is the public npm registry, by default
  *   `https://registry.npmjs.org`. That is a THIRD-PARTY service operated by npm,
- *   Inc. / GitHub and is **outside the Microsoft 365 and Azure compliance
- *   boundary**. It is not an M365 service and is not covered by the M365 data
- *   residency, EUDB, or tenant-data commitments.
+ *   Inc. / GitHub. It is **not a Microsoft 365 or Azure Online Service**, so it
+ *   is outside the Microsoft Product Terms, the Microsoft Products and Services
+ *   Data Protection Addendum (DPA), and the EU Data Boundary — none of the M365
+ *   data-residency, EUDB, or tenant-data commitments apply to it.
  * - Making the connection at all inherently discloses to that third party the
- *   **client IP address**, the TLS/HTTP metadata of the connection, the requested
- *   **package name** (in the URL path), and — unless telemetry is opted out — the
- *   static product **`User-Agent`** string. Nothing else is sent.
+ *   **client IP address**, standard TLS/HTTP connection metadata (TLS handshake
+ *   and SNI, the `Host` and `Accept` headers, request time and timing), the
+ *   requested **package name** (in the URL path), and the static product
+ *   **`User-Agent`** string. Nothing else is sent.
+ * - Opting out of telemetry (`SPE_MCP_COLLECT_TELEMETRY=false`) suppresses the
+ *   registry request **entirely** — it is a skip reason, so there is no
+ *   connection and therefore nothing to disclose. (The shared user-agent helper
+ *   also omits the product `User-Agent` when telemetry is off; for this endpoint
+ *   that is defense in depth only, because no request is made at all.)
  * - No account, tenant, subscription, container, machine, install, session, or
  *   content data is sent. There is no install GUID and no correlation identifier
  *   of any kind, in the request or in the cache.
@@ -472,8 +479,10 @@ function emitCollectionNotice(): void {
  * - no `authorization`, no `cookie`, and no identifier of any kind;
  * - `credentials: "omit"` and `redirect: "error"`, plus an explicit check that
  *   the response did not come from a different host than the one we dialled;
- * - the only headers are `accept` and — unless telemetry is opted out — the
- *   static product `User-Agent`.
+ * - the only headers are `accept` and the static product `User-Agent`. (When
+ *   telemetry is opted out the check never reaches this function at all — the
+ *   whole request is skipped — so there is no "request without a User-Agent"
+ *   case for this endpoint.)
  */
 async function fetchDistTags(url: string): Promise<Record<string, string> | null> {
   let expectedHost: string;
