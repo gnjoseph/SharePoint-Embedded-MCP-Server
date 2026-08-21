@@ -37,10 +37,10 @@ lifecycle script executes while untrusted content is being collected.
 Any commit reachable from `main` can be audited, including commits from before this workflow
 existed. The audit therefore never runs code from the commit it is auditing:
 
-- **Controller** — checked out at the workspace root with **no `ref:` override**. Because the
-  workflow only triggers on `schedule` and `workflow_dispatch` against the default branch, the
-  event SHA is the protected `main` tip. This is where `scripts/security-audit/**`, `package.json`
-  and the workflow itself come from.
+- **Controller** — the validation job checks out protected `main` and resolves its tip to
+  `controller_sha`. Every downstream controller checkout pins that exact SHA at the workspace
+  root, independent of the event-selected ref or audited target. This is where
+  `scripts/security-audit/**`, `package.json` and the workflow itself come from.
 - **Target** — checked out into `target/` at the validated SHA. It is **data**, never an
   executable surface.
 

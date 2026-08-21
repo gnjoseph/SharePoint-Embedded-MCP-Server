@@ -32,9 +32,9 @@ on:
         default: claude-opus-5
         type: choice
         # Exactly one entry for the MVP: every model family carries a different
-        # provider/subprocessor chain, and only this one has been through
-        # privacy review. Adding a choice requires a fresh determination and a
-        # matching update to ALLOWED_MODELS in
+        # provider/subprocessor chain, and this is the only chain in scope for
+        # the pending CELA and Privacy determinations. Adding a choice requires
+        # a fresh determination and a matching update to ALLOWED_MODELS in
         # scripts/security-audit/lib/constants.mjs.
         options:
           - claude-opus-5

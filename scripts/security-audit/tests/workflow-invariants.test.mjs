@@ -742,7 +742,7 @@ test('contributors are told the model layer is disabled by default', () => {
 
   for (const required of [
     'GitHub Copilot',
-    'No repository metadata',
+    'No separate repository or activity data',
     'No tools, no writes',
     'Advisory and redacted',
     'pull_request_target',
@@ -765,6 +765,16 @@ test('contributors are told the model layer is disabled by default', () => {
     CONTRIBUTING_DOC,
     /third-party\s+model provider/,
     'the disclosure must name the third-party model provider relay',
+  );
+  assert.match(
+    CONTRIBUTING_DOC,
+    /does include\s+each selected file's repository-relative path, line count and public source content/,
+    'the disclosure must identify the file metadata and content sent to the model',
+  );
+  assert.match(
+    CONTRIBUTING_DOC,
+    /may\s+itself contain names, identifiers, credential-shaped strings or environment-variable references/,
+    'the disclosure must not make absolute exclusion claims about public source content',
   );
 });
 

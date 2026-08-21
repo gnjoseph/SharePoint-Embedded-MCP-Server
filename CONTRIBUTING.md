@@ -53,8 +53,10 @@ What this stage does and does not do:
 - **Only public, tracked source.** The corpus is limited to an allowlist of source file extensions
   from committed files on `main`, under a hard file-count and byte cap. Untracked files, local
   working-tree changes, build output and dependencies are never included.
-- **No repository metadata.** No issues, pull requests, discussions, commit messages, author
-  identities, secrets, environment variables or CI logs are sent.
+- **No separate repository or activity data.** The corpus does not query issues, pull requests,
+  discussions, commit messages, author records, CI logs or the runner environment. It does include
+  each selected file's repository-relative path, line count and public source content, which may
+  itself contain names, identifiers, credential-shaped strings or environment-variable references.
 - **No tools, no writes.** The model runs without tools, without MCP servers, without shell access
   and without any write permission. It cannot open issues, comment, push, or change settings.
 - **Advisory and redacted.** Output is schema-validated and redacted before use, is advisory only,
