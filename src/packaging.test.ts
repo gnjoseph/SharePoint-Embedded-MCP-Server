@@ -92,6 +92,55 @@ describe("packaging: complete metadata", () => {
   });
 });
 
+/**
+ * SEC-008 (update awareness) supply-chain guard.
+ *
+ * The npm update check is deliberately implemented with the platform `fetch`
+ * and an in-repo SemVer parser so it adds ZERO runtime dependencies. A package
+ * that ships to developers' machines pays for every transitive dependency in
+ * audit surface, so the runtime dependency set is pinned here: adding one must
+ * be a conscious, reviewed decision that updates this test.
+ */
+describe("dependency hygiene: runtime dependency budget", () => {
+  const EXPECTED_RUNTIME_DEPENDENCIES = [
+    "@azure/msal-node",
+    "@modelcontextprotocol/sdk",
+    "commander",
+    "open",
+    "zod",
+    "zod-to-json-schema",
+  ];
+
+  it("ships exactly the approved runtime dependencies", () => {
+    const actual = Object.keys(pkg.dependencies ?? {}).sort();
+    expect(actual).toEqual([...EXPECTED_RUNTIME_DEPENDENCIES].sort());
+  });
+
+  it("keeps the runtime dependency count at 6", () => {
+    expect(Object.keys(pkg.dependencies ?? {})).toHaveLength(6);
+  });
+
+  it("adds no update-check or semver dependency", () => {
+    // The update check must not reintroduce `semver`, `node-fetch`, `axios`,
+    // `update-notifier`, `boxen`, or similar — all are covered in-repo.
+    const banned = [
+      "semver",
+      "node-fetch",
+      "axios",
+      "got",
+      "undici",
+      "update-notifier",
+      "latest-version",
+      "package-json",
+      "boxen",
+    ];
+    const deps = Object.keys(pkg.dependencies ?? {});
+    for (const name of banned) {
+      expect(deps, `${name} must not be a runtime dependency`).not.toContain(name);
+    }
+  });
+});
+
 describe("dependency hygiene: no deprecated uuid@8", () => {
   const major = (v: string): number => {
     const m = String(v).match(/\d+/);

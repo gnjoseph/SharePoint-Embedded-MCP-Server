@@ -122,6 +122,70 @@ without a global install. Pin a specific version with
 `@microsoft/spe-mcp@0.1.0-alpha.1`. To remove the server, delete the MCP
 client config entry.
 
+### Update notifications
+
+To make it obvious when you are running an old build, the server checks the
+public npm registry **once a day, in the background**, for a newer published
+release and — if one exists — appends a short notice to a single tool result:
+
+```text
+Update available: @microsoft/spe-mcp 0.2.0-alpha.1 -> 0.2.0-alpha.4 (alpha channel).
+Update with: npm install -g @microsoft/spe-mcp@alpha
+```
+
+The current version and the update state are also reported by `status_get`, so
+they are always available for a bug report.
+
+How it behaves:
+
+- **Notify only — the server never updates itself.** Nothing is downloaded,
+  installed, or executed; you choose when to update. There is no auto-update.
+- **Never blocks a tool call.** The check is fire-and-forget with a 2-second
+  timeout; if the registry is slow or unreachable, the result is simply dropped.
+- **Channel-aware.** A prerelease install (e.g. `alpha`) is compared against its
+  own dist-tag, and a newer **stable** release is mentioned separately.
+- **Quiet.** The notice is shown once per newer version, not on every call.
+- **Anonymous.** Exactly one unauthenticated `GET` of the package's public
+  metadata — `https://registry.npmjs.org/@microsoft%2fspe-mcp`, no query string,
+  redirects rejected. No credentials, cookies, `.npmrc`, or `npm` subprocess are
+  involved, and **no install GUID, machine, user, tenant, subscription, or
+  session identifier** is sent. As with any HTTPS request, npm sees your IP
+  address, the static `User-Agent` `spe-mcp-server/<version>` (omitted when
+  telemetry is off), and the time of the request.
+- **Announced.** Before the first check in a process, a one-time notice is
+  printed to **stderr** naming the endpoint, the boundary, and the opt-out.
+- **Cached locally.** The result is stored owner-only at
+  `<data dir>/update-check.json` and **kept until you delete it**;
+  `spe-mcp logout` and `spe-mcp auth --reset` remove it, and `status_get` prints
+  the path.
+
+> ⚠️ **Boundary note.** `registry.npmjs.org` is operated by npm, Inc. (GitHub).
+> It is the **only** endpoint this server contacts that is **outside the
+> Microsoft 365 / Azure compliance boundary** and outside EU Data Boundary
+> commitments. Disable the update check to remove it entirely.
+
+> **Known limitation.** Node's built-in `fetch` does not honour `HTTP_PROXY` /
+> `HTTPS_PROXY` / `NO_PROXY`, so this request cannot be routed through an egress
+> proxy for inspection. It fails closed — the check is skipped, and no data
+> leaves by another route. Adding proxy support would require a new runtime
+> dependency, which this project avoids; this is an open, unresolved tradeoff.
+> Disable the check in environments where all egress must be proxied.
+
+It is skipped automatically when the server is run from a source checkout or in
+CI, and can be turned off explicitly:
+
+```bash
+SPE_MCP_UPDATE_CHECK=false spe-mcp start     # preferred env var
+spe-mcp start --no-update-check              # flag
+SPE_NO_UPDATE_CHECK=1 spe-mcp start          # backward-compatible alias
+NO_UPDATE_NOTIFIER=1 spe-mcp start           # community-standard opt-out
+SPE_MCP_COLLECT_TELEMETRY=false spe-mcp start # telemetry opt-out also disables it
+```
+
+When disabled, **no network request, no stderr notice, and no cache write happen
+at all**. See [PRIVACY.md](PRIVACY.md) and
+[docs/DATA-FLOW.md](docs/DATA-FLOW.md) for the full data-flow description.
+
 ## Prerequisites
 
 - **Node.js** 22, 24, or 26
@@ -198,7 +262,9 @@ The server accepts configuration via CLI flags or environment variables:
 | `--read-only` | `SPE_READ_ONLY` | Advertise/allow only read/list/get/search tools; reject mutating calls |
 | `--tools` | `SPE_TOOLS` | Restrict exposed tools to a profile (`readOnly`, `docsOnly`, `provisioning`, `content`, `admin`) or a comma-separated tool list |
 | `--data-dir` | `SPE_DATA_DIR` | Directory for the token cache + provisioning state (default `~/.spe-mcp`). Point each instance at a unique **absolute** path (or `~/...`; CWD-relative paths are rejected) to run multiple servers without clobbering state |
-| _(none)_ | `SPE_MCP_COLLECT_TELEMETRY` | Product `User-Agent` attribution token on outbound Graph/ARM requests. On by default; set to `false` to opt out (see [PRIVACY.md](PRIVACY.md)) |
+| `--no-update-check` | `SPE_MCP_UPDATE_CHECK=false` | Disable the once-a-day npm version check that tells you when a newer server release is published (see [Update notifications](#update-notifications)). Also honours `SPE_NO_UPDATE_CHECK=1` (alias), the community-standard `NO_UPDATE_NOTIFIER=1`, and `SPE_MCP_COLLECT_TELEMETRY=false`. When disabled, no network request, stderr notice, or cache write occurs |
+| _(none)_ | `SPE_NPM_REGISTRY` | Registry base URL for the update check (default `https://registry.npmjs.org` — npm, Inc./GitHub, **outside the Microsoft 365 / Azure compliance boundary**). **HTTPS only**; credentials, query strings, and fragments are rejected |
+| _(none)_ | `SPE_MCP_COLLECT_TELEMETRY` | Product `User-Agent` attribution token on outbound Graph/ARM requests. On by default; set to `false` to opt out — this also disables the update check entirely (see [PRIVACY.md](PRIVACY.md)) |
 
 > The CLI flag wins when both a flag and its env var are set. Run
 > `spe-mcp start --help` to see the authoritative option list and descriptions.
@@ -278,7 +344,7 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or `~/Library/App
 
 ```bash
 # Start the MCP server (stdio transport)
-spe-mcp start [--client-id ID] [--tenant-id ID] [--read-only] [--tools <profileOrCsv>]
+spe-mcp start [--client-id ID] [--tenant-id ID] [--read-only] [--tools <profileOrCsv>] [--no-update-check]
 
 # Authenticate interactively (cache tokens for headless use)
 spe-mcp auth --client-id ID --tenant-id ID [--reset]
@@ -296,6 +362,7 @@ Every command has built-in help — run `spe-mcp <command> --help` (e.g.
 | `--tenant-id <id>` | Entra ID Tenant ID. Discovered from the Azure CLI when omitted. |
 | `--read-only` | Read-only mode: only read/list/get/search tools are exposed and callable. |
 | `--tools <profileOrCsv>` | Tool allowlist: a profile (`readOnly`, `docsOnly`, `provisioning`, `content`, `admin`) or a comma-separated list of tool names. |
+| `--no-update-check` | Disable the daily npm version check (see [Update notifications](#update-notifications)). |
 
 ## Authentication
 
@@ -601,6 +668,28 @@ Authentication tokens are cached locally with owner-only permissions (**SEC-003*
 details see [PRIVACY.md](PRIVACY.md) and [docs/DATA-FLOW.md](docs/DATA-FLOW.md); Microsoft's
 handling of data you send to its online services is described in the
 [Microsoft Privacy Statement](https://privacy.microsoft.com/privacystatement).
+
+The one **non-Microsoft** destination is the public npm registry
+(`https://registry.npmjs.org`, operated by npm, Inc./GitHub), contacted at most once a day by
+the [update check](#update-notifications) to read the published version list for
+`@microsoft/spe-mcp`. ⚠️ This endpoint is **outside the Microsoft 365 / Azure compliance
+boundary**, is not covered by the Microsoft Product Terms or DPA, and is outside EU Data
+Boundary commitments. The request is **unauthenticated and anonymous** — exactly
+`GET https://registry.npmjs.org/@microsoft%2fspe-mcp` with no query string, no credentials or
+cookies, redirects rejected, and **no install GUID, machine, user, tenant, subscription,
+correlation, or session identifier**; it is an ordinary public package lookup, identical to
+what `npm view` would issue. As with any HTTPS request, npm can observe your **IP address**,
+the static `User-Agent` (omitted when telemetry is off), and the **time of the request**;
+those are disclosed by the connection itself, not added by this tool. Nothing is downloaded,
+installed, or executed — there is **no auto-update**. Before the first check, a one-time
+notice naming the endpoint and the opt-out is printed to **stderr**. Disable it with
+`SPE_MCP_UPDATE_CHECK=false` (preferred), `--no-update-check`, `SPE_NO_UPDATE_CHECK=1`,
+`NO_UPDATE_NOTIFIER=1`, or `SPE_MCP_COLLECT_TELEMETRY=false`; when disabled, the request is
+never made and nothing is cached. It is also skipped automatically in CI and in source
+checkouts. The cached result lives at `<data dir>/update-check.json`, is retained until you
+delete it, and is removed by `spe-mcp logout` / `spe-mcp auth --reset`. npm's own handling of
+registry requests is governed by the
+[npm privacy policy](https://docs.npmjs.com/policies/privacy).
 
 **Data collection (standard Microsoft notice).** The software may collect information about
 you and your use of the software and send it to Microsoft; Microsoft may use this information

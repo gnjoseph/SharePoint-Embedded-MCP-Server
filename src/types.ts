@@ -104,6 +104,14 @@ export interface ServerConfig {
    * to see the profile list and description.
    */
   tools?: string;
+  /**
+   * Update awareness (SEC-008). When `false`, the server never contacts the npm
+   * registry to see whether a newer build has been published — no network call,
+   * no cache read, no cache write. Defaults to enabled; set to `false` by the
+   * `--no-update-check` flag, and independently overridden by the
+   * `SPE_NO_UPDATE_CHECK` / `NO_UPDATE_NOTIFIER` environment variables.
+   */
+  updateCheck?: boolean;
 }
 
 // ─── Auth Config ─────────────────────────────────────────────────────────────

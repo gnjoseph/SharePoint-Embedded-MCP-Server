@@ -12,7 +12,9 @@ organization's agreements with Microsoft.
 **The tool opens no dedicated usage-analytics channel and sends no personal, tenant, or
 per-user data to Microsoft.** The only Microsoft-bound attribution signal is a static product
 `User-Agent` token, which is on by default and can be turned off (see
-[Turning it off](#turning-it-off)). Specifically:
+[Turning it off](#turning-it-off)). The only **non-Microsoft** destination is an anonymous
+public-package lookup on the npm registry used to notify you of newer releases, which can
+also be turned off. Specifically:
 
 - **No telemetry channel.** The tool does not implement application telemetry and does not
   "phone home." Diagnostic logs are written to the local process's **stderr only**, with
@@ -32,6 +34,70 @@ per-user data to Microsoft.** The only Microsoft-bound attribution signal is a s
   aggregate traffic driven by this tool. It is a request header on calls you already make —
   not a separate data feed — and it is **on by default**; set `SPE_MCP_COLLECT_TELEMETRY=false`
   to omit it (see [Turning it off](#turning-it-off)).
+- **Update check (public npm registry — the only non-Microsoft destination, and the only
+  destination outside the compliance boundary).** At most once every 24 hours the tool reads
+  the published version list for `@microsoft/spe-mcp` from the public npm registry
+  (`https://registry.npmjs.org`, override with `SPE_NPM_REGISTRY`) so it can tell you when a
+  newer release exists (`src/update-check.ts`).
+
+  > **Boundary disclosure.** `registry.npmjs.org` is operated by **npm, Inc. (GitHub)**, not by
+  > Microsoft 365 or Azure. It is **outside the Microsoft 365 / Azure compliance boundary** and
+  > outside any **EU Data Boundary** commitment that applies to your tenant. Data sent there is
+  > not covered by the Microsoft Product Terms or the DPA; it is governed by the
+  > [npm privacy policy](https://docs.npmjs.com/policies/privacy).
+
+  **Exactly one request is made,** to the exact package path with no query string and no
+  fragment:
+
+  ```text
+  GET https://registry.npmjs.org/@microsoft%2fspe-mcp
+  ```
+
+  **What the third party can see.** The request is an **anonymous, unauthenticated HTTP GET of
+  public package metadata** — the same lookup `npm view` performs. The request body and headers
+  carry no identifiers, but the connection itself necessarily discloses to npm:
+
+  | Disclosed to npm | Why |
+  |------------------|-----|
+  | Your **IP address** (or your egress/NAT address) | Inherent to making an HTTPS connection |
+  | The **package name** `@microsoft/spe-mcp` | It is the resource being requested |
+  | The static product **`User-Agent`** `spe-mcp-server/<version>` | Standard client identification; **omitted entirely** when `SPE_MCP_COLLECT_TELEMETRY=false` |
+  | Approximate **time of the request** | Inherent to any server-side request log |
+
+  **What is never sent:** no credentials, tokens, cookies, or `Authorization` header; no
+  `.npmrc` and no npm subprocess; **no install GUID, machine identifier, hostname, user name,
+  tenant ID, subscription ID, correlation ID, or session ID**; no usage, prompt, or content
+  data; no data about which tools you invoked. The tool generates and stores **no identifier of
+  any kind** for this feature. Redirects are rejected outright, so the request cannot be
+  bounced to a different host.
+
+  **No auto-update.** Nothing is downloaded, installed, executed, or modified. The tool only
+  *notifies* you; applying an update is always a manual `npm install` you run yourself.
+
+  **Local retention.** The result is cached on your machine at
+  `<data dir>/update-check.json` (owner-only permissions, control **SEC-008**;
+  `<data dir>` is `%LOCALAPPDATA%\spe-mcp` on Windows or `~/.local/share/spe-mcp` elsewhere,
+  and is reported by `status_get`). The cache contains only the checked version strings, the
+  registry URL, a timestamp, and which versions you have already been told about — **no
+  identifier**. It is **retained locally until you delete it**: there is no automatic expiry of
+  the file itself, only of its freshness. Run `spe-mcp logout` or `spe-mcp auth --reset` to
+  delete it, or remove the file by hand.
+
+  **First-run notice.** Before the **first** network request in a process, the tool prints a
+  one-time notice to **stderr** naming the endpoint, the boundary, and how to turn the check
+  off. No notice is printed when the check is disabled or served from cache.
+
+  **Turning it off.** The check is **skipped automatically** in CI and when running from a
+  source checkout, and can be disabled outright (see [Turning it off](#turning-it-off)); when
+  disabled, **no request is made, no notice is printed, and no cache file is written**.
+
+  **Known limitation (proxy).** The check uses the Node.js built-in `fetch`, which does **not**
+  honour `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`. On a network that requires an egress proxy
+  the request simply fails and is silently ignored (fail-closed — no data leaves by another
+  route), but it also means the check **cannot be routed through your proxy for inspection or
+  policy enforcement**. Adding proxy support would require a new runtime dependency, which this
+  project deliberately avoids. This is recorded as an **open, unresolved tradeoff**; if your
+  environment requires all egress to be proxied, disable the check.
 
 See [docs/DATA-FLOW.md](docs/DATA-FLOW.md) for the full list of network endpoints and what
 travels to each.
@@ -68,7 +134,32 @@ Microsoft-bound telemetry signal, and it is **on by default**. To opt out, set
 outbound Graph and Azure Resource Manager requests. Those requests still go out — they simply
 carry the underlying tool's default `User-Agent` instead (e.g. the Azure CLI's own token for
 `az`/`azd`, or the Node runtime default for direct Graph calls), whose logging is governed by
-those services' own terms. To further limit
+those services' own terms.
+
+The **update check** — the only non-Microsoft outbound call, and the only call that leaves the
+Microsoft 365 / Azure compliance boundary — is on by default in published installs. Any one of
+the following disables it completely:
+
+| Opt-out | Effect |
+|---------|--------|
+| `SPE_MCP_UPDATE_CHECK=false` | **Preferred.** Disables the check for every instance in that environment (`0`, `off`, `no` also accepted) |
+| `spe-mcp start --no-update-check` | Disables the check for that server instance |
+| `SPE_NO_UPDATE_CHECK=1` | Backward-compatible alias, honoured identically |
+| `NO_UPDATE_NOTIFIER=1` | Community-standard opt-out, honoured identically |
+| `SPE_MCP_COLLECT_TELEMETRY=false` | Opting out of the product `User-Agent` also disables the update check |
+
+When disabled, the tool makes **no registry request, prints no collection notice, and writes no
+update-check cache file** — the code path exits before any network or disk access. `status_get`
+still reports the state, reading only what is already on disk.
+
+The check is also skipped automatically in CI (`CI`, `GITHUB_ACTIONS`, `TF_BUILD`, …) and when
+the server is run from a source checkout rather than an installed package.
+
+To delete data already cached by the check, run `spe-mcp logout` or `spe-mcp auth --reset` —
+both remove `<data dir>/update-check.json` along with the cached authentication tokens. You can
+also delete the file by hand; `status_get` prints its full path.
+
+To further limit
 outbound calls you can run with `--read-only` (no mutating operations) or `--tools` (restrict
 the exposed tool set, including the optional Microsoft Learn documentation lookup). See
 [docs/DATA-FLOW.md](docs/DATA-FLOW.md), [docs/SECURITY-CONTROLS.md](docs/SECURITY-CONTROLS.md),
