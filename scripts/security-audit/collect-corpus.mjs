@@ -34,7 +34,14 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
@@ -76,16 +83,63 @@ function fail(message) {
 }
 
 /**
+ * Git records symbolic links as blobs with this file mode. A tracked symlink is
+ * the classic way to smuggle out-of-tree content into a bounded corpus: the
+ * blob holds a path such as `../../secrets.env`, and any collector that reads
+ * through the link exfiltrates a file the allowlist never approved. The mode is
+ * therefore checked at enumeration time, before the filesystem is touched.
+ */
+const GIT_SYMLINK_MODE = '120000';
+
+/**
  * @param {string} repoRoot Directory of the checkout to enumerate.
- * @returns {string[]} Repository-relative, POSIX-separated tracked paths.
+ * @returns {{ file: string, mode: string }[]} Repository-relative, POSIX-separated
+ *   tracked paths paired with their git file mode.
  */
 function listTrackedFiles(repoRoot) {
-  const stdout = execFileSync('git', ['ls-files', '-z'], {
+  // `-s` prepends "<mode> <object> <stage>\t" to every record so symlink blobs
+  // (mode 120000) can be rejected without following them.
+  const stdout = execFileSync('git', ['ls-files', '-s', '-z'], {
     cwd: repoRoot,
     encoding: 'utf8',
     maxBuffer: 32 * 1024 * 1024,
   });
-  return stdout.split('\0').filter(Boolean);
+
+  const entries = [];
+  for (const record of stdout.split('\0')) {
+    if (!record) continue;
+    const tab = record.indexOf('\t');
+    if (tab === -1) {
+      fail(`unparsable git ls-files record: ${JSON.stringify(record)}`);
+    }
+    const mode = record.slice(0, record.indexOf(' '));
+    entries.push({ file: record.slice(tab + 1), mode });
+  }
+  return entries;
+}
+
+/**
+ * Fail closed unless `absolute` resolves inside `rootReal` once every symbolic
+ * link on the path has been expanded. This catches the case the per-file
+ * `lstat` cannot see: a symlinked *parent directory* that redirects an
+ * otherwise innocent-looking relative path outside the audited checkout.
+ *
+ * @param {string} rootReal Canonical path of the audited checkout.
+ * @param {string} absolute Path to validate.
+ * @param {string} file Repository-relative path, used for the error message.
+ */
+function assertWithinRoot(rootReal, absolute, file) {
+  let resolved;
+  try {
+    resolved = realpathSync.native(absolute);
+  } catch {
+    fail(`refusing to collect ${file}: path could not be resolved`);
+    return;
+  }
+  const relative = path.relative(rootReal, resolved);
+  if (relative === '' || relative.startsWith('..') || path.isAbsolute(relative)) {
+    fail(`refusing to collect ${file}: resolved path escapes the audited checkout`);
+  }
 }
 
 /**
@@ -115,8 +169,29 @@ function main() {
   }
 
   const candidates = listTrackedFiles(repoRoot)
-    .filter((file) => isEligible(file, prefixes))
-    .sort();
+    .filter((entry) => isEligible(entry.file, prefixes))
+    .sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
+
+  // Index-level symlink rejection. A tracked symlink whose blob points outside
+  // the checkout would otherwise be read through, so collection aborts rather
+  // than silently skipping: a corpus that quietly drops files is harder to
+  // reason about than one that refuses to build.
+  const trackedSymlinks = candidates
+    .filter((entry) => entry.mode === GIT_SYMLINK_MODE)
+    .map((entry) => entry.file);
+  if (trackedSymlinks.length > 0) {
+    fail(`refusing to collect tracked symlink(s): ${trackedSymlinks.join(', ')}`);
+  }
+
+  // Canonical root for containment checks. Resolved once so a symlinked
+  // checkout directory (common on macOS, where /tmp is a link) does not make
+  // every subsequent comparison fail.
+  let rootReal;
+  try {
+    rootReal = realpathSync.native(path.resolve(repoRoot));
+  } catch {
+    fail(`repository root ${JSON.stringify(repoRoot)} could not be resolved`);
+  }
 
   /** @type {Record<string, { bytes: number, lines: number }>} */
   const manifest = {};
@@ -131,19 +206,41 @@ function main() {
   const nonce = generateCorpusNonce();
   const delimiters = corpusDelimiters(nonce);
 
-  for (const file of candidates) {
+  for (const { file } of candidates) {
     if (fileCount >= CORPUS_LIMITS.maxFiles) {
       skipped.push({ file, reason: 'max-files' });
       continue;
     }
 
-    let size;
+    const absolute = path.join(repoRoot, file);
+
+    // lstat, never stat: stat follows links and would report the *target*, so a
+    // symlink would be read as an ordinary file.
+    let stats;
     try {
-      size = statSync(path.join(repoRoot, file)).size;
+      stats = lstatSync(absolute);
     } catch {
       skipped.push({ file, reason: 'unreadable' });
       continue;
     }
+
+    // Fail closed rather than skip. Reaching here means git reported a
+    // non-symlink mode while the filesystem disagrees, which is exactly the
+    // inconsistency an attacker would engineer.
+    if (stats.isSymbolicLink()) {
+      fail(`refusing to read symlink ${file}`);
+    }
+    if (!stats.isFile()) {
+      skipped.push({ file, reason: 'not-a-file' });
+      continue;
+    }
+
+    // Catches a symlinked *parent* directory, which the index mode check above
+    // cannot see: the file entry is a regular blob, but its path traverses a
+    // link that may escape the checkout.
+    assertWithinRoot(rootReal, absolute, file);
+
+    const size = stats.size;
 
     if (size > CORPUS_LIMITS.maxFileBytes) {
       skipped.push({ file, reason: 'max-file-bytes' });
@@ -154,7 +251,7 @@ function main() {
       continue;
     }
 
-    const rawBody = readFileSync(path.join(repoRoot, file), 'utf8');
+    const rawBody = readFileSync(absolute, 'utf8');
 
     // Defence in depth: a body must never be able to emit anything that looks
     // like a fence. The nonce makes forgery infeasible; neutralization makes it

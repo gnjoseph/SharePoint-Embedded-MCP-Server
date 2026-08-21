@@ -37,6 +37,15 @@ import { ALLOWED_MODELS, DEFAULT_MODEL, DEFAULT_SCOPE, SCOPES } from './lib/cons
 const BASE_REF = 'refs/remotes/origin/main';
 /** The only ref SARIF results are ever attributed to. */
 const TARGET_REF = 'refs/heads/main';
+/**
+ * The only ref the controller half of the run may be loaded from.
+ *
+ * The "controller" is the workflow definition plus every helper script under
+ * `scripts/security-audit/`. It is trusted: it decides what is collected, what
+ * is redacted, and what is published. The "target" is the (possibly historical)
+ * commit whose contents are analysed, and is treated as untrusted input.
+ */
+const CONTROLLER_REF = 'refs/heads/main';
 const FULL_SHA = /^[0-9a-f]{40}$/;
 
 /** Test-only escape hatch; never set by any workflow. */
@@ -100,22 +109,33 @@ function assertReachableFromMain(sha) {
 }
 
 /**
- * Resolves the default audit target: the current tip of `origin/main`.
+ * Resolves the current tip of `origin/main`, exiting when it cannot be
+ * determined.
  *
- * Used when no `ref` was supplied — the `schedule` event passes no inputs at
- * all, and the `workflow_dispatch` input defaults to an empty string. The
- * returned SHA is *not* trusted implicitly: `main()` re-applies the full-SHA
- * shape check and the reachability check to it (the tip is trivially its own
- * ancestor, so the check is satisfied without being weakened).
+ * The tip serves three purposes, all of which must agree:
+ *
+ * 1. The default audit target when no `ref` was supplied — the `schedule` event
+ *    passes no inputs at all, and the `workflow_dispatch` input defaults to an
+ *    empty string. The returned SHA is *not* trusted implicitly: `main()`
+ *    re-applies the full-SHA shape check and the reachability check to it (the
+ *    tip is trivially its own ancestor, so the check is satisfied without being
+ *    weakened).
+ * 2. The `is_main_tip` gate that decides whether SARIF may be published.
+ * 3. The `controller_sha` output that every downstream job pins its *controller*
+ *    checkout to, so the helper scripts always come from protected main rather
+ *    than from whatever branch the dispatch was started on.
+ *
+ * Because (3) is a trust boundary, an unresolvable tip is fatal rather than
+ * degraded: without it there is no verified commit to pin the controller to.
  *
  * @returns {string}
  */
-function resolveDefaultRef() {
+function requireMainTip() {
   const tip = tryResolveMainTip();
   if (tip === '') {
     fail(
-      `no ref supplied and ${BASE_REF} could not be resolved. ` +
-        'Ensure the checkout fetched origin/main (fetch-depth: 0).',
+      `${BASE_REF} could not be resolved, so the trusted controller commit is unknown. ` +
+        'Ensure the controller checkout fetched origin/main (fetch-depth: 0).',
     );
   }
   return tip;
@@ -144,13 +164,57 @@ function tryResolveMainTip() {
   }
 }
 
+/**
+ * Rejects any Actions run whose controller ref is not the protected default
+ * branch.
+ *
+ * `workflow_dispatch` lets any actor with write access choose the branch that
+ * supplies *both* the workflow YAML and every helper script it invokes. Without
+ * this check a contributor could push `attacker/branch`, weaken
+ * `collect-corpus.mjs` or `validate-response.mjs` there, dispatch the audit, and
+ * have the run exfiltrate or publish whatever the weakened controller allows.
+ *
+ * This guard is deliberately defence in depth, not the primary control: the YAML
+ * that actually executes for a dispatch is the copy on the event-selected ref,
+ * so an actor with write access could simply delete this step. The substantive
+ * control is that every job re-checks-out the controller at the validated
+ * `controller_sha` (main tip) before running any helper, so the scripts that do
+ * the collecting, redacting, and publishing always come from protected main.
+ *
+ * No-ops outside Actions (`GITHUB_EVENT_NAME` unset) so local runs and unit
+ * tests are unaffected.
+ */
+function assertControllerRefIsMain() {
+  const event = (process.env.GITHUB_EVENT_NAME ?? '').trim();
+  if (event === '') {
+    return;
+  }
+
+  const ref = (process.env.GITHUB_REF ?? '').trim();
+  if (ref !== CONTROLLER_REF) {
+    fail(
+      `${event} is only accepted from ${CONTROLLER_REF}; this run was started from ` +
+        `${JSON.stringify(ref || '(unset)')}. Re-run the workflow from the protected ` +
+        `default branch.`,
+    );
+  }
+}
+
 function main() {
+  // Runs before argument parsing: a dispatch from an unprotected branch is
+  // rejected regardless of what it asked for.
+  assertControllerRefIsMain();
+
   const args = parseArgs(process.argv.slice(2));
+
+  // Resolved exactly once so the default target, the `is_main_tip` gate and the
+  // `controller_sha` pin can never describe three different commits.
+  const mainTip = requireMainTip();
 
   // `schedule` supplies no inputs and the dispatch input defaults to empty, so
   // an absent ref means "audit the current main tip" rather than "invalid".
   const suppliedRef = (args.ref ?? '').trim();
-  const ref = suppliedRef === '' ? resolveDefaultRef() : suppliedRef;
+  const ref = suppliedRef === '' ? mainTip : suppliedRef;
   const refSource = suppliedRef === '' ? `default (${BASE_REF})` : 'input';
 
   if (!FULL_SHA.test(ref)) {
@@ -190,7 +254,12 @@ function main() {
     // documents `sha` as "the sha of the HEAD of the ref", so uploading an
     // ancestor would mis-attribute findings to main's tip. When false the
     // workflow withholds the upload (fail closed) instead of lying.
-    is_main_tip: String(ref !== '' && ref === tryResolveMainTip()),
+    is_main_tip: String(ref !== '' && ref === mainTip),
+    // The commit the *trusted controller* checkout must pin to. Every job that
+    // runs audit helpers checks this commit out at the repository root so the
+    // scripts always come from protected main, never from the event-selected
+    // branch and never from the (possibly historical) target commit.
+    controller_sha: mainTip,
     model,
     scope,
     dry_run: String(dryRun),
@@ -208,7 +277,7 @@ function main() {
   }
 }
 
-export { FULL_SHA, TARGET_REF, resolveDefaultRef, tryResolveMainTip };
+export { CONTROLLER_REF, FULL_SHA, TARGET_REF, requireMainTip, tryResolveMainTip };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main();

@@ -80,11 +80,22 @@ jobs:
       # ancestor cannot be uploaded without mis-attributing findings to main.
       # Uploads are therefore gated on this value and fail closed.
       is_main_tip: ${{ steps.validate.outputs.is_main_tip }}
+      # The validated origin/main tip. Every job that runs audit helper scripts
+      # pins its *controller* checkout to this commit, so the trusted code is
+      # always the protected-main version — never the event-selected branch (a
+      # workflow_dispatch can be started from any ref) and never the target
+      # commit (an older reachable ancestor may not contain the helpers at all).
+      controller_sha: ${{ steps.validate.outputs.controller_sha }}
       model: ${{ steps.validate.outputs.model }}
       scope: ${{ steps.validate.outputs.scope }}
       dry_run: ${{ steps.validate.outputs.dry_run }}
     steps:
-      - name: Checkout main
+      # This job resolves `controller_sha`, so it cannot consume it. The
+      # protected branch name is used instead: actions/checkout resolves it
+      # server-side to the current main tip, which is the same commit the
+      # validator then reports as `controller_sha`. It can never resolve to the
+      # ref a workflow_dispatch was started from.
+      - name: Checkout controller scripts from main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
@@ -103,6 +114,13 @@ jobs:
       # weekly run. validate-target.mjs resolves an empty ref to the current
       # origin/main tip and then applies the *same* full-SHA and
       # reachable-from-main checks to it — a default, never a bypass.
+      #
+      # The script also refuses to run when GITHUB_EVENT_NAME is set and
+      # GITHUB_REF is not refs/heads/main, so a dispatch from an unprotected
+      # branch is rejected before any input is parsed. Both variables are
+      # default runner environment variables, so no `env:` entry is needed.
+      # This is defence in depth: the substantive control is that every
+      # controller checkout below pins to `controller_sha`.
       - name: Validate target ref and options
         id: validate
         env:
@@ -176,13 +194,15 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Controller checkout: trusted helper scripts from the protected default
-      # branch at the workflow's own event SHA. Must come first — actions/checkout
-      # runs `git clean -ffdx` in its destination, so a root checkout performed
-      # after a `target/` checkout would delete it.
+      # Controller checkout: trusted helper scripts pinned to `controller_sha`,
+      # the commit validate-inputs resolved for the protected default branch —
+      # never the event-selected ref and never the audited commit. Must come
+      # first — actions/checkout runs `git clean -ffdx` in its destination, so a
+      # root checkout performed after a `target/` checkout would delete it.
       - name: Checkout controller scripts from main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.validate-inputs.outputs.controller_sha }}
           persist-credentials: false
 
       - name: Checkout target commit
@@ -267,6 +287,7 @@ jobs:
       - name: Checkout controller scripts from main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.validate-inputs.outputs.controller_sha }}
           persist-credentials: false
 
       - name: Checkout target commit with full history
@@ -325,8 +346,11 @@ jobs:
       # dropped: the published summary carries counts only, and the raw report
       # is deleted before any upload step runs. Actions logs on a public
       # repository are world-readable, so the scanner's console output is
-      # discarded in the scan step rather than used for triage; triage is a
-      # local `gitleaks git .` run by a maintainer.
+      # discarded in the scan step rather than used for triage. Triage is a
+      # restricted local `gitleaks git .` run by a maintainer on a workstation
+      # checked out at the target SHA this run audited (printed as `Target` in
+      # the job summary); rule identifiers and paths stay on that workstation
+      # until the credential has been rotated. See docs/SECURITY-AUDIT.md.
       - name: Reduce report to sanitized counts
         run: |
           set -euo pipefail
@@ -368,6 +392,7 @@ jobs:
       - name: Checkout controller scripts from main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.validate-inputs.outputs.controller_sha }}
           persist-credentials: false
 
       - name: Checkout target commit
@@ -426,6 +451,7 @@ jobs:
       - name: Checkout controller scripts from main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.validate-inputs.outputs.controller_sha }}
           persist-credentials: false
 
       - name: Checkout target commit
@@ -619,6 +645,7 @@ jobs:
       - name: Checkout controller scripts from main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.validate-inputs.outputs.controller_sha }}
           persist-credentials: false
 
       - name: Checkout target commit
@@ -672,7 +699,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Checkout main
+      # This job runs with `if: always()`, so validate-inputs may have failed and
+      # `needs.validate-inputs.outputs.controller_sha` may be empty. An empty
+      # `ref` makes actions/checkout fall back to the event-selected ref, which
+      # is exactly the input this workflow refuses to trust, so the protected
+      # branch name is used directly: it always resolves to the main tip and can
+      # never resolve to an attacker-selected branch.
+      - name: Checkout controller scripts from main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main

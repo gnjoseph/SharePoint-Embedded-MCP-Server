@@ -25,7 +25,7 @@ The audit has two layers:
 | `validate-inputs` | Normalizes and validates the manual inputs | Target must be a 40-hex SHA reachable from `main`; scope and model come from allowlists. Scheduled runs supply no ref, so the current `origin/main` tip is resolved to a full SHA and then validated by the same rules |
 | `codeql` | CodeQL `security-extended` for JavaScript/TypeScript | Uploads SARIF to code scanning (`security-events: write`) |
 | `dependency-audit` | `npm audit --audit-level=high` | The raw JSON is reduced to sanitized counts + advisory URLs before it ever leaves the runner |
-| `secret-scan` | Gitleaks **CLI**, downloaded at a pinned version and SHA256-verified | Report is reduced to file/rule/line — never the matched secret |
+| `secret-scan` | Gitleaks **CLI**, downloaded at a pinned version and SHA256-verified | Public output is **counts only** (`total`, `ruleCount`, `fileCount`). Rule identifiers, file paths, line numbers, commit metadata and the matched secret never leave the runner; the raw report and the scanner console output are discarded inside the job |
 | `action-pins` | Fails if any workflow uses a mutable action ref | Enforces 40-hex commit pinning recursively across `.github/workflows` **and** every composite `action.yml`/`action.yaml` in the repository |
 | `summary` | Aggregates results into the job summary | Fails the run if any deterministic job did not succeed |
 
@@ -175,10 +175,13 @@ Individual stages can be run directly — see
    disclosure an attacker wants. Nothing in the run tells you *where* the hit is: Actions logs
    are world-readable on a public repository, so the scanner's console output — which repeats
    file path, line, commit, author and e-mail for every finding — is discarded inside the job,
-   and the raw Gitleaks report is deleted before any upload step runs. To locate a hit, clone
-   the repository and re-run the scanner locally:
-   `gitleaks git . --redact --no-banner`. Match the counts against the summary, rotate the
-   credential *before* removing it from source, then re-run the workflow to confirm.
+   and the raw Gitleaks report is deleted before any upload step runs. To locate a hit, reproduce
+   the scan **locally, at the target SHA the run audited** (printed as `Target` in the job
+   summary), on a machine you control: `git clone <repo> && cd <repo> && git checkout <target-sha>`
+   then `gitleaks git . --redact --no-banner`. Match the counts against the summary, rotate the
+   credential *before* removing it from source, then re-run the workflow to confirm. Keep the
+   local report on the workstation — do not paste rule identifiers or paths into an issue, a pull
+   request or any other public surface until the credential has been rotated.
 3. **Model findings are leads, not verdicts.** Each accepted finding carries a confidence and a
    control anchor. Confirm the code path by hand before filing anything.
 4. **Check the rejected list.** A high rejection count usually means the model drifted off the

@@ -8,8 +8,17 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -33,7 +42,7 @@ import { findRejectReasons, redact } from '../lib/redaction.mjs';
 import { validateFindings, extractJson } from '../validate-response.mjs';
 import { FULL_SHA } from '../validate-target.mjs';
 import { renderTemplate, templateValues } from '../build-prompt.mjs';
-import { checkCompositeActions, checkWorkflowSource } from '../check-action-pins.mjs';
+import { checkCompositeActions, checkWorkflowSource, collectFiles } from '../check-action-pins.mjs';
 import { toSarif } from '../to-sarif.mjs';
 import { sanitizeNpmAudit, sanitizeGitleaks } from '../sanitize-findings.mjs';
 import { modelStatus, buildSummary } from '../summarize.mjs';
@@ -52,17 +61,80 @@ function childPath() {
   return [...extras, process.env.PATH ?? ''].join(path.delimiter);
 }
 
-/** @param {string[]} argv */
-function runScript(script, argv) {
+/**
+ * Run one of the audit scripts as a child process.
+ *
+ * `extraEnv` is spread last so a caller can override runner-supplied variables
+ * such as `GITHUB_EVENT_NAME` and `GITHUB_REF`; those are unset on a developer
+ * workstation, which is exactly what the dispatch-ref guard keys off.
+ *
+ * @param {string} script
+ * @param {string[]} argv
+ * @param {Record<string, string>} [extraEnv]
+ * @param {string} [cwd]
+ */
+function runScript(script, argv, extraEnv = {}, cwd = REPO_ROOT) {
   return spawnSync(process.execPath, [path.join(SCRIPT_DIR, script), ...argv], {
-    cwd: REPO_ROOT,
+    cwd,
     encoding: 'utf8',
-    env: { ...process.env, GITHUB_OUTPUT: '', PATH: childPath(), Path: childPath() },
+    env: {
+      ...process.env,
+      GITHUB_OUTPUT: '',
+      PATH: childPath(),
+      Path: childPath(),
+      ...extraEnv,
+    },
   });
 }
 
 function tempDir(prefix) {
   return mkdtempSync(path.join(tmpdir(), prefix));
+}
+
+/**
+ * Create a symlink, reporting whether the platform allowed it.
+ *
+ * Unprivileged Windows without Developer Mode rejects `symlink(2)` with EPERM.
+ * The controls under test are fail-closed, so a machine that cannot *create* the
+ * attack cannot exercise it either; those runs skip rather than report a false
+ * pass. Linux CI — where the workflow actually runs — always takes the real path.
+ *
+ * @param {string} target
+ * @param {string} linkPath
+ * @param {'file' | 'dir' | 'junction'} [type]
+ * @returns {boolean} `false` when the platform refused to create the link.
+ */
+function trySymlink(target, linkPath, type = 'file') {
+  try {
+    symlinkSync(target, linkPath, type);
+    return true;
+  } catch (error) {
+    if (error && (error.code === 'EPERM' || error.code === 'EACCES')) return false;
+    throw error;
+  }
+}
+
+/**
+ * Initialise a throwaway git repository.
+ *
+ * `collect-corpus.mjs` enumerates through `git ls-files`, so symlink tests need
+ * a real index rather than a bare directory.
+ *
+ * @param {string} prefix
+ * @returns {{ dir: string, git: (...argv: string[]) => string }}
+ */
+function tempGitRepo(prefix) {
+  const dir = tempDir(prefix);
+  const git = (...argv) =>
+    execFileSync('git', argv, {
+      cwd: dir,
+      encoding: 'utf8',
+      env: { ...process.env, PATH: childPath(), Path: childPath() },
+    });
+  git('init', '--quiet');
+  git('config', 'user.email', 'audit@example.invalid');
+  git('config', 'user.name', 'audit');
+  return { dir, git };
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +232,55 @@ test('target ref and main-tip status are published for SARIF attribution', () =>
   assert.equal(historical.status, 0, historical.stderr);
   assert.match(historical.stdout, /target_ref=refs\/heads\/main\b/);
   assert.match(historical.stdout, /is_main_tip=false\b/);
+});
+
+// A `workflow_dispatch` can be raised against any branch a contributor can push
+// to, and the executing workflow file is the copy on that branch. The guard is
+// therefore defence in depth behind the pinned controller checkouts: it refuses
+// to emit a validated target at all unless the controller ref is protected
+// `main`, so a fork-branch dispatch cannot borrow the audit's permissions.
+test('a manual dispatch from a branch other than main is refused', () => {
+  const attacker = runScript('validate-target.mjs', [], {
+    GITHUB_EVENT_NAME: 'workflow_dispatch',
+    GITHUB_REF: 'refs/heads/attacker',
+  });
+  assert.notEqual(attacker.status, 0, 'a dispatch from a non-main ref must fail closed');
+  assert.match(attacker.stderr, /refs\/heads\/main/);
+  assert.doesNotMatch(attacker.stdout, /target_sha=/);
+
+  // Same guard, tag ref: a tag is not the protected branch either.
+  const tagged = runScript('validate-target.mjs', [], {
+    GITHUB_EVENT_NAME: 'workflow_dispatch',
+    GITHUB_REF: 'refs/tags/v1.2.3',
+  });
+  assert.notEqual(tagged.status, 0, 'a dispatch from a tag ref must fail closed');
+});
+
+test('a dispatch from main is accepted and publishes the controller SHA', () => {
+  const allowed = runScript('validate-target.mjs', [], {
+    GITHUB_EVENT_NAME: 'workflow_dispatch',
+    GITHUB_REF: 'refs/heads/main',
+  });
+  assert.equal(allowed.status, 0, allowed.stderr);
+  assert.match(allowed.stdout, /controller_sha=[0-9a-f]{40}\b/);
+
+  // A scheduled run carries `refs/heads/main` as well, and must behave the same.
+  const scheduled = runScript('validate-target.mjs', [], {
+    GITHUB_EVENT_NAME: 'schedule',
+    GITHUB_REF: 'refs/heads/main',
+  });
+  assert.equal(scheduled.status, 0, scheduled.stderr);
+  assert.match(scheduled.stdout, /controller_sha=[0-9a-f]{40}\b/);
+
+  // The controller SHA is the protected-branch tip, never the audited target.
+  const controller = /controller_sha=([0-9a-f]{40})/.exec(scheduled.stdout)?.[1];
+  const historical = runScript('validate-target.mjs', ['--ref', HISTORICAL_TARGET], {
+    GITHUB_EVENT_NAME: 'schedule',
+    GITHUB_REF: 'refs/heads/main',
+  });
+  assert.equal(historical.status, 0, historical.stderr);
+  assert.match(historical.stdout, new RegExp(`controller_sha=${controller}\\b`));
+  assert.match(historical.stdout, new RegExp(`target_sha=${HISTORICAL_TARGET}\\b`));
 });
 
 // ---------------------------------------------------------------------------
@@ -321,6 +442,92 @@ test('a forged delimiter in repository content cannot close the real fence', () 
   assert.equal(framed.split(delimiters.end).length - 1, 1);
   assert.ok(!value.includes(nonce), 'untrusted content must not contain the per-run nonce');
   assert.ok(!value.includes(DELIMITER_SENTINEL), 'forged sentinels must be neutralized');
+});
+
+test('a tracked symlink is refused instead of followed out of the checkout', () => {
+  // The classic bounded-corpus escape: the allowlist approves `src/*.ts`, so the
+  // attacker commits `src/leak.ts` as a *symlink* whose blob is `../../secret`.
+  // A collector that reads the path rather than inspecting the index would ship
+  // an out-of-tree file to the model. Written straight into the index via
+  // `update-index --cacheinfo` so the assertion holds on filesystems that cannot
+  // materialise links.
+  const { dir, git } = tempGitRepo('spe-corpus-symlink-');
+  const outside = path.join(dir, '..', 'spe-corpus-secret.txt');
+  writeFileSync(outside, 'SECRET-MATERIAL\n', 'utf8');
+
+  mkdirSync(path.join(dir, 'src'), { recursive: true });
+  writeFileSync(path.join(dir, 'src', 'index.ts'), 'export const ok = 1;\n', 'utf8');
+  git('add', 'src/index.ts');
+
+  // A symlink blob is an ordinary blob whose *content* is the link target; the
+  // 120000 file mode is what makes git treat it as a link.
+  const blob = execFileSync('git', ['hash-object', '-w', '--stdin'], {
+    cwd: dir,
+    input: '../../spe-corpus-secret.txt',
+    encoding: 'utf8',
+    env: { ...process.env, PATH: childPath(), Path: childPath() },
+  }).trim();
+  git('update-index', '--add', '--cacheinfo', `120000,${blob},src/leak.ts`);
+
+  const out = tempDir('spe-corpus-symlink-out-');
+  const result = runScript('collect-corpus.mjs', [
+    '--scope',
+    'server-core',
+    '--out',
+    out,
+    '--repo-root',
+    dir,
+  ]);
+
+  assert.notEqual(result.status, 0, 'collection must fail closed on a tracked symlink');
+  assert.match(result.stderr, /symlink/i);
+  assert.match(result.stderr, /src\/leak\.ts/);
+  assert.ok(
+    !existsSync(path.join(out, 'corpus.txt')),
+    'no corpus may be emitted when a symlink is present',
+  );
+
+  rmSync(outside, { force: true });
+});
+
+test('a symlinked parent directory cannot redirect collection outside the checkout', (t) => {
+  // The index-mode check cannot see this one: `src/index.ts` is a perfectly
+  // ordinary tracked blob, but `src/` is swapped for a link after checkout. Only
+  // realpath containment catches it, which is why the collector resolves every
+  // file it is about to read.
+  const { dir, git } = tempGitRepo('spe-corpus-parentlink-');
+  mkdirSync(path.join(dir, 'src'), { recursive: true });
+  writeFileSync(path.join(dir, 'src', 'index.ts'), 'export const ok = 1;\n', 'utf8');
+  git('add', 'src/index.ts');
+
+  const elsewhere = mkdtempSync(path.join(tmpdir(), 'spe-corpus-elsewhere-'));
+  writeFileSync(path.join(elsewhere, 'index.ts'), 'export const secret = "leaked";\n', 'utf8');
+
+  rmSync(path.join(dir, 'src'), { recursive: true, force: true });
+  if (!trySymlink(elsewhere, path.join(dir, 'src'), 'dir')) {
+    t.skip('platform does not permit directory symlink creation');
+    return;
+  }
+
+  const out = tempDir('spe-corpus-parentlink-out-');
+  const result = runScript('collect-corpus.mjs', [
+    '--scope',
+    'server-core',
+    '--out',
+    out,
+    '--repo-root',
+    dir,
+  ]);
+
+  assert.notEqual(result.status, 0, 'collection must fail closed when the path escapes the root');
+  assert.match(result.stderr, /escapes the audited checkout|symlink/i);
+  const corpus = path.join(out, 'corpus.txt');
+  if (existsSync(corpus)) {
+    assert.ok(
+      !readFileSync(corpus, 'utf8').includes('leaked'),
+      'out-of-tree content must never reach the corpus',
+    );
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -764,6 +971,51 @@ test('a pinned reference with a version comment is accepted', () => {
   assert.equal(checkWorkflowSource(`    - uses: actions/checkout@${'3'.repeat(40)}\n`, 'a.yml').length, 1);
 });
 
+
+test('the action-pin scan refuses to follow a symlinked workflow file', (t) => {
+  // Same trust boundary, different reader: a symlinked `.yml` would let a
+  // contributor point the pin checker at a file outside the repo, so the scan
+  // reports "all pinned" over content nobody reviewed.
+  const root = tempDir('spe-pins-symlink-');
+  const workflows = path.join(root, '.github', 'workflows');
+  mkdirSync(workflows, { recursive: true });
+  writeFileSync(
+    path.join(workflows, 'real.yml'),
+    `    - uses: actions/checkout@${'a'.repeat(40)} # v5.0.0\n`,
+    'utf8',
+  );
+
+  const outside = path.join(root, 'outside.yml');
+  writeFileSync(outside, '    - uses: actions/checkout@v5\n', 'utf8');
+  if (!trySymlink(outside, path.join(workflows, 'linked.yml'), 'file')) {
+    t.skip('platform does not permit file symlink creation');
+    return;
+  }
+
+  assert.throws(() => collectFiles(workflows, (name) => name.endsWith('.yml')), /symlink/i);
+  assert.throws(() => checkCompositeActions(root), /symlink/i);
+});
+
+test('the action-pin scan refuses a symlinked directory and cannot loop', (t) => {
+  // A self-referential directory link is the cheapest denial-of-service against
+  // a naive recursive walker: it never terminates. Fail-closed rejection plus
+  // the visited-realpath set means neither an escape nor a hang is reachable.
+  const root = tempDir('spe-pins-loop-');
+  const workflows = path.join(root, '.github', 'workflows');
+  mkdirSync(workflows, { recursive: true });
+  writeFileSync(
+    path.join(workflows, 'real.yml'),
+    `    - uses: actions/checkout@${'a'.repeat(40)} # v5.0.0\n`,
+    'utf8',
+  );
+
+  if (!trySymlink(workflows, path.join(workflows, 'loop'), 'dir')) {
+    t.skip('platform does not permit directory symlink creation');
+    return;
+  }
+
+  assert.throws(() => collectFiles(workflows, (name) => name.endsWith('.yml')), /symlink/i);
+});
 
 test('no audit script creates issues, comments or performs repository writes', () => {
   const offenders = [];

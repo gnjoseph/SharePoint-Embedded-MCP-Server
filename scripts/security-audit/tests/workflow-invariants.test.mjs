@@ -13,6 +13,7 @@ import { ALLOWED_MODELS, DEFAULT_MODEL, SCOPES } from '../lib/constants.mjs';
 
 const REPO_ROOT = path.resolve(import.meta.dirname, '..', '..', '..');
 const WORKFLOW_DIR = path.join(REPO_ROOT, '.github', 'workflows');
+const SCRIPT_DIR = path.join(REPO_ROOT, 'scripts', 'security-audit');
 const AUDIT_WORKFLOW = path.join(WORKFLOW_DIR, 'security-audit.yml');
 
 // Comments are allowed to name a construct in order to explain why it is
@@ -284,8 +285,8 @@ test('jobs that run helper scripts check out the controller before the target', 
     const [controller, target] = checkouts;
     assert.equal(
       controller.with.ref,
-      undefined,
-      `job ${name}: the controller checkout must not override ref (it must stay on the protected default branch)`,
+      '${{ needs.validate-inputs.outputs.controller_sha }}',
+      `job ${name}: the controller checkout must be pinned to the validated main SHA, never the event-selected ref`,
     );
     assert.equal(
       controller.with.path,
@@ -423,9 +424,45 @@ test('model SARIF upload is attributed to the target and gated on main tip', () 
 
 test('validate-inputs publishes the outputs the attribution gates depend on', () => {
   const outputs = audit.doc.jobs['validate-inputs'].outputs;
-  for (const key of ['target_sha', 'target_ref', 'is_main_tip']) {
+  for (const key of ['target_sha', 'target_ref', 'is_main_tip', 'controller_sha']) {
     assert.ok(outputs[key], `validate-inputs must publish ${key}`);
   }
+});
+
+// A manual dispatch selects the workflow *and* the controller ref. If that ref is
+// attacker-selectable, every "trusted controller" guarantee collapses, so the
+// validator refuses any dispatch whose controller ref is not main, and every job
+// re-checks-out the controller at the validated main SHA before running a helper.
+test('a manual dispatch is only honoured when the controller ref is main', () => {
+  const job = audit.doc.jobs['validate-inputs'];
+  const step = job.steps.find((entry) => /validate-target\.mjs/.test(entry.run ?? ''));
+  assert.ok(step, 'validate-inputs must run validate-target.mjs');
+
+  const source = readFileSync(path.join(SCRIPT_DIR, 'validate-target.mjs'), 'utf8');
+  const code = stripComments(source);
+
+  // `GITHUB_REF` / `GITHUB_EVENT_NAME` are supplied automatically by the runner,
+  // so the guard needs no workflow wiring -- but it must actually read them.
+  assert.match(
+    code,
+    /GITHUB_EVENT_NAME/,
+    'the guard must know which event started the run',
+  );
+  assert.match(
+    code,
+    /GITHUB_REF/,
+    'the guard must read the controller ref the run was started from',
+  );
+  assert.match(
+    code,
+    /refs\/heads\/main/,
+    'validate-target must compare the controller ref against refs/heads/main',
+  );
+  assert.match(
+    code,
+    /controller_sha/,
+    'the validated main SHA must be published so jobs can pin the controller checkout',
+  );
 });
 
 test('the legacy no-op gitleaks gate is gone from the security workflow', () => {

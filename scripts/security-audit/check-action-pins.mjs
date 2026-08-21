@@ -21,8 +21,8 @@
  *   node scripts/security-audit/check-action-pins.mjs [--dir .github/workflows] [--root .]
  */
 
-import { readdirSync, readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { isAbsolute, join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const USES_RE = /^\s*(?:-\s+)?uses:\s*(\S+)\s*(.*)$/;
@@ -71,46 +71,96 @@ export function checkWorkflowSource(text, file) {
 }
 
 /**
+ * Resolves `absolute` and asserts the real path stays inside `rootReal`.
+ *
+ * The walk refuses to follow symlinks, but a caller can still point `--root` or
+ * `--dir` at a path whose *ancestors* are links. Re-checking containment on every
+ * visited entry keeps the scan confined to a single real directory tree even when
+ * the entry point itself was reached through a link.
+ *
+ * @param {string} rootReal Canonical (already realpath-resolved) scan root.
+ * @param {string} absolute Path to verify.
+ * @returns {string} The canonical path of `absolute`.
+ */
+function assertWithinRoot(rootReal, absolute) {
+  let real;
+  try {
+    real = realpathSync.native(absolute);
+  } catch (error) {
+    throw new Error(
+      `security-audit: cannot resolve ${absolute}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  const rel = relative(rootReal, real);
+  if (rel !== '' && (rel.startsWith('..') || isAbsolute(rel))) {
+    throw new Error(`security-audit: path escapes the scan root: ${absolute} -> ${real}`);
+  }
+  return real;
+}
+
+/**
  * Recursively lists files under `dir` that satisfy `predicate`.
+ *
+ * Symlinks are rejected outright — both symlinked files and symlinked directories
+ * cause a fail-closed throw rather than a skip. A repository that ships a link
+ * into `/etc`, into another checkout, or back into itself would otherwise let the
+ * pin scanner read (or loop over) content outside the audited tree, and a link
+ * that shadows a composite action could hide an unpinned `uses:` from this check.
+ * Refusing to follow links also makes filesystem cycles unreachable; the `seen`
+ * set below is belt-and-braces for hard-linked or bind-mounted directories.
  *
  * @param {string} dir
  * @param {(name: string) => boolean} predicate
  * @returns {string[]} POSIX-style paths, sorted for deterministic output.
+ * @throws {Error} When a symlink, an escaping path, or a directory cycle is found.
  */
 export function collectFiles(dir, predicate) {
   /** @type {string[]} */
   const found = [];
+
+  let rootReal;
+  try {
+    rootReal = realpathSync.native(dir);
+  } catch (error) {
+    throw new Error(
+      `security-audit: cannot resolve the scan root ${dir}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  /** @type {Set<string>} */
+  const seen = new Set([rootReal]);
 
   /** @param {string} current */
   function walk(current) {
     for (const entry of readdirSync(current, { withFileTypes: true }).sort((a, b) =>
       a.name.localeCompare(b.name),
     )) {
-      if (entry.name.startsWith('.') && entry.isDirectory() && entry.name !== '.github') continue;
       const full = join(current, entry.name);
-      // `withFileTypes` reports symlinks separately; resolve them defensively so a
-      // symlinked workflow directory is still scanned rather than silently skipped.
-      const isDirectory = entry.isDirectory() || (entry.isSymbolicLink() && safeIsDirectory(full));
-      if (isDirectory) {
+      if (entry.isSymbolicLink()) {
+        throw new Error(`security-audit: refusing to follow symlink: ${full}`);
+      }
+      if (entry.isDirectory()) {
+        if (entry.name.startsWith('.') && entry.name !== '.github') continue;
         if (SKIP_DIRS.has(entry.name)) continue;
+        const real = assertWithinRoot(rootReal, full);
+        if (seen.has(real)) {
+          throw new Error(`security-audit: directory cycle detected at ${full}`);
+        }
+        seen.add(real);
         walk(full);
         continue;
       }
-      if (predicate(entry.name)) found.push(full.split('\\').join('/'));
+      // Sockets, FIFOs and device nodes are never audit inputs.
+      if (!entry.isFile()) continue;
+      if (predicate(entry.name)) {
+        assertWithinRoot(rootReal, full);
+        found.push(full.split('\\').join('/'));
+      }
     }
   }
 
   walk(dir);
   return found.sort();
-}
-
-/** @param {string} target */
-function safeIsDirectory(target) {
-  try {
-    return statSync(target).isDirectory();
-  } catch {
-    return false;
-  }
 }
 
 /**
