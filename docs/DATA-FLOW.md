@@ -15,8 +15,9 @@ MCP client  <--stdio-->  spe-mcp-server (local process)  <--HTTPS-->  Microsoft 
   network socket for the client connection.
 - Every outbound network call is HTTPS. All calls that carry your data go to a
   **Microsoft-operated** endpoint, made **on your behalf**, using **your** credentials, into
-  **your** tenant and subscription. The single exception is an anonymous public-package
-  lookup on the npm registry (below), which carries no data of yours.
+  **your** tenant and subscription. The single exception is an unauthenticated public-package
+  lookup on the npm registry (below), sent without a user identifier, which carries no data of
+  yours.
 
 ## Outbound endpoints
 

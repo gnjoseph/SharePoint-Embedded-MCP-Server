@@ -41,9 +41,9 @@
  *   content data is sent. There is no install GUID and no correlation identifier
  *   of any kind, in the request or in the cache.
  * - Before the FIRST network request of a process, a one-time collection notice
- *   ({@link COLLECTION_NOTICE}) is written to stderr naming the endpoint, its
- *   boundary status, and the opt-out. Skipped/cached runs make no request and so
- *   emit no notice.
+ *   ({@link collectionNotice}) is written to stderr naming the endpoint actually
+ *   contacted (including a `SPE_NPM_REGISTRY` override), its boundary status, and
+ *   the opt-out. Skipped/cached runs make no request and so emit no notice.
  * - The result is cached on the local disk only. It is **retained until deleted**
  *   — by `spe-mcp logout`, by removing the data dir, or by deleting the file
  *   reported by `status_get`. There is no server-side record and no retention
@@ -151,24 +151,37 @@ const CI_ENV_VARS = [
 const logger = createLogger("Update");
 
 /**
- * One-time stderr disclosure emitted immediately BEFORE the first network
- * request of a process. Exported so docs and tests assert the exact wording.
+ * Build the one-time stderr disclosure emitted immediately BEFORE the first
+ * network request of a process.
  *
- * It must name the endpoint, say plainly that the endpoint sits outside the
- * Microsoft 365 / Azure compliance boundary, say what the connection discloses,
- * say that nothing is installed, and name the opt-out.
+ * It must name the endpoint actually contacted, say plainly that the endpoint
+ * sits outside the Microsoft 365 / Azure compliance boundary, say what the
+ * connection discloses, say that nothing is installed, and name the opt-out.
+ *
+ * @param registry - The resolved registry origin. Always a value that already
+ *   passed {@link resolveRegistry} (HTTPS, no credentials, no query/fragment,
+ *   length-capped), so it is safe to print verbatim.
  */
-export const COLLECTION_NOTICE = [
-  "Update check: contacting the public npm registry to see whether a newer",
-  `version of ${PACKAGE_NAME} has been published.`,
-  "The npm registry is a third-party service OUTSIDE the Microsoft 365 / Azure",
-  "compliance boundary. The request is unauthenticated and sends no account,",
-  "tenant, machine, session, or content data — but the connection itself",
-  "discloses your IP address, the package name, and the product User-Agent to",
-  "that third party. The result is cached locally until you delete it.",
-  "Nothing is downloaded, installed, or updated automatically.",
-  "Turn this off with --no-update-check or SPE_MCP_UPDATE_CHECK=false.",
-].join(" ");
+export function collectionNotice(registry: string): string {
+  return [
+    `Update check: contacting the npm registry at ${registry} to see whether a`,
+    `newer version of ${PACKAGE_NAME} has been published.`,
+    "The npm registry is a third-party service OUTSIDE the Microsoft 365 / Azure",
+    "compliance boundary. The request is unauthenticated and carries no user",
+    "identifier and no account, tenant, machine, session, or content data — but",
+    "the connection itself discloses your IP address, the package name, and the",
+    "product User-Agent to that third party. The result is cached locally until",
+    "you delete it. Nothing is downloaded, installed, or updated automatically.",
+    "Turn this off with --no-update-check or SPE_MCP_UPDATE_CHECK=false.",
+  ].join(" ");
+}
+
+/**
+ * The disclosure for the default public registry. Exported so docs and tests
+ * assert the exact wording; a `SPE_NPM_REGISTRY` override names that host
+ * instead (see {@link collectionNotice}).
+ */
+export const COLLECTION_NOTICE = collectionNotice(DEFAULT_REGISTRY);
 
 /** Why the check did not run. */
 export type UpdateSkipReason =
@@ -194,8 +207,15 @@ export interface UpdateAvailable {
   readonly channel: string | null;
   /** Newest STABLE release, when it is also newer than the running build. */
   readonly stable?: string;
-  /** The exact command a user can run to update. Informational only. */
-  readonly command: string;
+  /**
+   * The package spec to move to, e.g. `@microsoft/spe-mcp@alpha`. Deliberately
+   * NOT an install command: the server may be launched by `npx`, by a global
+   * install, or from a pinned spec in an MCP client config, and only the user
+   * knows which. Informational only — nothing is installed automatically.
+   */
+  readonly packageSpec: string;
+  /** Package spec for the newest stable release, when {@link stable} is set. */
+  readonly stablePackageSpec?: string;
 }
 
 /** A ready-to-append notice plus its structured twin. */
@@ -457,16 +477,20 @@ function extractDistTags(raw: string): Record<string, string> {
 }
 
 /**
- * Emit the {@link COLLECTION_NOTICE} to stderr, at most once per process.
+ * Emit the collection disclosure to stderr, at most once per process.
  *
  * Called immediately before the first network request, so a run that is opted
  * out, skipped, or served from cache never makes a request AND never emits the
  * notice. stderr only — stdout is the JSON-RPC channel.
+ *
+ * @param registry - The registry actually about to be contacted, so a
+ *   `SPE_NPM_REGISTRY` override is disclosed truthfully rather than the default
+ *   public host. Already validated by {@link resolveRegistry}.
  */
-function emitCollectionNotice(): void {
+function emitCollectionNotice(registry: string): void {
   if (collectionNoticeEmitted) return;
   collectionNoticeEmitted = true;
-  logger.log(COLLECTION_NOTICE);
+  logger.log(collectionNotice(registry));
 }
 
 /**
@@ -484,7 +508,10 @@ function emitCollectionNotice(): void {
  *   whole request is skipped — so there is no "request without a User-Agent"
  *   case for this endpoint.)
  */
-async function fetchDistTags(url: string): Promise<Record<string, string> | null> {
+async function fetchDistTags(
+  url: string,
+  registry: string,
+): Promise<Record<string, string> | null> {
   let expectedHost: string;
   try {
     expectedHost = new URL(url).host;
@@ -493,7 +520,7 @@ async function fetchDistTags(url: string): Promise<Record<string, string> | null
   }
 
   // Last thing before any egress: tell the user what is about to happen.
-  emitCollectionNotice();
+  emitCollectionNotice(registry);
 
   try {
     const response = await fetch(url, {
@@ -652,16 +679,26 @@ function cachedTargetVersion(cache: UpdateCache): string | undefined {
   return cache.channelVersion ?? cache.latest;
 }
 
-/** Render the single notice appended to a tool result. */
+/**
+ * Render the single notice appended to a tool result.
+ *
+ * The remediation wording is deliberately execution-mode neutral. This server is
+ * commonly launched by an MCP client through an unpinned `npx -y @microsoft/spe-mcp`,
+ * in which case `npm install -g` would update something the client never runs.
+ * We therefore name the package *spec* to move to and let the reader apply it to
+ * whichever launch mechanism they actually configured.
+ */
 function renderNotice(update: UpdateAvailable): string {
   const lines = [
     `Update available: ${update.package} ${update.current} -> ${update.latest}` +
-      `${update.channel ? ` (${update.channel} channel)` : ""}. Update with: ${update.command}`,
+      `${update.channel ? ` (${update.channel} channel)` : ""}.`,
+    `To update, point your MCP client at ${update.packageSpec} — update or pin the ` +
+      `package spec in the client config (for example the npx args), or reinstall ` +
+      `the copy you actually launch (for example npm install -g ${update.packageSpec} ` +
+      `for a global install). An unpinned npx launch may keep starting a cached build.`,
   ];
-  if (update.stable) {
-    lines.push(
-      `Latest stable release: ${update.stable} (npm install -g ${update.package}@latest).`,
-    );
+  if (update.stable && update.stablePackageSpec) {
+    lines.push(`Latest stable release: ${update.stable} (spec ${update.stablePackageSpec}).`);
   }
   lines.push(
     "Nothing was downloaded or installed; this is a notification only. " +
@@ -754,7 +791,7 @@ async function runUpdateCheck(options: StartUpdateCheckOptions): Promise<void> {
     } else {
       notifiedFor = cached ? [...cached.notifiedFor] : [];
       checkedAt = now;
-      tags = await fetchDistTags(url);
+      tags = await fetchDistTags(url, registry);
       if (tags === null) {
         writeCache({
           version: 1,
@@ -814,8 +851,10 @@ async function runUpdateCheck(options: StartUpdateCheckOptions): Promise<void> {
       latest,
       channel,
       // Only call out stable separately when it is a different, additional target.
-      ...(stableVersion && stableVersion !== latest ? { stable: stableVersion } : {}),
-      command: `npm install -g ${PACKAGE_NAME}@${channelVersion && channel ? channel : "latest"}`,
+      ...(stableVersion && stableVersion !== latest
+        ? { stable: stableVersion, stablePackageSpec: `${PACKAGE_NAME}@latest` }
+        : {}),
+      packageSpec: `${PACKAGE_NAME}@${channelVersion && channel ? channel : "latest"}`,
     };
 
     status = {

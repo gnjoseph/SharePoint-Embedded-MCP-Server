@@ -17,6 +17,7 @@ import { join } from "node:path";
 
 import {
   COLLECTION_NOTICE,
+  collectionNotice,
   DEFAULT_REGISTRY,
   CHECK_TTL_MS,
   FAILURE_BACKOFF_MS,
@@ -457,19 +458,42 @@ describe("cache", () => {
 // ---------------------------------------------------------------------------
 
 describe("renderNotice", () => {
-  it("names the channel and the exact install command", () => {
+  it("names the channel and the package spec to move to", () => {
     const text = __testing.renderNotice({
       package: PACKAGE_NAME,
       current: "1.0.0-alpha.1",
       latest: "1.0.0-alpha.2",
       channel: "alpha",
-      command: `npm install -g ${PACKAGE_NAME}@alpha`,
+      packageSpec: `${PACKAGE_NAME}@alpha`,
     });
     expect(text).toContain("1.0.0-alpha.1 -> 1.0.0-alpha.2");
     expect(text).toContain("(alpha channel)");
-    expect(text).toContain(`npm install -g ${PACKAGE_NAME}@alpha`);
+    expect(text).toContain(`${PACKAGE_NAME}@alpha`);
     expect(text).toContain("--no-update-check");
     expect(text).not.toContain("Latest stable release");
+  });
+
+  // B1: the server is usually launched by an MCP client through an unpinned
+  // `npx -y @microsoft/spe-mcp`. Guidance that names ONLY a global install would
+  // tell the user to update something the client never runs.
+  it("gives execution-mode neutral remediation, not a bare global install", () => {
+    const text = __testing.renderNotice({
+      package: PACKAGE_NAME,
+      current: "1.0.0-alpha.1",
+      latest: "1.0.0-alpha.2",
+      channel: "alpha",
+      packageSpec: `${PACKAGE_NAME}@alpha`,
+    });
+    // Points at the client configuration first...
+    expect(text).toContain("MCP client");
+    expect(text).toMatch(/package spec/i);
+    // ...warns about the unpinned npx caching trap...
+    expect(text).toMatch(/npx/i);
+    expect(text).toMatch(/cached build/i);
+    // ...and offers the global install only as one example among modes.
+    expect(text).toContain("for example npm install -g");
+    // Still explicitly notify-only.
+    expect(text).toContain("Nothing was downloaded or installed");
   });
 
   it("calls out a separate stable target when one exists", () => {
@@ -479,9 +503,11 @@ describe("renderNotice", () => {
       latest: "1.0.0-alpha.2",
       channel: "alpha",
       stable: "2.0.0",
-      command: `npm install -g ${PACKAGE_NAME}@alpha`,
+      packageSpec: `${PACKAGE_NAME}@alpha`,
+      stablePackageSpec: `${PACKAGE_NAME}@latest`,
     });
     expect(text).toContain("Latest stable release: 2.0.0");
+    expect(text).toContain(`spec ${PACKAGE_NAME}@latest`);
   });
 
   it("omits the channel clause for a stable build", () => {
@@ -490,10 +516,10 @@ describe("renderNotice", () => {
       current: "1.0.0",
       latest: "1.1.0",
       channel: null,
-      command: `npm install -g ${PACKAGE_NAME}@latest`,
+      packageSpec: `${PACKAGE_NAME}@latest`,
     });
     expect(text).not.toContain("channel)");
-    expect(text).toContain(`npm install -g ${PACKAGE_NAME}@latest`);
+    expect(text).toContain(`${PACKAGE_NAME}@latest`);
   });
 });
 
@@ -512,7 +538,7 @@ describe("runUpdateCheck", () => {
     expect(status.state).toBe("update-available");
     expect(status.latestVersion).toBe(EXPECTED_LATEST);
     expect(status.currentVersion).toBe(PACKAGE_VERSION);
-    expect(status.updateAvailable?.command).toContain(`npm install -g ${PACKAGE_NAME}@`);
+    expect(status.updateAvailable?.packageSpec).toBe(`${PACKAGE_NAME}@alpha`);
 
     const notice = takePendingUpdateNotice();
     expect(notice?.text).toContain(EXPECTED_LATEST);
@@ -1065,6 +1091,74 @@ describe("privacy: first-run collection notice", () => {
     await __testing.runUpdateCheck({});
     expect(events).toEqual([]);
     expect(__testing.collectionNoticeEmitted()).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B4: the disclosure must name the registry that is actually contacted.
+// ---------------------------------------------------------------------------
+
+describe("privacy: collection notice names the configured registry", () => {
+  let stderr: ReturnType<typeof vi.spyOn>;
+  let lines: string[];
+
+  beforeEach(() => {
+    lines = [];
+    stderr = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    });
+    respondWith(packument(tagsFixture()));
+  });
+
+  afterEach(() => {
+    stderr.mockRestore();
+  });
+
+  it("names the default public registry when no override is set", async () => {
+    await __testing.runUpdateCheck({});
+    const notice = lines.find((l) => l.includes("OUTSIDE the Microsoft 365 / Azure"));
+    expect(notice).toBeDefined();
+    expect(notice).toContain(DEFAULT_REGISTRY);
+  });
+
+  it("names the override host, not the default, when SPE_NPM_REGISTRY is set", async () => {
+    process.env.SPE_NPM_REGISTRY = "https://npm.contoso.example";
+    await __testing.runUpdateCheck({});
+    const notice = lines.find((l) => l.includes("OUTSIDE the Microsoft 365 / Azure"));
+    expect(notice).toBeDefined();
+    expect(notice).toContain("https://npm.contoso.example");
+    // Telling the user we contacted npmjs.org when we did not would be a
+    // false disclosure.
+    expect(notice).not.toContain(DEFAULT_REGISTRY);
+  });
+
+  it("only ever renders a registry that already passed validation", () => {
+    // collectionNotice() prints its argument verbatim, so the sanitisation
+    // guarantee lives in resolveRegistry(): anything it accepts is an https
+    // origin with no credentials, query, or fragment.
+    for (const hostile of [
+      "http://npm.example",
+      "https://user:pw@npm.example",
+      "https://npm.example/?x=1",
+      "https://npm.example/#f",
+      `https://npm.example/${"a".repeat(600)}`,
+    ]) {
+      process.env.SPE_NPM_REGISTRY = hostile;
+      expect(__testing.resolveRegistry()).toBeNull();
+    }
+  });
+
+  it("keeps the exported default disclosure in sync with the builder", () => {
+    expect(COLLECTION_NOTICE).toBe(collectionNotice(DEFAULT_REGISTRY));
+    expect(COLLECTION_NOTICE).toContain(DEFAULT_REGISTRY);
+  });
+
+  it("states the request is unauthenticated and carries no user identifier", () => {
+    // B4: "anonymous" overstates the guarantee — an IP address is still
+    // observable. Say precisely what is and is not sent.
+    expect(COLLECTION_NOTICE).toContain("unauthenticated");
+    expect(COLLECTION_NOTICE).toContain("no user");
+    expect(COLLECTION_NOTICE).not.toContain("anonymous");
   });
 });
 

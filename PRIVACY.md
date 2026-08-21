@@ -13,7 +13,8 @@ organization's agreements with Microsoft.
 per-user data to Microsoft.** The only Microsoft-bound attribution signal is a static product
 `User-Agent` token, which is on by default and can be turned off (see
 [Turning it off](#turning-it-off)). The only destination that is **not a Microsoft 365 or Azure
-Online Service** is an anonymous public-package lookup on the npm registry used to notify you of
+Online Service** is an unauthenticated public-package lookup — sent without a user identifier —
+on the npm registry used to notify you of
 newer releases, which can also be turned off. Specifically:
 
 - **No telemetry channel.** The tool does not implement application telemetry and does not
@@ -55,8 +56,9 @@ newer releases, which can also be turned off. Specifically:
   GET https://registry.npmjs.org/@microsoft%2fspe-mcp
   ```
 
-  **What the third party can see.** The request is an **anonymous, unauthenticated HTTP GET of
-  public package metadata** — the same lookup `npm view` performs. The request body and headers
+  **What the third party can see.** The request is an **unauthenticated HTTP GET of
+  public package metadata, sent without a user identifier** — the same lookup `npm view` performs.
+  The request body and headers
   carry no identifiers, but the connection itself necessarily discloses to npm:
 
   | Disclosed to npm | Why |

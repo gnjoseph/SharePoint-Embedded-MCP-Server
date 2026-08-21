@@ -117,10 +117,18 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or
 
 ### Updating / removing
 
-Because clients run the package through `npx`, they pick up published updates
-without a global install. Pin a specific version with
-`@microsoft/spe-mcp@0.1.0-alpha.1`. To remove the server, delete the MCP
-client config entry.
+How you update depends on how your MCP client launches the server, so update the
+copy the client actually runs:
+
+- **Unpinned `npx -y @microsoft/spe-mcp` (the config above).** `npx` may keep
+  starting a cached build, so pin the package spec in the client config to the
+  version or channel you want — for example `@microsoft/spe-mcp@alpha` or
+  `@microsoft/spe-mcp@0.2.0-alpha.1` — and restart the client.
+- **Global install.** Reinstall it: `npm install -g @microsoft/spe-mcp@alpha`.
+- **Project-local install.** Update the dependency in that project and reinstall.
+
+To remove the server, delete the MCP client config entry (and uninstall the
+package if you installed it globally or locally).
 
 ### Update notifications
 
@@ -130,7 +138,8 @@ release and — if one exists — appends a short notice to a single tool result
 
 ```text
 Update available: @microsoft/spe-mcp 0.2.0-alpha.1 -> 0.2.0-alpha.4 (alpha channel).
-Update with: npm install -g @microsoft/spe-mcp@alpha
+To update, point your MCP client at @microsoft/spe-mcp@alpha — update or pin the package spec in the client config (for example the npx args), or reinstall the copy you actually launch (for example npm install -g @microsoft/spe-mcp@alpha for a global install). An unpinned npx launch may keep starting a cached build.
+Nothing was downloaded or installed; this is a notification only. Disable this check with --no-update-check or SPE_MCP_UPDATE_CHECK=false.
 ```
 
 The current version and the update state are also reported by `status_get`, so
@@ -145,8 +154,9 @@ How it behaves:
 - **Channel-aware.** A prerelease install (e.g. `alpha`) is compared against its
   own dist-tag, and a newer **stable** release is mentioned separately.
 - **Quiet.** The notice is shown once per newer version, not on every call.
-- **Anonymous.** Exactly one unauthenticated `GET` of the package's public
-  metadata — `https://registry.npmjs.org/@microsoft%2fspe-mcp`, no query string,
+- **Unauthenticated, without a user identifier.** Exactly one unauthenticated
+  `GET` of the package's public metadata —
+  `https://registry.npmjs.org/@microsoft%2fspe-mcp`, no query string,
   redirects rejected. No credentials, cookies, `.npmrc`, or `npm` subprocess are
   involved, and **no install GUID, machine, user, tenant, subscription, or
   session identifier** is sent. As with any HTTPS request, npm sees your IP
@@ -156,7 +166,9 @@ How it behaves:
   (`SPE_MCP_COLLECT_TELEMETRY=false`) suppresses the request entirely, so none of
   that is disclosed.
 - **Announced.** Before the first check in a process, a one-time notice is
-  printed to **stderr** naming the endpoint, the boundary, and the opt-out.
+  printed to **stderr** naming the endpoint actually contacted (the registry from
+  `SPE_NPM_REGISTRY` if you set one, otherwise `registry.npmjs.org`), the
+  boundary, and the opt-out.
 - **Cached locally.** The result is stored owner-only at
   `<data dir>/update-check.json` and **kept until you delete it**;
   `spe-mcp logout` and `spe-mcp auth --reset` remove it, and `status_get` prints
@@ -680,7 +692,7 @@ day by the [update check](#update-notifications) to read the published version l
 `@microsoft/spe-mcp`. ⚠️ Because it is not a Microsoft Online Service, it is **not covered by the
 Microsoft Product Terms, the Microsoft Products and Services Data Protection Addendum (DPA), or
 the EU Data Boundary**, and it is **outside the Microsoft 365 / Azure compliance
-boundary**. The request is **unauthenticated and anonymous** — exactly
+boundary**. The request is **unauthenticated and carries no user identifier** — exactly
 `GET https://registry.npmjs.org/@microsoft%2fspe-mcp` with no query string, no credentials or
 cookies, redirects rejected, and **no install GUID, machine, user, tenant, subscription,
 correlation, or session identifier**; it is an ordinary public package lookup, identical to

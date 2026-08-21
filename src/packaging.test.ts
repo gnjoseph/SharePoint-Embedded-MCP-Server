@@ -71,6 +71,81 @@ describe("packaging: THIRD-PARTY-NOTICES", () => {
       expect(notices, `missing attribution for ${dep}`).toContain(dep);
     }
   });
+
+  /**
+   * Consistency guard: the checked-in notices file must match the *locked*
+   * production tree, not a historical one. `npm run notices` emits one numbered
+   * entry per package as `N. <name> <version> (<license>)`; this compares the
+   * version in that entry against the version `package-lock.json` resolves for
+   * the same direct dependency. It is offline and deterministic (it never runs
+   * the generator), so a stale THIRD-PARTY-NOTICES fails CI instead of shipping.
+   */
+  it("records the locked version of every direct production dependency", () => {
+    const notices = readFileSync(noticesPath, "utf8");
+    const lock = readJson("package-lock.json");
+    const packages = (lock.packages ?? {}) as Record<string, { version?: string }>;
+
+    const mismatches: string[] = [];
+    for (const dep of Object.keys(pkg.dependencies ?? {})) {
+      const locked = packages[`node_modules/${dep}`]?.version;
+      expect(locked, `no lockfile entry for ${dep}`).toBeTruthy();
+
+      const escaped = dep.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+      const entry = new RegExp(`^\\d+\\. ${escaped} (\\S+) \\(`, "m").exec(notices);
+      if (!entry) {
+        mismatches.push(`${dep}: no numbered notices entry`);
+        continue;
+      }
+      if (entry[1] !== locked) {
+        mismatches.push(`${dep}: notices ${entry[1]} != lockfile ${locked}`);
+      }
+    }
+
+    expect(
+      mismatches,
+      `THIRD-PARTY-NOTICES is stale; run \`npm run notices\`: ${mismatches.join("; ")}`,
+    ).toHaveLength(0);
+  });
+});
+
+/**
+ * B3 (OSS review): the published tarball must carry the disclosure documents the
+ * README links to. README ships in the package and links to PRIVACY.md,
+ * docs/DATA-FLOW.md, docs/SECURITY-CONTROLS.md and friends with *relative*
+ * links, so omitting them from `files` leaves an installed copy with dead links
+ * and no on-disk privacy/security disclosure.
+ */
+describe("packaging: disclosure documents are published", () => {
+  const DISCLOSURE_DOCS = [
+    "CHANGELOG.md",
+    "NOTICE.md",
+    "PRIVACY.md",
+    "README.md",
+    "SECURITY.md",
+    "SUPPORT.md",
+    "docs/DATA-FLOW.md",
+    "docs/SECURITY-CONTROLS.md",
+    "docs/TROUBLESHOOTING.md",
+  ];
+
+  it("lists every disclosure document in the published files allow-list", () => {
+    const files = (pkg.files ?? []) as string[];
+    for (const doc of DISCLOSURE_DOCS) {
+      expect(files, `${doc} must be published`).toContain(doc);
+    }
+  });
+
+  it("has every listed disclosure document on disk", () => {
+    for (const doc of DISCLOSURE_DOCS) {
+      expect(existsSync(join(pkgRoot, doc)), `${doc} is missing from the repo`).toBe(true);
+    }
+  });
+
+  it("ships no .npmignore that could override the files allow-list", () => {
+    // `.npmignore` takes precedence over `files` for directory contents; its
+    // absence is what makes the allow-list above authoritative.
+    expect(existsSync(join(pkgRoot, ".npmignore"))).toBe(false);
+  });
 });
 
 describe("packaging: complete metadata", () => {
