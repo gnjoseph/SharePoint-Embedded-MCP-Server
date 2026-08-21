@@ -527,3 +527,126 @@ test('the Copilot CLI is installed reproducibly from a committed manifest', () =
   const pin = manifest.dependencies['@github/copilot'];
   assert.match(pin, /^\d+\.\d+\.\d+/, 'the Copilot CLI must be pinned to an exact version');
 });
+
+// ---------------------------------------------------------------------------
+// Governance and contributor-disclosure invariants.
+//
+// These guard the documentation contract reviewed by CELA: the credential model
+// must be one that GitHub can actually issue, the open legal questions must stay
+// visibly open, contributors must be told what the optional model layer does,
+// and the layer itself must stay off.
+// ---------------------------------------------------------------------------
+
+const AUDIT_DOC = readFileSync(path.join(REPO_ROOT, 'docs', 'SECURITY-AUDIT.md'), 'utf8');
+const CONTRIBUTING_DOC = readFileSync(path.join(REPO_ROOT, 'CONTRIBUTING.md'), 'utf8');
+
+test('credential governance requires a team-owned managed service account', () => {
+  // GitHub cannot issue a token to a "team alias" -- a PAT always belongs to an
+  // account. Requiring one is an instruction that cannot be followed.
+  assert.doesNotMatch(
+    AUDIT_DOC,
+    /a team alias, not a personal account/,
+    'the docs must not ask for a credential model GitHub does not support',
+  );
+
+  for (const required of [
+    'managed service (machine) GitHub account',
+    'Copilot Business or Copilot Enterprise',
+    'Individual/Pro seats are disallowed pending CELA',
+    'at least two named human owners',
+    'explicit expiry',
+  ]) {
+    assert.ok(
+      AUDIT_DOC.includes(required),
+      `credential governance must state: ${required}`,
+    );
+  }
+
+  assert.match(AUDIT_DOC, /cost centre/i, 'premium-request billing must name a cost centre');
+  assert.match(AUDIT_DOC, /offboarding checklist/i, 'offboarding must be an explicit obligation');
+});
+
+test('activation determinations are recorded as open, never as approved', () => {
+  const heading = '### Activation determinations (to be completed by CELA/Privacy)';
+  const start = AUDIT_DOC.indexOf(heading);
+  assert.notEqual(start, -1, 'the activation determinations table must exist');
+
+  const section = AUDIT_DOC.slice(start);
+  for (const topic of [/retention/i, /Data residency/, /acceptable-use policy/, /train/i]) {
+    assert.match(section, topic, `activation determinations must cover ${topic}`);
+  }
+
+  const open = section.match(/Not determined/g) ?? [];
+  assert.ok(
+    open.length >= 5,
+    `every determination must be open; found ${open.length} "Not determined" markers`,
+  );
+
+  // Nothing in this repository may assert that legal or privacy review is done.
+  assert.doesNotMatch(
+    AUDIT_DOC,
+    /\bapproved by (CELA|Privacy)\b/i,
+    'the docs must not claim CELA or Privacy approval',
+  );
+});
+
+test('contributors are told the model layer is disabled by default', () => {
+  assert.match(
+    CONTRIBUTING_DOC,
+    /## Optional model-assisted security analysis/,
+    'contributors must be given a disclosure section',
+  );
+  assert.ok(
+    CONTRIBUTING_DOC.includes('**This feature is disabled by default.**'),
+    'the disclosure must lead with the disabled-by-default status',
+  );
+
+  for (const required of [
+    'GitHub Copilot',
+    'No repository metadata',
+    'No tools, no writes',
+    'Advisory and redacted',
+    'pull_request_target',
+    'maintainer will discuss it with you',
+    'docs/SECURITY-AUDIT.md',
+  ]) {
+    assert.ok(
+      CONTRIBUTING_DOC.includes(required),
+      `contributor disclosure must state: ${required}`,
+    );
+  }
+
+  // Wrapped prose: match across the line break rather than pinning the wrap point.
+  assert.match(
+    CONTRIBUTING_DOC,
+    /already-public,\s+git-tracked source files from `main`/,
+    'the disclosure must scope the corpus to public tracked source on main',
+  );
+  assert.match(
+    CONTRIBUTING_DOC,
+    /third-party\s+model provider/,
+    'the disclosure must name the third-party model provider relay',
+  );
+});
+
+test('the model layer remains disabled: nothing in the repository enables it', () => {
+  assert.ok(
+    audit.code.includes("vars.SECURITY_AUDIT_AI_ENABLED == 'true'"),
+    'the model job must stay gated on an opt-in repository variable',
+  );
+
+  for (const file of readdirSync(WORKFLOW_DIR)) {
+    if (!/\.ya?ml$/.test(file)) continue;
+    const raw = readFileSync(path.join(WORKFLOW_DIR, file), 'utf8');
+    assert.doesNotMatch(
+      raw,
+      /SECURITY_AUDIT_AI_ENABLED\s*[:=]\s*['"]?true/,
+      `${file} must not set the model-layer variable`,
+    );
+  }
+
+  assert.ok(
+    AUDIT_DOC.includes('The model layer ships **disabled**'),
+    'the docs must continue to state that the model layer ships disabled',
+  );
+});

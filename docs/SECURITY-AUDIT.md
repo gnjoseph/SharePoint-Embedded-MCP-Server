@@ -202,9 +202,12 @@ Steps, in order:
    see [`tools/copilot-cli/README.md`](../tools/copilot-cli/README.md).
 2. **Create and protect the `security-audit-ai` environment**: required reviewers, plus a
    deployment-branch rule limited to `main`.
-3. **Add a least-scope `COPILOT_PAT` environment secret** (Copilot Requests only — no `repo`,
-   no `workflow`, no `write:*`). This is the only supported credential path; see the governance
-   requirements below.
+3. **Provision a team-owned managed service account, then add a least-scope `COPILOT_PAT`
+   environment secret** (Copilot Requests only — no `repo`, no `workflow`, no `write:*`).
+   GitHub has no "team alias" credential: a personal access token is always bound to a GitHub
+   *account*, so the token must be issued from a **managed service (machine) account owned by the
+   team**, never from an individual maintainer's account. This is the only supported credential
+   path; see the governance requirements below.
 4. **Set the repository variable `SECURITY_AUDIT_AI_ENABLED` to `true`.** The job stays skipped
    until this variable exists, so the protected environment is never implicitly created.
 5. **Validate the model id** is accepted by the provider before the first real run. The default
@@ -217,18 +220,38 @@ disabled — the deterministic jobs are unaffected.
 
 | Requirement | Obligation |
 | --- | --- |
-| Owner | Name a single accountable owner (a team alias, not a personal account) recorded with the environment. A personal token silently inherits that person's entitlements. |
+| Account | The token must be issued from a **team-owned managed service (machine) GitHub account**, provisioned through the organization's standard process and recorded in the team's asset inventory. A token issued from an individual maintainer's account is disqualifying: it silently inherits that person's entitlements and dies with their offboarding. |
+| Seat | The service account must hold a **Copilot Business or Copilot Enterprise** seat. **Individual/Pro seats are disallowed pending CELA review** — their terms, retention and training posture differ from the business/enterprise agreements. |
+| Named owners | Record **at least two named human owners** (primary and backup) for the service account and the token, alongside the environment. A machine account with no named owner is unmaintainable. |
 | Scope | Copilot Requests only. Any `repo`, `workflow`, `write:*` or `admin:*` scope is disqualifying. |
+| Expiry | Set an **explicit expiry**. Tokens configured with "no expiration" are disqualifying. |
 | Rotation | Rotate on a fixed cadence no longer than the organization's standard for CI credentials, and immediately on any suspected exposure. |
-| Offboarding | Revoke and reissue whenever the owning individual changes role or leaves. Add this to the team's offboarding checklist — an orphaned token keeps working. |
-| Billing | Requests are metered against the token owner's Copilot entitlement. Confirm the cost centre before enabling; a weekly run over the full corpus is not free. |
-| Provider terms | Confirm the provider's terms of service and acceptable-use policy permit automated source analysis for this repository's content. |
-| Retention | Confirm and record how long the provider retains prompts and completions. The corpus is repository source; treat retention as a data-handling decision, not a detail. |
+| Offboarding | Add the token to the team's **offboarding checklist**. Revoke and reissue whenever a named owner changes role or leaves, and whenever the service account changes hands. |
+| Cost centre | Copilot premium requests are metered and billed against the service account's entitlement. Record the **cost centre** that absorbs them before enabling; a weekly run over the full corpus is not free. |
 | Debug logs | Do **not** enable `ACTIONS_STEP_DEBUG` or `ACTIONS_RUNNER_DEBUG` on runs of this workflow. Debug logging can surface prompt and response content into world-readable logs, defeating the redaction boundary. |
 
 There is **no** alternative credential mechanism implemented. If a different provider or an
 OIDC-based flow is adopted later, it must be implemented and reviewed on its own merits — do not
 assume it is available.
+
+### Activation determinations (to be completed by CELA/Privacy)
+
+Nothing in this table is answered, agreed or approved. These are **open questions** that CELA and
+Privacy must determine and record before `SECURITY_AUDIT_AI_ENABLED` is set. This repository makes
+no claim about any of them; the rows exist so that activation cannot proceed on assumption.
+
+| Determination | Question to be answered | Status |
+| --- | --- | --- |
+| Prompt/completion retention | How long does the provider retain the prompt (repository source) and the completion, and where is that retention documented? | ☐ Not determined |
+| Data residency | In which regions are prompts processed and stored, and is that acceptable for this repository's content? | ☐ Not determined |
+| Provider terms and AUP | Do the applicable terms of service and acceptable-use policy permit automated source analysis of this repository under the seat type in use? | ☐ Not determined |
+| Model training/improvement | Are prompts or completions used for model training, fine-tuning or product improvement, and can that be disabled? | ☐ Not determined |
+| Telemetry and provider-side logging | What request metadata and content is logged provider-side, who can access it, and for how long? | ☐ Not determined |
+| Contributor disclosure sufficiency | Is the disclosure in [`../CONTRIBUTING.md`](../CONTRIBUTING.md) sufficient notice to external contributors? | ☐ Not determined |
+| Export/third-party review | Are there export-control or third-party-review obligations triggered by sending this source to the provider? | ☐ Not determined |
+
+If any row is unresolved, leave the layer disabled. The deterministic jobs are unaffected and
+continue to run on schedule.
 
 Related administrative follow-ups (independent of the model layer):
 

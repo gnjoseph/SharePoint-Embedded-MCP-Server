@@ -38,6 +38,36 @@ For more information see the
 [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or
 comments.
 
+## Optional model-assisted security analysis
+
+**This feature is disabled by default.** It is documented here so contributors know what *could*
+happen to code they contribute, if maintainers ever enable it.
+
+The repository contains a scheduled weekly security-audit workflow. It has an optional stage that,
+when a maintainer explicitly enables it, may send a bounded selection of **already-public,
+git-tracked source files from `main`** to **GitHub Copilot**, which relays them to a **third-party
+model provider** for advisory security analysis.
+
+What this stage does and does not do:
+
+- **Only public, tracked source.** The corpus is limited to an allowlist of source file extensions
+  from committed files on `main`, under a hard file-count and byte cap. Untracked files, local
+  working-tree changes, build output and dependencies are never included.
+- **No repository metadata.** No issues, pull requests, discussions, commit messages, author
+  identities, secrets, environment variables or CI logs are sent.
+- **No tools, no writes.** The model runs without tools, without MCP servers, without shell access
+  and without any write permission. It cannot open issues, comment, push, or change settings.
+- **Advisory and redacted.** Output is schema-validated and redacted before use, is advisory only,
+  and is never a required check for merging a pull request.
+- **Never triggered by contributions.** The workflow has no `pull_request` or
+  `pull_request_target` trigger. Opening or updating a pull request never sends anything anywhere.
+
+The full design, boundaries and activation prerequisites are documented in
+[docs/SECURITY-AUDIT.md](docs/SECURITY-AUDIT.md).
+
+If you have concerns about this feature as it relates to your contribution, please open a GitHub
+discussion or a non-security issue and a maintainer will discuss it with you.
+
 ## Reporting security issues
 
 Please report security issues privately as described in [SECURITY.md](SECURITY.md). Do
