@@ -31,11 +31,13 @@ on:
         required: false
         default: claude-opus-5
         type: choice
+        # Exactly one entry for the MVP: every model family carries a different
+        # provider/subprocessor chain, and only this one has been through
+        # privacy review. Adding a choice requires a fresh determination and a
+        # matching update to ALLOWED_MODELS in
+        # scripts/security-audit/lib/constants.mjs.
         options:
           - claude-opus-5
-          - claude-sonnet-4.5
-          - gpt-5
-          - gpt-4.1
       dry_run:
         description: 'Exercise the schema / redaction / SARIF path with a synthetic response. No credential is used and no inference is performed.'
         required: false
@@ -296,6 +298,10 @@ jobs:
       # re-raised as the step status; it is not swallowed by a trailing command.
       # The scan target is the separate `target/` checkout; the binary and the
       # report both live in the controller-owned workspace root.
+      # Console output is redirected and discarded unread: gitleaks prints one
+      # block per finding carrying file path, line, commit, author and e-mail.
+      # `--redact` masks only the secret value, not that metadata, and Actions
+      # logs are world-readable on a public repository.
       - name: Scan repository history
         id: scan
         continue-on-error: true
@@ -307,16 +313,20 @@ jobs:
             --report-path .security-audit/gitleaks.json \
             --redact \
             --exit-code 2 \
-            --no-banner
+            --no-banner \
+            > .security-audit/gitleaks-console.log 2>&1
           status=$?
+          rm -f .security-audit/gitleaks-console.log
           echo "gitleaks exited with ${status}"
           exit "${status}"
 
       # The raw report contains the match context, commit metadata, rule
       # identifiers and file paths. Everything that locates a finding is
       # dropped: the published summary carries counts only, and the raw report
-      # is deleted before any upload step runs. Triage uses the scan step logs,
-      # which require repository write access to read.
+      # is deleted before any upload step runs. Actions logs on a public
+      # repository are world-readable, so the scanner's console output is
+      # discarded in the scan step rather than used for triage; triage is a
+      # local `gitleaks git .` run by a maintainer.
       - name: Reduce report to sanitized counts
         run: |
           set -euo pipefail
@@ -441,6 +451,32 @@ jobs:
             echo "COPILOT_PAT is not set in the security-audit-ai environment" >&2
             exit 1
           fi
+
+      # Runner debug logging (`ACTIONS_STEP_DEBUG` / `ACTIONS_RUNNER_DEBUG`, or
+      # the "Enable debug logging" re-run toggle that sets `runner.debug`) makes
+      # the runner echo step inputs, environment and command output verbatim.
+      # That would flush the assembled corpus, the prompt and the raw model
+      # response into the Actions log, which is world-readable on a public
+      # repository. There is no way to opt a single job out of that behaviour,
+      # so the job refuses to run instead. This guard sits before corpus
+      # collection so nothing is even assembled under debug logging, and it
+      # tests the flags rather than printing them.
+      - name: Refuse to run under debug logging
+        env:
+          STEP_DEBUG: ${{ secrets.ACTIONS_STEP_DEBUG }}
+          RUNNER_DEBUG_SECRET: ${{ secrets.ACTIONS_RUNNER_DEBUG }}
+          RUNNER_DEBUG_CONTEXT: ${{ runner.debug }}
+        run: |
+          set -euo pipefail
+          for flag in "${STEP_DEBUG:-}" "${RUNNER_DEBUG_SECRET:-}" "${RUNNER_DEBUG_CONTEXT:-}" "${RUNNER_DEBUG:-}"; do
+            case "$(printf '%s' "${flag}" | tr '[:upper:]' '[:lower:]')" in
+              true|1|yes|on)
+                echo "::error::Debug logging is enabled; refusing to send repository source to the model." >&2
+                exit 1
+                ;;
+            esac
+          done
+          echo "Debug logging is off; continuing."
 
       # Collects an allowlisted, size-capped corpus. Every file body is wrapped
       # in per-run, nonce-bearing untrusted-content delimiters so instructions

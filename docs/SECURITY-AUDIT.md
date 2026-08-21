@@ -172,10 +172,12 @@ Individual stages can be run directly — see
    artifact are world-readable on a public repository, so they carry `total`, `ruleCount` and
    `fileCount` — never rule identifiers and never file paths. A rule id paired with a path
    states which file holds which class of credential, which is exactly the pre-rotation
-   disclosure an attacker wants. To locate a hit, open the **`Scan for committed secrets`**
-   step log of the failing run (visible to collaborators with read access to Actions logs);
-   the scanner runs with `--redact`, so the log shows location without the secret value.
-   The raw Gitleaks report is deleted inside the job and is never uploaded. Rotate the
+   disclosure an attacker wants. Nothing in the run tells you *where* the hit is: Actions logs
+   are world-readable on a public repository, so the scanner's console output — which repeats
+   file path, line, commit, author and e-mail for every finding — is discarded inside the job,
+   and the raw Gitleaks report is deleted before any upload step runs. To locate a hit, clone
+   the repository and re-run the scanner locally:
+   `gitleaks git . --redact --no-banner`. Match the counts against the summary, rotate the
    credential *before* removing it from source, then re-run the workflow to confirm.
 3. **Model findings are leads, not verdicts.** Each accepted finding carries a confidence and a
    control anchor. Confirm the code path by hand before filing anything.
@@ -210,8 +212,11 @@ Steps, in order:
    path; see the governance requirements below.
 4. **Set the repository variable `SECURITY_AUDIT_AI_ENABLED` to `true`.** The job stays skipped
    until this variable exists, so the protected environment is never implicitly created.
-5. **Validate the model id** is accepted by the provider before the first real run. The default
-   (`claude-opus-5`) is an allowlist entry that has not been exercised end to end.
+5. **Validate the model id** is accepted by the provider before the first real run. The allowlist
+   holds exactly **one** model for the MVP (`claude-opus-5`), so the provider and subprocessor
+   chain is fixed and reviewable. Adding a second model widens that chain and requires its own
+   CELA/Privacy determination — it is not a configuration change. `claude-opus-5` is an allowlist
+   entry that has not been exercised end to end.
 
 ### `COPILOT_PAT` governance requirements
 
@@ -228,7 +233,7 @@ disabled — the deterministic jobs are unaffected.
 | Rotation | Rotate on a fixed cadence no longer than the organization's standard for CI credentials, and immediately on any suspected exposure. |
 | Offboarding | Add the token to the team's **offboarding checklist**. Revoke and reissue whenever a named owner changes role or leaves, and whenever the service account changes hands. |
 | Cost centre | Copilot premium requests are metered and billed against the service account's entitlement. Record the **cost centre** that absorbs them before enabling; a weekly run over the full corpus is not free. |
-| Debug logs | Do **not** enable `ACTIONS_STEP_DEBUG` or `ACTIONS_RUNNER_DEBUG` on runs of this workflow. Debug logging can surface prompt and response content into world-readable logs, defeating the redaction boundary. |
+| Debug logs | The `model-audit` job **fails closed** before any corpus is collected when `ACTIONS_STEP_DEBUG` or `ACTIONS_RUNNER_DEBUG` is set, or when the run was started with "Enable debug logging". Debug logging can flush prompt and response content into logs that are world-readable on a public repository, so the job refuses to run rather than relying on an operator instruction. Disable debug logging and re-run. |
 
 There is **no** alternative credential mechanism implemented. If a different provider or an
 OIDC-based flow is adopted later, it must be implemented and reviewed on its own merits — do not

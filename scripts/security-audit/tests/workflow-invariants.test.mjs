@@ -528,6 +528,108 @@ test('the Copilot CLI is installed reproducibly from a committed manifest', () =
   assert.match(pin, /^\d+\.\d+\.\d+/, 'the Copilot CLI must be pinned to an exact version');
 });
 
+// Runner debug logging echoes step inputs, environment and command output
+// verbatim into the Actions log, which is world-readable on a public
+// repository. Under debug logging the corpus, the prompt and the raw model
+// response would all be published. A job cannot opt out of that behaviour, so
+// the job must refuse to start -- and it must refuse before anything is
+// assembled, installed or sent.
+test('the model job refuses to run under debug logging, before any corpus exists', () => {
+  const steps = audit.doc.jobs['model-audit'].steps;
+  const guardIndex = steps.findIndex(
+    (step) =>
+      typeof step.env === 'object' &&
+      step.env !== null &&
+      Object.values(step.env).some((value) => /ACTIONS_STEP_DEBUG/.test(String(value))) &&
+      Object.values(step.env).some((value) => /ACTIONS_RUNNER_DEBUG/.test(String(value))),
+  );
+  assert.ok(guardIndex >= 0, 'a debug-logging guard step must exist');
+
+  const guard = steps[guardIndex];
+  assert.ok(
+    Object.values(guard.env).some((value) => /runner\.debug/.test(String(value))),
+    'the "Enable debug logging" re-run toggle must be covered too',
+  );
+  assert.match(guard.run, /exit 1/, 'the guard must fail the job, not warn');
+  assert.equal(
+    /echo\s+"?\$\{?STEP_DEBUG/.test(guard.run),
+    false,
+    'the guard must test the flags, never print them',
+  );
+
+  const laterStep = (pattern) =>
+    steps.findIndex(
+      (step) =>
+        (typeof step.run === 'string' && pattern.test(step.run)) ||
+        (typeof step.uses === 'string' && pattern.test(step.uses)),
+    );
+  for (const [label, pattern] of [
+    ['corpus collection', /collect-corpus\.mjs/],
+    ['prompt assembly', /build-prompt\.mjs/],
+    ['Copilot CLI install', /npm ci --ignore-scripts/],
+    ['inference', /^actions\/ai-inference@/],
+  ]) {
+    const index = laterStep(pattern);
+    assert.ok(index >= 0, `${label} step must exist`);
+    assert.ok(
+      guardIndex < index,
+      `the debug guard must run before ${label}`,
+    );
+  }
+});
+
+// gitleaks prints one block per finding to the console carrying file path,
+// line, commit, author and e-mail. `--redact` masks the secret value only, not
+// that metadata, and Actions logs are world-readable on a public repository.
+// Every scan invocation must therefore discard its console output, and nothing
+// may replay a gitleaks log or the raw report back into the log or summary.
+test('gitleaks console output is discarded and never replayed', () => {
+  const workflows = [
+    ['security-audit.yml', audit],
+    ['security.yml', readWorkflow(path.join(WORKFLOW_DIR, 'security.yml'))],
+  ];
+
+  for (const [name, workflow] of workflows) {
+    const steps = Object.values(workflow.doc.jobs)
+      .flatMap((job) => job.steps ?? [])
+      .filter((step) => typeof step.run === 'string');
+
+    const scans = steps.filter((step) => /^\s*\.\/gitleaks\s+git\b/m.test(step.run));
+    assert.ok(scans.length > 0, `${name} must invoke the gitleaks binary`);
+
+    for (const step of scans) {
+      assert.match(
+        step.run,
+        /> \.security-audit\/gitleaks-console\.log 2>&1/,
+        `${name}: gitleaks console output must be redirected to a file`,
+      );
+      assert.match(
+        step.run,
+        /rm -f \.security-audit\/gitleaks-console\.log/,
+        `${name}: the console log must be deleted unread`,
+      );
+      assert.match(
+        step.run,
+        /exit "\$\{status\}"/,
+        `${name}: the scanner exit code must still be re-raised`,
+      );
+    }
+
+    for (const step of steps) {
+      assert.equal(
+        /\b(cat|head|tail|less)\s+[^\n]*gitleaks-console\.log/.test(step.run),
+        false,
+        `${name}: the gitleaks console log must never be read back`,
+      );
+      assert.equal(
+        /\b(cat|head|tail|less)\s+[^\n]*\.security-audit\/gitleaks\.json/.test(step.run),
+        false,
+        `${name}: the raw gitleaks report must never be read back`,
+      );
+    }
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Governance and contributor-disclosure invariants.
 //

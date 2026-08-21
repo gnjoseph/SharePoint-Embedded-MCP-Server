@@ -89,13 +89,16 @@ export const CORPUS_DENY_PATTERNS = Object.freeze([
  * Models the workflow is permitted to request. The `workflow_dispatch` input is
  * validated against this list; anything else aborts before any credential is
  * touched.
+ *
+ * The MVP allowlist deliberately holds exactly one entry. Each model family is
+ * served by a different provider/subprocessor chain, and the privacy review
+ * covers only the single chain named here. Widening this list changes where
+ * repository source is processed, so a new entry requires its own CELA and
+ * Privacy determination before it may be added — it is not a configuration
+ * detail. Keep this list, the `model` choices in
+ * `.github/workflows/security-audit.yml`, and `DEFAULT_MODEL` identical.
  */
-export const ALLOWED_MODELS = Object.freeze([
-  'claude-opus-5',
-  'claude-sonnet-4.5',
-  'gpt-4.1',
-  'gpt-5',
-]);
+export const ALLOWED_MODELS = Object.freeze(['claude-opus-5']);
 
 /** Default model for the audit. */
 export const DEFAULT_MODEL = 'claude-opus-5';

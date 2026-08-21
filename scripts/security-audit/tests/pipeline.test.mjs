@@ -531,8 +531,8 @@ test('gitleaks reports never carry secret material', () => {
 // and the `secret-scan-summary` artifact. Before the secret is rotated, a rule
 // identifier paired with a path states which file holds which class of
 // credential, which is itself disclosure. The summary therefore carries counts
-// only; triage happens through the scan step log, which is restricted to
-// collaborators with Actions read access.
+// only. Actions logs are world-readable on a public repository, so the scanner
+// console output is discarded in the job as well; triage is a local re-run.
 test('the sanitized gitleaks summary publishes counts without locations', () => {
   const sanitized = sanitizeGitleaks([
     { RuleID: 'generic-api-key', File: 'src/a.ts', StartLine: 3, Secret: 'x' },
