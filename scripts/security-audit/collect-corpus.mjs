@@ -17,6 +17,10 @@
  *    aborts the collection outright.
  *  - File discovery uses `git ls-files`, so untracked and ignored files (which
  *    may contain local secrets) are never collected.
+ *  - `--repo-root` points at the *audited* checkout, which is separate from the
+ *    trusted controller checkout this script is executed from. The controller
+ *    never runs code from, and never sources helper scripts out of, the audited
+ *    tree — so auditing a historical commit cannot change audit behaviour.
  *
  * Emits:
  *  - `<out>/corpus.txt`          delimiter-fenced file bodies
@@ -26,7 +30,7 @@
  *                                 the exact fence in use
  *
  * Usage:
- *   node scripts/security-audit/collect-corpus.mjs --scope <name> --out <dir>
+ *   node scripts/security-audit/collect-corpus.mjs --scope <name> --out <dir> [--repo-root <dir>]
  */
 
 import { execFileSync } from 'node:child_process';
@@ -71,9 +75,13 @@ function fail(message) {
   process.exit(1);
 }
 
-/** @returns {string[]} Repository-relative, POSIX-separated tracked paths. */
-function listTrackedFiles() {
+/**
+ * @param {string} repoRoot Directory of the checkout to enumerate.
+ * @returns {string[]} Repository-relative, POSIX-separated tracked paths.
+ */
+function listTrackedFiles(repoRoot) {
   const stdout = execFileSync('git', ['ls-files', '-z'], {
+    cwd: repoRoot,
     encoding: 'utf8',
     maxBuffer: 32 * 1024 * 1024,
   });
@@ -95,13 +103,18 @@ function main() {
   const args = parseArgs(process.argv.slice(2));
   const scope = (args.scope ?? '').trim() || DEFAULT_SCOPE;
   const outDir = (args.out ?? '').trim() || 'security-audit-out';
+  // The audited content lives in a *separate* checkout from the trusted
+  // controller scripts, so the corpus root is explicit. Manifest keys stay
+  // repository-relative so findings reference real repository paths rather
+  // than the controller's `target/` staging directory.
+  const repoRoot = (args['repo-root'] ?? '').trim() || '.';
 
   const prefixes = SCOPES[scope];
   if (!prefixes) {
     fail(`scope ${JSON.stringify(scope)} is not allowlisted`);
   }
 
-  const candidates = listTrackedFiles()
+  const candidates = listTrackedFiles(repoRoot)
     .filter((file) => isEligible(file, prefixes))
     .sort();
 
@@ -126,7 +139,7 @@ function main() {
 
     let size;
     try {
-      size = statSync(file).size;
+      size = statSync(path.join(repoRoot, file)).size;
     } catch {
       skipped.push({ file, reason: 'unreadable' });
       continue;
@@ -141,7 +154,7 @@ function main() {
       continue;
     }
 
-    const rawBody = readFileSync(file, 'utf8');
+    const rawBody = readFileSync(path.join(repoRoot, file), 'utf8');
 
     // Defence in depth: a body must never be able to emit anything that looks
     // like a fence. The nonce makes forgery infeasible; neutralization makes it

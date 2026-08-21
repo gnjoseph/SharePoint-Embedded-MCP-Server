@@ -32,6 +32,53 @@ The audit has two layers:
 Dependency installation in the audit path uses `npm ci --ignore-scripts`, so no repository
 lifecycle script executes while untrusted content is being collected.
 
+### Trusted controller vs audited target
+
+Any commit reachable from `main` can be audited, including commits from before this workflow
+existed. The audit therefore never runs code from the commit it is auditing:
+
+- **Controller** — checked out at the workspace root with **no `ref:` override**. Because the
+  workflow only triggers on `schedule` and `workflow_dispatch` against the default branch, the
+  event SHA is the protected `main` tip. This is where `scripts/security-audit/**`, `package.json`
+  and the workflow itself come from.
+- **Target** — checked out into `target/` at the validated SHA. It is **data**, never an
+  executable surface.
+
+Every helper is invoked from the controller checkout and pointed at the target explicitly
+(`collect-corpus.mjs --repo-root target`, `check-action-pins.mjs --dir target/.github/workflows
+--root target`, `npm ci`/`npm audit` under `working-directory: target`, `gitleaks git target`,
+CodeQL `source-root: target`). Tests assert that no `node scripts/security-audit/...` invocation
+ever resolves out of `target/`.
+
+> **Ordering constraint.** `actions/checkout` runs `git clean -ffdx` in its destination, so a
+> root checkout performed *after* a `target/` checkout would delete the target. The controller
+> checkout must always come **first**; a test enforces the ordering.
+
+Auditing an ancestor such as `819431d` — a commit with no `scripts/security-audit/` directory at
+all — is a supported case and is covered by a regression test.
+
+### Result attribution
+
+SARIF uploaded from an audit describes the *target* commit, not the workflow event SHA, so both
+uploads pass explicit attribution:
+
+| Input | Value | Why |
+| --- | --- | --- |
+| `checkout_path` | `${{ github.workspace }}/target` | Relativizes SARIF paths against the target checkout, so results do not surface as `target/src/...` |
+| `ref` | `refs/heads/main` | The ref results are recorded against |
+| `sha` | The validated target SHA | The commit results are recorded against |
+
+Code scanning defines `sha` as *the head of the supplied ref*, so a historical ancestor cannot be
+described truthfully. Runs whose target is **not** the current `main` tip therefore do not upload:
+
+- `codeql` sets `upload: never` and the analysis is discarded.
+- `model-audit` skips the upload step and a dedicated step logs why and **fails the job**.
+
+That is deliberate fail-closed behaviour. On a public repository the alternative — publishing raw
+findings as a downloadable artifact — would disclose unfixed vulnerabilities, so it is not offered.
+Historical audits are for local/manual triage; schedule-driven runs always target the tip and
+always upload.
+
 ### Model-assisted job
 
 `model-audit` sends a **bounded, allowlisted corpus** to a model and validates every finding
@@ -98,6 +145,12 @@ npm run security:audit:test
 npm run security:audit:pins
 ```
 
+Both `security:audit:dry-run` and `collect-corpus.mjs` accept `--repo-root <dir>`, which is how
+the workflow points the controller's helpers at the `target/` checkout. It defaults to `.`, so
+local runs audit the working tree and need no extra flag. Manifest keys stay repository-relative
+regardless of the root, so a finding reported against `src/server.ts` reads the same locally and
+in CI.
+
 `security:audit:dry-run` writes to `.security-audit/dry-run/` (git-ignored):
 
 | File | Contents |
@@ -158,6 +211,10 @@ not relax the reachability rule to accommodate rewritten history.
 Scheduled runs are unaffected: they supply no ref, so the current `origin/main` tip is resolved
 and validated by the same rules.
 
+Reachability does **not** imply the commit contains this workflow. Older ancestors are audited
+using the controller/target split described above, and code-scanning upload is suppressed for any
+target that is not the current tip — see [Result attribution](#result-attribution).
+
 ## Design constraints
 
 - The workflow has **no** `pull_request` or `pull_request_target` trigger, so untrusted forks
@@ -166,5 +223,9 @@ and validated by the same rules.
 - Every action is pinned to a 40-hex commit SHA with the version in a trailing comment, and
   `action-pins` fails the run if that ever regresses.
 - Checkouts use `persist-credentials: false`.
+- Audit logic always executes from the protected `main` controller checkout; the audited commit is
+  mounted at `target/` and treated as data.
+- Findings are attributed to the target commit explicitly, and suppressed rather than misattributed
+  when the target is not the current `main` tip.
 - Every `continue-on-error: true` step is paired with an explicit failure gate that re-raises
   the failure after the raw report has been sanitized — a test enforces this invariant.

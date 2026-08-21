@@ -15,8 +15,13 @@
  * fixture honest: the validator still enforces "file must be in the corpus"
  * and "line must be within range" rather than being handed a pre-baked answer.
  *
+ * `--repo-root` selects the tree that is *audited*. It defaults to `.` for local
+ * use, and the workflow passes `target` so the dry run reads the separately
+ * checked out audited tree while still executing the trusted controller scripts
+ * from the protected branch.
+ *
  * Usage:
- *   node scripts/security-audit/dry-run.mjs [--scope <name>] [--out <dir>]
+ *   node scripts/security-audit/dry-run.mjs [--scope <name>] [--out <dir>] [--repo-root <dir>]
  */
 
 import { spawnSync } from 'node:child_process';
@@ -125,9 +130,22 @@ function main() {
   const outDir = resolve(REPO_ROOT, args.out ?? join('.security-audit', 'dry-run'));
   mkdirSync(outDir, { recursive: true });
 
-  process.stdout.write(`security-audit dry run\n  scope: ${scope}\n  out:   ${outDir}\n`);
+  // The audited tree. Defaults to this repository so the dry run is usable
+  // locally; the workflow passes `target`, the separate audited checkout.
+  const repoRoot = (args['repo-root'] ?? '').trim() || '.';
 
-  runStage('collect corpus', 'collect-corpus.mjs', ['--scope', scope, '--out', outDir]);
+  process.stdout.write(
+    `security-audit dry run\n  scope: ${scope}\n  root:  ${repoRoot}\n  out:   ${outDir}\n`,
+  );
+
+  runStage('collect corpus', 'collect-corpus.mjs', [
+    '--scope',
+    scope,
+    '--out',
+    outDir,
+    '--repo-root',
+    repoRoot,
+  ]);
 
   const manifestPath = join(outDir, 'corpus-manifest.json');
   const corpusPath = join(outDir, 'corpus.txt');
@@ -153,6 +171,18 @@ function main() {
 
   const systemPrompt = readFileSync(join(outDir, 'system.txt'), 'utf8');
   const modelPrompt = readFileSync(join(outDir, 'prompt.txt'), 'utf8');
+
+  // `prompt.txt` is corpus + trusted suffix. The corpus is untrusted repository
+  // content and legitimately contains `{{` (GitHub Actions expressions are in
+  // the `workflows` scope), so the unresolved-placeholder assertion may only be
+  // applied to the trusted, template-rendered regions: `system.txt` in full and
+  // the suffix that follows the final corpus fence.
+  const lastFence = modelPrompt.lastIndexOf(delimiters.end);
+  if (lastFence === -1) {
+    throw new Error('prompt.txt does not contain the per-run corpus fence');
+  }
+  const trustedSuffix = modelPrompt.slice(lastFence + delimiters.end.length);
+
   for (const [label, text] of [
     ['system.txt', systemPrompt],
     ['prompt.txt', modelPrompt],
@@ -160,6 +190,11 @@ function main() {
     if (!text.includes(manifest.nonce)) {
       throw new Error(`${label} does not carry the per-run corpus nonce`);
     }
+  }
+  for (const [label, text] of [
+    ['system.txt', systemPrompt],
+    ['prompt.txt trusted suffix', trustedSuffix],
+  ]) {
     if (text.includes('{{')) {
       throw new Error(`${label} contains an unresolved template placeholder`);
     }

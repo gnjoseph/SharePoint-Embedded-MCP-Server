@@ -117,6 +117,50 @@ test('scope and model inputs are allowlisted', () => {
   assert.match(ok.stdout, /dry_run=true/);
 });
 
+// A commit that predates `scripts/security-audit/` entirely. It is reachable
+// from main, so it is a legitimate audit target — but the helper scripts do not
+// exist in its tree. This is the regression that forced the controller/target
+// split: helpers come from the protected default branch, the audited content is
+// checked out separately under `target/`.
+const HISTORICAL_TARGET = '819431dad141ed27bfd16e034a25079c1f7a4dce';
+
+test('an ancestor commit without the audit helpers is still a valid target', () => {
+  const tracked = spawnSync(
+    'git',
+    ['ls-tree', '-r', '--name-only', HISTORICAL_TARGET, '--', 'scripts/security-audit'],
+    {
+      cwd: REPO_ROOT,
+      encoding: 'utf8',
+      env: { ...process.env, PATH: childPath(), Path: childPath() },
+    },
+  );
+  assert.equal(tracked.status, 0, tracked.stderr);
+  assert.equal(
+    tracked.stdout.trim(),
+    '',
+    'fixture invariant: the historical target must not contain the audit helpers',
+  );
+
+  const result = runScript('validate-target.mjs', ['--ref', HISTORICAL_TARGET]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, new RegExp(`target_sha=${HISTORICAL_TARGET}\\b`));
+});
+
+test('target ref and main-tip status are published for SARIF attribution', () => {
+  const tip = runScript('validate-target.mjs', []);
+  assert.equal(tip.status, 0, tip.stderr);
+  assert.match(tip.stdout, /target_ref=refs\/heads\/main\b/);
+  assert.match(tip.stdout, /is_main_tip=true\b/);
+
+  // A historical target cannot be represented in code scanning: `sha` must be
+  // the HEAD of `ref`. The flag lets the workflow suppress the upload instead of
+  // mis-attributing findings to the current tip.
+  const historical = runScript('validate-target.mjs', ['--ref', HISTORICAL_TARGET]);
+  assert.equal(historical.status, 0, historical.stderr);
+  assert.match(historical.stdout, /target_ref=refs\/heads\/main\b/);
+  assert.match(historical.stdout, /is_main_tip=false\b/);
+});
+
 // ---------------------------------------------------------------------------
 // Corpus collection
 // ---------------------------------------------------------------------------
@@ -156,6 +200,32 @@ test('every corpus file is fenced by per-run nonce delimiters', () => {
   const closes = corpus.split(delimiters.end).length - 1;
   assert.equal(opens, manifest.fileCount);
   assert.equal(closes, manifest.fileCount);
+});
+
+test('the corpus reads the audited tree from --repo-root, not the controller cwd', () => {
+  // The workflow checks the trusted helpers out at the workspace root and the
+  // audited commit under `target/`. Collection must therefore read file content
+  // from the supplied root while keeping manifest keys repository-relative.
+  const out = tempDir('spe-corpus-root-');
+  const result = runScript('collect-corpus.mjs', [
+    '--scope',
+    'workflows',
+    '--out',
+    out,
+    '--repo-root',
+    REPO_ROOT,
+  ]);
+  assert.equal(result.status, 0, result.stderr);
+
+  const manifest = JSON.parse(readFileSync(path.join(out, 'corpus-manifest.json'), 'utf8'));
+  assert.ok(manifest.fileCount > 0, 'expected the workflows scope to collect files');
+  for (const file of Object.keys(manifest.files)) {
+    assert.ok(!path.isAbsolute(file), `manifest key must stay relative: ${file}`);
+    assert.ok(
+      !file.startsWith('target/'),
+      `manifest key must not leak the checkout directory: ${file}`,
+    );
+  }
 });
 
 test('two corpus runs never share a delimiter nonce', () => {

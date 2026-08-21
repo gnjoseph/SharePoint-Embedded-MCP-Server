@@ -70,6 +70,14 @@ jobs:
       contents: read
     outputs:
       target_sha: ${{ steps.validate.outputs.target_sha }}
+      # The only ref SARIF results are ever attributed to. Emitted as a constant
+      # by validate-target.mjs so it cannot be influenced by workflow inputs.
+      target_ref: ${{ steps.validate.outputs.target_ref }}
+      # 'true' only when the validated target is the *current* origin/main tip.
+      # Code scanning documents `sha` as "the sha of the HEAD of the ref", so an
+      # ancestor cannot be uploaded without mis-attributing findings to main.
+      # Uploads are therefore gated on this value and fail closed.
+      is_main_tip: ${{ steps.validate.outputs.is_main_tip }}
       model: ${{ steps.validate.outputs.model }}
       scope: ${{ steps.validate.outputs.scope }}
       dry_run: ${{ steps.validate.outputs.dry_run }}
@@ -121,10 +129,14 @@ jobs:
       actions: read
       security-events: write
     steps:
+      # The audited tree is checked out into `target/` and is never the tree the
+      # workflow executes helper scripts from. CodeQL runs no repository script,
+      # so this job needs the target checkout only.
       - name: Checkout target commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.validate-inputs.outputs.target_sha }}
+          path: target
           persist-credentials: false
 
       - name: Initialize CodeQL
@@ -132,11 +144,21 @@ jobs:
         with:
           languages: javascript-typescript
           queries: security-extended
+          source-root: target
 
+      # `ref`/`sha` are passed explicitly so results are attributed to the
+      # audited commit rather than to the event SHA. Because `sha` must be the
+      # HEAD of `ref`, results are only uploaded when the target *is* the
+      # current main tip; historical audits report in the job log and are not
+      # uploaded (fail closed rather than mis-attribute).
       - name: Analyze
         uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
         with:
           category: '/language:javascript-typescript'
+          checkout_path: ${{ github.workspace }}/target
+          ref: ${{ needs.validate-inputs.outputs.target_ref }}
+          sha: ${{ needs.validate-inputs.outputs.target_sha }}
+          upload: ${{ needs.validate-inputs.outputs.is_main_tip == 'true' && 'always' || 'never' }}
 
   # ---------------------------------------------------------------------------
   # Deterministic check 2: dependency audit.
@@ -152,29 +174,42 @@ jobs:
     permissions:
       contents: read
     steps:
+      # Controller checkout: trusted helper scripts from the protected default
+      # branch at the workflow's own event SHA. Must come first — actions/checkout
+      # runs `git clean -ffdx` in its destination, so a root checkout performed
+      # after a `target/` checkout would delete it.
+      - name: Checkout controller scripts from main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Checkout target commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.validate-inputs.outputs.target_sha }}
+          path: target
           persist-credentials: false
 
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: npm
 
       # `--ignore-scripts`: the audit path must never execute repository or
       # dependency lifecycle scripts from the commit under audit.
       - name: Install dependencies without lifecycle scripts
+        working-directory: target
         run: npm ci --ignore-scripts
 
+      # The report is written to the controller-owned workspace root so the
+      # sanitizer never reads from, or writes into, the audited tree.
       - name: Run npm audit
         id: audit
+        working-directory: target
         run: |
           set -uo pipefail
-          mkdir -p .security-audit
-          npm audit --audit-level=high --json > .security-audit/npm-audit.json || true
+          mkdir -p "${GITHUB_WORKSPACE}/.security-audit"
+          npm audit --audit-level=high --json > "${GITHUB_WORKSPACE}/.security-audit/npm-audit.json" || true
           npm audit --audit-level=high
         continue-on-error: true
 
@@ -225,10 +260,18 @@ jobs:
       # value against that file whenever GITLEAKS_VERSION is bumped.
       GITLEAKS_SHA256: '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'
     steps:
-      - name: Checkout full history
+      # Controller checkout first (see the dependency-audit job for the
+      # `git clean -ffdx` ordering constraint).
+      - name: Checkout controller scripts from main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout target commit with full history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.validate-inputs.outputs.target_sha }}
+          path: target
           fetch-depth: 0
           persist-credentials: false
 
@@ -251,13 +294,15 @@ jobs:
       # `--exit-code 2` distinguishes "leaks found" from an operational failure,
       # so a crashed scanner is never mistaken for a clean scan. The exit code is
       # re-raised as the step status; it is not swallowed by a trailing command.
+      # The scan target is the separate `target/` checkout; the binary and the
+      # report both live in the controller-owned workspace root.
       - name: Scan repository history
         id: scan
         continue-on-error: true
         run: |
           set -uo pipefail
           mkdir -p .security-audit
-          ./gitleaks git . \
+          ./gitleaks git target \
             --report-format json \
             --report-path .security-audit/gitleaks.json \
             --redact \
@@ -305,10 +350,18 @@ jobs:
     permissions:
       contents: read
     steps:
+      # Controller checkout first (see the dependency-audit job for the
+      # `git clean -ffdx` ordering constraint).
+      - name: Checkout controller scripts from main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Checkout target commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.validate-inputs.outputs.target_sha }}
+          path: target
           persist-credentials: false
 
       - name: Set up Node
@@ -316,8 +369,13 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
+      # The checker itself comes from the controller checkout; only the scanned
+      # workflow and composite-action trees come from the audited commit.
       - name: Verify action pinning
-        run: node scripts/security-audit/check-action-pins.mjs
+        run: |
+          node scripts/security-audit/check-action-pins.mjs \
+            --dir target/.github/workflows \
+            --root target
 
   # ---------------------------------------------------------------------------
   # Model-assisted advisory pass (credentialed).
@@ -343,10 +401,18 @@ jobs:
       contents: read
       security-events: write
     steps:
+      # Controller checkout first (see the dependency-audit job for the
+      # `git clean -ffdx` ordering constraint).
+      - name: Checkout controller scripts from main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Checkout target commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.validate-inputs.outputs.target_sha }}
+          path: target
           persist-credentials: false
 
       - name: Set up Node
@@ -378,6 +444,7 @@ jobs:
           set -euo pipefail
           node scripts/security-audit/collect-corpus.mjs \
             --scope "${AUDIT_SCOPE}" \
+            --repo-root target \
             --out .security-audit/model
 
       # actions/ai-inference concatenates the system prompt and the user prompt
@@ -438,11 +505,33 @@ jobs:
 
       # Uploaded to code scanning, whose alerts are visible only to users with
       # write access. No issues, no comments, no public artifact of raw findings.
+      #
+      # `ref`/`sha` are passed explicitly so results are attributed to the
+      # audited commit rather than to the workflow event SHA. The code-scanning
+      # API requires `sha` to be the HEAD of `ref`, so a historical ancestor is
+      # not representable: when the target is not the current main tip the
+      # upload is skipped entirely. This repository is public, so the findings
+      # are NOT published as an artifact instead — the run fails closed and the
+      # summary records that no model findings were published.
       - name: Upload SARIF to code scanning
+        if: needs.validate-inputs.outputs.is_main_tip == 'true'
         uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
         with:
           sarif_file: .security-audit/model/report.sarif
+          checkout_path: ${{ github.workspace }}/target
+          ref: ${{ needs.validate-inputs.outputs.target_ref }}
+          sha: ${{ needs.validate-inputs.outputs.target_sha }}
           category: spe-security-audit-model
+
+      # Historical audits produce findings that cannot be attributed safely, so
+      # they are neither uploaded nor published. Surface that explicitly.
+      - name: Report unpublished historical findings
+        if: needs.validate-inputs.outputs.is_main_tip != 'true'
+        run: |
+          set -euo pipefail
+          echo "Target is not the current main tip; model SARIF was not uploaded." >&2
+          echo "Re-run the audit against the main tip to publish model findings." >&2
+          exit 1
 
   # ---------------------------------------------------------------------------
   # Credential-free rehearsal of the untrusted-output path.
@@ -461,10 +550,18 @@ jobs:
     permissions:
       contents: read
     steps:
+      # Controller checkout first (see the dependency-audit job for the
+      # `git clean -ffdx` ordering constraint).
+      - name: Checkout controller scripts from main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Checkout target commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.validate-inputs.outputs.target_sha }}
+          path: target
           persist-credentials: false
 
       - name: Set up Node
@@ -477,7 +574,9 @@ jobs:
           AUDIT_SCOPE: ${{ needs.validate-inputs.outputs.scope }}
         run: |
           set -euo pipefail
-          node scripts/security-audit/dry-run.mjs --scope "${AUDIT_SCOPE}"
+          node scripts/security-audit/dry-run.mjs \
+            --scope "${AUDIT_SCOPE}" \
+            --repo-root target
 
       - name: Run script test suite
         run: npm run security:audit:test

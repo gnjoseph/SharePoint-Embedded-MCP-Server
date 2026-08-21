@@ -35,6 +35,8 @@ import { pathToFileURL } from 'node:url';
 import { ALLOWED_MODELS, DEFAULT_MODEL, DEFAULT_SCOPE, SCOPES } from './lib/constants.mjs';
 
 const BASE_REF = 'refs/remotes/origin/main';
+/** The only ref SARIF results are ever attributed to. */
+const TARGET_REF = 'refs/heads/main';
 const FULL_SHA = /^[0-9a-f]{40}$/;
 
 /** Test-only escape hatch; never set by any workflow. */
@@ -109,16 +111,35 @@ function assertReachableFromMain(sha) {
  * @returns {string}
  */
 function resolveDefaultRef() {
+  const tip = tryResolveMainTip();
+  if (tip === '') {
+    fail(
+      `no ref supplied and ${BASE_REF} could not be resolved. ` +
+        'Ensure the checkout fetched origin/main (fetch-depth: 0).',
+    );
+  }
+  return tip;
+}
+
+/**
+ * Resolves the current tip of `origin/main`, returning an empty string instead
+ * of exiting when it cannot be determined.
+ *
+ * Used for the `is_main_tip` output, which gates SARIF publication. Code
+ * scanning documents its `sha` input as "the sha of the HEAD of the ref", so a
+ * historical ancestor cannot be attributed honestly to `refs/heads/main`; when
+ * the tip cannot be resolved we report `false` and the workflow withholds the
+ * upload rather than mis-attributing results.
+ *
+ * @returns {string} 40-hex SHA, or `''` when unresolvable.
+ */
+function tryResolveMainTip() {
   try {
     return execFileSync('git', ['rev-parse', `${BASE_REF}^{commit}`], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
   } catch {
-    fail(
-      `no ref supplied and ${BASE_REF} could not be resolved. ` +
-        'Ensure the checkout fetched origin/main (fetch-depth: 0).',
-    );
     return '';
   }
 }
@@ -161,6 +182,15 @@ function main() {
 
   const outputs = {
     target_sha: ref,
+    // Code scanning attributes SARIF to a ref/sha pair. The audit only ever
+    // targets commits reachable from main, so the ref is a constant; exporting
+    // it keeps the workflow free of hard-coded branch names.
+    target_ref: TARGET_REF,
+    // True only when the target *is* the current main tip. Code scanning
+    // documents `sha` as "the sha of the HEAD of the ref", so uploading an
+    // ancestor would mis-attribute findings to main's tip. When false the
+    // workflow withholds the upload (fail closed) instead of lying.
+    is_main_tip: String(ref !== '' && ref === tryResolveMainTip()),
     model,
     scope,
     dry_run: String(dryRun),
@@ -178,7 +208,7 @@ function main() {
   }
 }
 
-export { FULL_SHA, resolveDefaultRef };
+export { FULL_SHA, TARGET_REF, resolveDefaultRef, tryResolveMainTip };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main();

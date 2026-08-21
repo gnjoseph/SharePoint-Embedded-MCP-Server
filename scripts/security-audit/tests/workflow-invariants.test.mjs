@@ -244,6 +244,190 @@ test('every continue-on-error step is re-raised by an explicit failure gate', ()
   }
 });
 
+// ---------------------------------------------------------------------------
+// Controller / target separation.
+//
+// The commit under audit is untrusted input. Helper scripts must always come
+// from the protected default branch (the workflow's own event SHA), and the
+// audited tree must always land in `target/`. Checking out the target over the
+// workspace root would both execute attacker-controlled scripts and break for
+// any historical commit that predates `scripts/security-audit/`.
+// ---------------------------------------------------------------------------
+
+// Jobs that execute a helper script from `scripts/security-audit/` and also
+// need the audited tree present.
+const CONTROLLER_JOBS = [
+  'dependency-audit',
+  'secret-scan',
+  'action-pins',
+  'model-audit',
+  'model-audit-dry-run',
+];
+
+function checkoutSteps(job) {
+  return (job.steps ?? []).filter((step) =>
+    /^actions\/checkout@/.test(step.uses ?? ''),
+  );
+}
+
+test('jobs that run helper scripts check out the controller before the target', () => {
+  for (const name of CONTROLLER_JOBS) {
+    const job = audit.doc.jobs[name];
+    assert.ok(job, `job ${name} must exist`);
+    const checkouts = checkoutSteps(job);
+    assert.equal(
+      checkouts.length,
+      2,
+      `job ${name} must check out the controller and the target separately`,
+    );
+
+    const [controller, target] = checkouts;
+    assert.equal(
+      controller.with.ref,
+      undefined,
+      `job ${name}: the controller checkout must not override ref (it must stay on the protected default branch)`,
+    );
+    assert.equal(
+      controller.with.path,
+      undefined,
+      `job ${name}: the controller checkout must land at the workspace root`,
+    );
+    assert.equal(controller.with['persist-credentials'], 'false');
+
+    assert.equal(
+      target.with.path,
+      'target',
+      `job ${name}: the audited tree must be isolated in target/`,
+    );
+    assert.match(
+      target.with.ref,
+      /needs\.validate-inputs\.outputs\.target_sha/,
+      `job ${name}: the target checkout must use the validated target SHA`,
+    );
+    assert.equal(target.with['persist-credentials'], 'false');
+
+    assert.ok(
+      (job.steps ?? []).indexOf(controller) < (job.steps ?? []).indexOf(target),
+      `job ${name}: the controller checkout must run first — actions/checkout runs git clean -ffdx in its destination`,
+    );
+  }
+});
+
+test('the CodeQL job checks out the target only and analyses target/', () => {
+  const job = audit.doc.jobs.codeql;
+  const checkouts = checkoutSteps(job);
+  assert.equal(checkouts.length, 1, 'CodeQL runs no helper script');
+  assert.equal(checkouts[0].with.path, 'target');
+
+  const init = job.steps.find((step) =>
+    /codeql-action\/init@/.test(step.uses ?? ''),
+  );
+  assert.equal(
+    init.with['source-root'],
+    'target',
+    'CodeQL must analyse the audited tree, not the controller checkout',
+  );
+});
+
+test('no helper script is ever executed from the target checkout', () => {
+  // Helper scripts are trusted controller code. Running `node target/...`
+  // would execute code from the commit under audit.
+  assert.equal(
+    /node\s+target\//.test(audit.code),
+    false,
+    'helper scripts must be invoked from the controller checkout',
+  );
+  assert.equal(
+    /working-directory:\s*target\/scripts/.test(audit.code),
+    false,
+    'helper scripts must not run with the audited tree as their working directory',
+  );
+  const invocations = audit.code.match(/node\s+\S*scripts\/security-audit\/\S+/g) ?? [];
+  assert.ok(invocations.length > 0, 'expected helper script invocations');
+  for (const invocation of invocations) {
+    assert.match(
+      invocation,
+      /node\s+scripts\/security-audit\//,
+      `helper invocations must be controller-relative: ${invocation}`,
+    );
+  }
+});
+
+test('npm operations against the audited tree are confined to target/', () => {
+  const job = audit.doc.jobs['dependency-audit'];
+  const npmSteps = (job.steps ?? []).filter((step) =>
+    /^\s*npm (?:ci|audit)\b/m.test(step.run ?? ''),
+  );
+  assert.ok(npmSteps.length >= 2, 'expected npm ci and npm audit steps');
+  for (const step of npmSteps) {
+    assert.equal(
+      step['working-directory'],
+      'target',
+      `npm step "${step.name}" must operate on the audited tree`,
+    );
+  }
+  // setup-node's dependency cache keys off the workspace root lockfile, which
+  // now belongs to the controller rather than the audited commit.
+  const setupNode = (job.steps ?? []).find((step) =>
+    /actions\/setup-node@/.test(step.uses ?? ''),
+  );
+  assert.equal(
+    setupNode.with.cache,
+    undefined,
+    'setup-node caching would key off the controller lockfile, not the audited one',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// SARIF attribution.
+//
+// Without explicit ref/sha, code scanning attributes findings to the event SHA
+// (current main tip) even when an older commit was analysed. `sha` must be the
+// HEAD of `ref`, so historical audits cannot be represented safely and are not
+// uploaded at all.
+// ---------------------------------------------------------------------------
+
+test('CodeQL results carry an explicit target ref, sha and checkout path', () => {
+  const analyze = audit.doc.jobs.codeql.steps.find((step) =>
+    /codeql-action\/analyze@/.test(step.uses ?? ''),
+  );
+  assert.match(analyze.with.ref, /needs\.validate-inputs\.outputs\.target_ref/);
+  assert.match(analyze.with.sha, /needs\.validate-inputs\.outputs\.target_sha/);
+  assert.match(analyze.with.checkout_path, /github\.workspace.*target/);
+  assert.match(
+    analyze.with.upload,
+    /is_main_tip == 'true'/,
+    'uploads must be suppressed when the target is not the current main tip',
+  );
+});
+
+test('model SARIF upload is attributed to the target and gated on main tip', () => {
+  const job = audit.doc.jobs['model-audit'];
+  const upload = (job.steps ?? []).find((step) =>
+    /codeql-action\/upload-sarif@/.test(step.uses ?? ''),
+  );
+  assert.ok(upload, 'the model job must upload through code scanning');
+  assert.match(upload.if, /is_main_tip == 'true'/);
+  assert.match(upload.with.ref, /needs\.validate-inputs\.outputs\.target_ref/);
+  assert.match(upload.with.sha, /needs\.validate-inputs\.outputs\.target_sha/);
+  assert.match(upload.with.checkout_path, /github\.workspace.*target/);
+
+  // Findings for a historical target must fail closed rather than be published
+  // (public repository: no raw-findings artifact) or mis-attributed.
+  const fallback = (job.steps ?? []).find(
+    (step) => /is_main_tip != 'true'/.test(step.if ?? ''),
+  );
+  assert.ok(fallback, 'historical targets need an explicit fail-closed path');
+  assert.match(fallback.run, /exit 1/);
+});
+
+test('validate-inputs publishes the outputs the attribution gates depend on', () => {
+  const outputs = audit.doc.jobs['validate-inputs'].outputs;
+  for (const key of ['target_sha', 'target_ref', 'is_main_tip']) {
+    assert.ok(outputs[key], `validate-inputs must publish ${key}`);
+  }
+});
+
 test('the legacy no-op gitleaks gate is gone from the security workflow', () => {
   const raw = readFileSync(path.join(WORKFLOW_DIR, 'security.yml'), 'utf8');
   const code = stripComments(raw);

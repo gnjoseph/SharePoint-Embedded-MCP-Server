@@ -6,19 +6,27 @@ They use only the Node standard library, so they run with `node` alone — no `n
 
 Operator-facing documentation lives in [`docs/SECURITY-AUDIT.md`](../../docs/SECURITY-AUDIT.md).
 
+## Controller vs target
+
+In CI these scripts always run from a checkout of protected `main` (the *controller*), while the
+commit being audited is checked out separately into `target/` and treated purely as data. Scripts
+that read repository content therefore accept `--repo-root` (default `.`) so the controller can
+point them at the target without ever executing code from it. Locally the default is what you
+want — the working tree is both controller and target.
+
 ## Scripts
 
 | Script | Purpose | Exit codes |
 | --- | --- | --- |
-| `validate-target.mjs` | Validates the manual inputs: 40-hex SHA reachable from `main`, allowlisted scope/model, boolean dry-run. An empty/absent ref (scheduled runs) resolves to the `origin/main` tip and is then held to the same rules | `0` ok, `1` rejected |
-| `collect-corpus.mjs` | Collects the allowlisted, capped corpus, wraps each file in per-run nonce fences, and writes a manifest | `0` ok, `1` error |
+| `validate-target.mjs` | Validates the manual inputs: 40-hex SHA reachable from `main`, allowlisted scope/model, boolean dry-run. An empty/absent ref (scheduled runs) resolves to the `origin/main` tip and is then held to the same rules. Also publishes `target_ref` and `is_main_tip` for SARIF attribution | `0` ok, `1` rejected |
+| `collect-corpus.mjs` | Collects the allowlisted, capped corpus from `--repo-root`, wraps each file in per-run nonce fences, and writes a manifest with repository-relative keys | `0` ok, `1` error |
 | `build-prompt.mjs` | Renders `system.txt` (preamble) and `prompt.txt` (corpus + trusted suffix) from the manifest nonce | `0` ok, `1` error |
 | `validate-response.mjs` | Parses, schema-checks, rejects, and redacts the model response | `0` ok, `1` malformed, `3` unsafe (fail closed) |
 | `to-sarif.mjs` | Converts an accepted report to SARIF 2.1.0 | `0` ok, `1` error |
 | `sanitize-findings.mjs` | Strips secret material from `npm audit` / gitleaks reports | `0` ok, `1` error |
 | `check-action-pins.mjs` | Fails if any workflow **or composite action** uses an action that is not pinned to a 40-hex SHA | `0` clean, `1` violations |
 | `summarize.mjs` | Builds the run summary and decides pass/fail | `0` pass, `1` a deterministic job failed |
-| `dry-run.mjs` | Offline end-to-end run against a synthetic response | `0` ok, non-zero on failure |
+| `dry-run.mjs` | Offline end-to-end run against a synthetic response, honouring `--repo-root` | `0` ok, non-zero on failure |
 
 ## Prompt assembly
 
@@ -74,6 +82,15 @@ node scripts/security-audit/to-sarif.mjs --report .security-audit/model-report.j
 node scripts/security-audit/check-action-pins.mjs
 ```
 
+The CI shape, where the audited commit lives under `target/`:
+
+```bash
+node scripts/security-audit/collect-corpus.mjs \
+  --scope server-core --out .security-audit --repo-root target
+node scripts/security-audit/check-action-pins.mjs \
+  --dir target/.github/workflows --root target
+```
+
 `validate-target.mjs` needs `refs/remotes/origin/main` to exist locally (the workflow checks out
 with `fetch-depth: 0`). `SECURITY_AUDIT_TEST_MODE=1` skips only the reachability check and is used
 by the test suite; no workflow sets it, and a test asserts that.
@@ -95,8 +112,10 @@ npm run security:audit:test
   `constants.mjs` so it cannot drift), schema validation, every rejection reason,
   credential/shell smuggling, prompt injection, findings-cap overflow, redaction, sanitizers,
   SARIF shape including `finding.detail` reaching `message.text`, composite-action pin coverage,
-  summary polarity, the offline dry run, and a repo walk proving no script creates issues,
-  comments, or repository writes.
+  summary polarity, the offline dry run, `--repo-root` isolation (the corpus reads the audited
+  tree, not the controller cwd, and keys stay repository-relative), the historical-ancestor
+  regression using a commit that predates these scripts, and a repo walk proving no script creates
+  issues, comments, or repository writes.
 - `workflow-invariants.test.mjs` — parses the real workflow YAML and asserts: no PR triggers,
   weekly Monday schedule, deny-all workflow permissions, no write permission other than
   `security-events`, per-job timeouts and concurrency, allowlisted inputs, 40-hex action pins,
@@ -104,7 +123,10 @@ npm run security:audit:test
   the dry-run job holds no secret and never uploads to code scanning, `--ignore-scripts` in the
   audit path, no workflow sets `SECURITY_AUDIT_TEST_MODE` (the reachability escape hatch stays
   unreachable from CI), `persist-credentials: false`, every `continue-on-error` step is re-raised,
-  and the legacy no-op gitleaks gate is gone.
+  the controller checkout precedes the `target/` checkout in every job that runs a helper, helpers
+  and `npm` are confined to `target/` as data, CodeQL and the model report carry explicit
+  `checkout_path`/`ref`/`sha` attribution gated on the target being the `main` tip, and the legacy
+  no-op gitleaks gate is gone.
 
 Fixtures never contain a literal credential; token-shaped strings are constructed at runtime so
 the repository's own secret scanner does not flag its test data.
