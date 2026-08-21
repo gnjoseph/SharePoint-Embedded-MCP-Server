@@ -16,6 +16,7 @@ import path from 'node:path';
 import {
   CATEGORIES,
   CONFIDENCES,
+  CORPUS_DENY_PATTERNS,
   CORPUS_LIMITS,
   DELIMITER_NEUTRALIZED,
   DELIMITER_SENTINEL,
@@ -225,6 +226,52 @@ test('the corpus reads the audited tree from --repo-root, not the controller cwd
       !file.startsWith('target/'),
       `manifest key must not leak the checkout directory: ${file}`,
     );
+  }
+});
+
+test('agent instruction surfaces are denied from the corpus, independent of extension', () => {
+  // Instruction files are written to be obeyed by a model. If one reached the
+  // corpus as "untrusted file content" the auditor could follow it instead of
+  // auditing it. `ALLOWED_EXTENSIONS` excludes `.md` today, which masks most of
+  // these incidentally — this test pins the deny list itself so the control
+  // survives any future widening of the extension allowlist.
+  const denied = (file) => CORPUS_DENY_PATTERNS.some((pattern) => pattern.test(file));
+
+  const instructionSurfaces = [
+    'AGENTS.md',
+    'src/AGENTS.md',
+    'CLAUDE.md',
+    'packages/server/CLAUDE.md',
+    'Skills/full-setup/SKILL.md',
+    '.github/copilot-instructions.md',
+    '.github/instructions/typescript.instructions.md',
+    '.github/agents/spe-mcp-implementation.agent.md',
+    '.github/prompts/audit.prompt.md',
+    '.github/chatmodes/review.chatmode.md',
+    '.copilot/spe-mcp-implementation-agent/SKILL.md',
+    'docs/review.chatmode.md',
+  ];
+  for (const file of instructionSurfaces) {
+    assert.ok(denied(file), `instruction surface must be denied: ${file}`);
+  }
+
+  // Extension independence: the same paths stay denied when they carry an
+  // extension that *is* on the allowlist.
+  for (const file of ['AGENTS.ts', 'CLAUDE.mjs', '.github/agents/build.yml', '.copilot/tool.mjs']) {
+    assert.ok(denied(file), `denial must not depend on extension: ${file}`);
+  }
+
+  // ...and legitimate source must remain eligible.
+  const auditable = [
+    'src/index.ts',
+    'src/tools/list-containers.ts',
+    'scripts/security-audit/collect-corpus.mjs',
+    'scripts/security-audit/lib/constants.mjs',
+    '.github/workflows/ci.yml',
+    '.github/workflows/security-audit.yml',
+  ];
+  for (const file of auditable) {
+    assert.ok(!denied(file), `auditable source must not be denied: ${file}`);
   }
 });
 

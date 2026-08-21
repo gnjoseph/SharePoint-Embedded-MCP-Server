@@ -49,7 +49,21 @@ export const ALLOWED_EXTENSIONS = Object.freeze(['.ts', '.mts', '.mjs', '.js', '
 
 /**
  * Paths that are never collected even when they match a scope prefix.
- * Test files dominate the corpus by volume and dilute the audit signal.
+ *
+ * Two distinct reasons appear in this list:
+ *
+ * 1. Noise suppression — test files, build output and vendored code dominate the
+ *    corpus by volume and dilute the audit signal.
+ * 2. Prompt-injection containment — agent instruction surfaces are written to be
+ *    obeyed by a model. Feeding them to the auditor as "untrusted file content"
+ *    invites the model to follow them instead of auditing them. They are denied
+ *    outright.
+ *
+ * The instruction-surface entries are deliberately matched on *path*, not on
+ * file extension. `ALLOWED_EXTENSIONS` happens to exclude `.md` today, which
+ * would mask most of these, but that is an incidental side effect of an
+ * unrelated list. Encoding the denial here keeps the control intact if the
+ * extension allowlist is ever widened.
  */
 export const CORPUS_DENY_PATTERNS = Object.freeze([
   /(^|\/)node_modules\//,
@@ -59,6 +73,16 @@ export const CORPUS_DENY_PATTERNS = Object.freeze([
   /\.d\.ts$/,
   /(^|\/)__fixtures__\//,
   /(^|\/)security-audit\/fixtures\//,
+  // Agent instruction surfaces — see docs/SECURITY-AUDIT.md "Prompt-injection
+  // containment". Case-insensitive because these filenames are conventional
+  // rather than enforced.
+  /(^|\/)AGENTS\.[^/]+$/i,
+  /(^|\/)CLAUDE\.[^/]+$/i,
+  /(^|\/)SKILL\.[^/]+$/i,
+  /(^|\/)copilot-instructions\.[^/]+$/i,
+  /(^|\/)\.github\/(instructions|agents|prompts|chatmodes)\//i,
+  /(^|\/)\.copilot\//i,
+  /\.(instructions|agent|prompt|chatmode)\.md$/i,
 ]);
 
 /**
