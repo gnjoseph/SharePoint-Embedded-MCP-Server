@@ -1,0 +1,25 @@
+{
+  "note": "Synthetic finding bodies used only by dry-run.mjs. file and line are assigned at runtime from the freshly collected corpus manifest so the dry run exercises the real schema, redaction and SARIF paths without any credential or network access.",
+  "findings": [
+    {
+      "category": "error-leakage",
+      "severity": "medium",
+      "confidence": "medium",
+      "control": "SEC-002",
+      "title": "SYNTHETIC: upstream error detail may reach the client",
+      "description": "Synthetic dry-run finding. No model was invoked. This entry exists so the response schema validator, the redaction pass and the SARIF converter all execute end to end without credentials.",
+      "remediation": "Synthetic dry-run finding: no remediation required. Map upstream failures to client-safe messages if this were a real finding.",
+      "test": "Synthetic dry-run finding: no test required."
+    },
+    {
+      "category": "supply-chain",
+      "severity": "low",
+      "confidence": "low",
+      "control": "UNMAPPED",
+      "title": "SYNTHETIC: second finding to exercise multi-result SARIF",
+      "description": "Synthetic dry-run finding. Present so the SARIF converter emits more than one result and more than one rule.",
+      "remediation": "Synthetic dry-run finding: no remediation required.",
+      "test": "Synthetic dry-run finding: no test required."
+    }
+  ]
+}

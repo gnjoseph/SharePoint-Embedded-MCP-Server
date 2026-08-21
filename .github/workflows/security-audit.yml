@@ -1,0 +1,522 @@
+name: Security audit
+
+# Deliberately scheduled + manual only.
+#
+# There is NO `pull_request` and NO `pull_request_target` trigger. The
+# model-assisted job reads repository source as untrusted input; running it on
+# fork-controlled refs would let a contributor choose the audited content and
+# steer the prompt. `security.yml` remains the per-PR security gate.
+on:
+  schedule:
+    # Mondays, 06:17 UTC. Offset from the hour to avoid the scheduler stampede.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Full 40-character commit SHA to audit. Must be reachable from main. Defaults to the main branch tip.'
+        required: false
+        type: string
+      scope:
+        description: 'Which part of the tree the model-assisted pass reads.'
+        required: false
+        default: server-core
+        type: choice
+        options:
+          - server-core
+          - tools
+          - workflows
+          - full
+      model:
+        description: 'Model used for the advisory pass.'
+        required: false
+        default: claude-opus-5
+        type: choice
+        options:
+          - claude-opus-5
+          - claude-sonnet-4.5
+          - gpt-5
+          - gpt-4.1
+      dry_run:
+        description: 'Exercise the schema / redaction / SARIF path with a synthetic response. No credential is used and no inference is performed.'
+        required: false
+        default: false
+        type: boolean
+
+# Deny by default. Every job re-declares only what it needs.
+permissions: {}
+
+concurrency:
+  group: security-audit-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  NODE_VERSION: '24.x'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Validates and normalises every operator-supplied input before it reaches a
+  # job that checks out code. Rejects anything that is not an allowlisted value
+  # or a 40-hex SHA reachable from main.
+  # ---------------------------------------------------------------------------
+  validate-inputs:
+    name: Validate inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      target_sha: ${{ steps.validate.outputs.target_sha }}
+      model: ${{ steps.validate.outputs.model }}
+      scope: ${{ steps.validate.outputs.scope }}
+      dry_run: ${{ steps.validate.outputs.dry_run }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # Inputs are passed through `env`, never interpolated into the command
+      # line, so a crafted value cannot break out into the shell.
+      - name: Validate target ref and options
+        id: validate
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_SCOPE: ${{ inputs.scope }}
+          INPUT_MODEL: ${{ inputs.model }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          node scripts/security-audit/validate-target.mjs \
+            --ref "${INPUT_REF:-}" \
+            --scope "${INPUT_SCOPE:-server-core}" \
+            --model "${INPUT_MODEL:-claude-opus-5}" \
+            --dry-run "${INPUT_DRY_RUN:-false}"
+
+  # ---------------------------------------------------------------------------
+  # Deterministic check 1: CodeQL.
+  # ---------------------------------------------------------------------------
+  codeql:
+    name: CodeQL (security-extended)
+    needs: validate-inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - name: Checkout target commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate-inputs.outputs.target_sha }}
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          category: '/language:javascript-typescript'
+
+  # ---------------------------------------------------------------------------
+  # Deterministic check 2: dependency audit.
+  #
+  # `npm audit --json` embeds the dependency graph, so the raw report is never
+  # published. Only severity counts and advisory URLs are retained.
+  # ---------------------------------------------------------------------------
+  dependency-audit:
+    name: Dependency audit
+    needs: validate-inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout target commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate-inputs.outputs.target_sha }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      # `--ignore-scripts`: the audit path must never execute repository or
+      # dependency lifecycle scripts from the commit under audit.
+      - name: Install dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+
+      - name: Run npm audit
+        id: audit
+        run: |
+          set -uo pipefail
+          mkdir -p .security-audit
+          npm audit --audit-level=high --json > .security-audit/npm-audit.json || true
+          npm audit --audit-level=high
+        continue-on-error: true
+
+      - name: Reduce report to sanitized counts
+        run: |
+          set -euo pipefail
+          node scripts/security-audit/sanitize-findings.mjs \
+            --kind npm-audit \
+            --in .security-audit/npm-audit.json \
+            --out .security-audit/npm-audit-summary.json
+          rm -f .security-audit/npm-audit.json
+          cat .security-audit/npm-audit-summary.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload sanitized dependency summary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dependency-audit-summary
+          path: .security-audit/npm-audit-summary.json
+          retention-days: 7
+
+      - name: Fail if npm audit reported high or critical advisories
+        if: steps.audit.outcome == 'failure'
+        run: |
+          echo "npm audit reported advisories at or above the high threshold" >&2
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  # Deterministic check 3: secret scanning that actually runs.
+  #
+  # Replaces the previous licence-gated, continue-on-error step which could
+  # report green without scanning. The Gitleaks CLI is MIT licensed and needs no
+  # licence key; only the marketplace action does. The binary is pinned by
+  # version and verified by SHA-256 before execution.
+  # ---------------------------------------------------------------------------
+  secret-scan:
+    name: Secret scan (gitleaks)
+    needs: validate-inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      GITLEAKS_VERSION: '8.30.1'
+      GITLEAKS_SHA256: '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate-inputs.outputs.target_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download and verify gitleaks
+        run: |
+          set -euo pipefail
+          asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${asset}"
+          curl --fail --silent --show-error --location --retry 3 --output "$asset" "$url"
+          echo "${GITLEAKS_SHA256}  ${asset}" | sha256sum --check --strict
+          tar -xzf "$asset" gitleaks
+          chmod +x gitleaks
+          ./gitleaks version
+
+      # `--exit-code 2` distinguishes "leaks found" from an operational failure,
+      # so a crashed scanner is never mistaken for a clean scan. The exit code is
+      # re-raised as the step status; it is not swallowed by a trailing command.
+      - name: Scan repository history
+        id: scan
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          mkdir -p .security-audit
+          ./gitleaks git . \
+            --report-format json \
+            --report-path .security-audit/gitleaks.json \
+            --redact \
+            --exit-code 2 \
+            --no-banner
+          status=$?
+          echo "gitleaks exited with ${status}"
+          exit "${status}"
+
+      # The raw report contains match context and commit metadata, so it is
+      # reduced to rule counts and file paths and then deleted.
+      - name: Reduce report to sanitized counts
+        run: |
+          set -euo pipefail
+          [ -f .security-audit/gitleaks.json ] || echo '[]' > .security-audit/gitleaks.json
+          node scripts/security-audit/sanitize-findings.mjs \
+            --kind gitleaks \
+            --in .security-audit/gitleaks.json \
+            --out .security-audit/gitleaks-summary.json
+          rm -f .security-audit/gitleaks.json
+          cat .security-audit/gitleaks-summary.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload sanitized secret-scan summary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: secret-scan-summary
+          path: .security-audit/gitleaks-summary.json
+          retention-days: 7
+
+      - name: Fail if secrets were detected
+        if: steps.scan.outcome == 'failure'
+        run: |
+          echo "gitleaks reported at least one finding; see the sanitized summary" >&2
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  # Deterministic check 4: every action in every workflow is pinned to a
+  # 40-character commit SHA.
+  # ---------------------------------------------------------------------------
+  action-pins:
+    name: Action pinning
+    needs: validate-inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout target commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate-inputs.outputs.target_sha }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Verify action pinning
+        run: node scripts/security-audit/check-action-pins.mjs
+
+  # ---------------------------------------------------------------------------
+  # Model-assisted advisory pass (credentialed).
+  #
+  # Gated on the repository variable `SECURITY_AUDIT_AI_ENABLED`. The `secrets`
+  # context is not readable from a job-level `if`, but `vars` is — and gating on
+  # the variable means the `security-audit-ai` environment is never referenced
+  # until an administrator has created and protected it. Referencing an
+  # environment that does not exist would cause GitHub to create it implicitly
+  # and unprotected, which is why the guard is required.
+  #
+  # Until the variable and the environment exist this job is skipped and the
+  # summary reports `AI NOT_CONFIGURED`. It never reports a pass.
+  # ---------------------------------------------------------------------------
+  model-audit:
+    name: Model-assisted review
+    needs: validate-inputs
+    if: ${{ vars.SECURITY_AUDIT_AI_ENABLED == 'true' && needs.validate-inputs.outputs.dry_run != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: security-audit-ai
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout target commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate-inputs.outputs.target_sha }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # Fail closed: an environment that exists but holds no credential must not
+      # silently degrade into a green run.
+      - name: Require credential
+        env:
+          COPILOT_PAT: ${{ secrets.COPILOT_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${COPILOT_PAT}" ]; then
+            echo "COPILOT_PAT is not set in the security-audit-ai environment" >&2
+            exit 1
+          fi
+
+      # Collects an allowlisted, size-capped corpus. Every file body is wrapped
+      # in explicit untrusted-content delimiters so instructions embedded in
+      # repository source are presented as data, not as directives.
+      - name: Collect corpus
+        env:
+          AUDIT_SCOPE: ${{ needs.validate-inputs.outputs.scope }}
+        run: |
+          set -euo pipefail
+          node scripts/security-audit/collect-corpus.mjs \
+            --scope "${AUDIT_SCOPE}" \
+            --out .security-audit/model
+
+      - name: Build prompt
+        run: |
+          set -euo pipefail
+          cp .security-audit/model/corpus.txt .security-audit/model/prompt.txt
+
+      # actions/ai-inference v3 shells out to the GitHub Copilot CLI, which must
+      # be present on the runner. The version is pinned exactly.
+      - name: Install Copilot CLI
+        run: npm install -g @github/copilot@1.0.80-1
+
+      # The reviewer instructions are supplied as the system prompt and the
+      # repository corpus as the user prompt, so untrusted file content is never
+      # concatenated into the instruction channel.
+      #
+      # `copilot-allow-tools` is deliberately unset: the action passes no
+      # `--allow-tool` flags when it is empty, so the model runs tool-less with
+      # no MCP servers, no shell and no write access.
+      - name: Run model-assisted review
+        id: inference
+        uses: actions/ai-inference@2c43c91ae16266ca159d311430343c67a5ffa222 # v3
+        with:
+          model: ${{ needs.validate-inputs.outputs.model }}
+          system-prompt-file: scripts/security-audit/prompt.md
+          prompt-file: .security-audit/model/prompt.txt
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
+
+      # The response is read from a file by path. It is never interpolated into
+      # a `run:` block, because `${{ }}` substitution happens before the shell
+      # sees the script and would allow command injection from model output.
+      - name: Validate and redact response
+        env:
+          RESPONSE_FILE: ${{ steps.inference.outputs.response-file }}
+        run: |
+          set -euo pipefail
+          node scripts/security-audit/validate-response.mjs \
+            --response "${RESPONSE_FILE}" \
+            --manifest .security-audit/model/corpus-manifest.json \
+            --out .security-audit/model/report.json
+
+      - name: Convert to SARIF
+        run: |
+          set -euo pipefail
+          node scripts/security-audit/to-sarif.mjs \
+            --report .security-audit/model/report.json \
+            --out .security-audit/model/report.sarif
+
+      # Uploaded to code scanning, whose alerts are visible only to users with
+      # write access. No issues, no comments, no public artifact of raw findings.
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          sarif_file: .security-audit/model/report.sarif
+          category: spe-security-audit-model
+
+  # ---------------------------------------------------------------------------
+  # Credential-free rehearsal of the untrusted-output path.
+  #
+  # Exercises corpus collection, schema validation, rejection, redaction and
+  # SARIF conversion against a synthetic response. No environment, no secret, no
+  # network egress, and no upload to code scanning — a synthetic result must
+  # never be mistaken for a real one.
+  # ---------------------------------------------------------------------------
+  model-audit-dry-run:
+    name: Model-assisted review (dry run)
+    needs: validate-inputs
+    if: ${{ needs.validate-inputs.outputs.dry_run == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout target commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate-inputs.outputs.target_sha }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Run synthetic dry run
+        env:
+          AUDIT_SCOPE: ${{ needs.validate-inputs.outputs.scope }}
+        run: |
+          set -euo pipefail
+          node scripts/security-audit/dry-run.mjs --scope "${AUDIT_SCOPE}"
+
+      - name: Run script test suite
+        run: npm run security:audit:test
+
+      - name: Upload dry-run SARIF
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: model-dry-run-sarif
+          path: .security-audit/dry-run/model-report.sarif
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Reports the outcome. Deterministic failures fail the run; the model layer is
+  # advisory and its absence is stated explicitly rather than implied to pass.
+  # ---------------------------------------------------------------------------
+  summary:
+    name: Summary
+    needs:
+      - validate-inputs
+      - codeql
+      - dependency-audit
+      - secret-scan
+      - action-pins
+      - model-audit
+      - model-audit-dry-run
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Render summary
+        env:
+          TARGET_SHA: ${{ needs.validate-inputs.outputs.target_sha }}
+          AUDIT_SCOPE: ${{ needs.validate-inputs.outputs.scope }}
+          CODEQL_RESULT: ${{ needs.codeql.result }}
+          DEPENDENCY_RESULT: ${{ needs.dependency-audit.result }}
+          SECRET_RESULT: ${{ needs.secret-scan.result }}
+          PINS_RESULT: ${{ needs.action-pins.result }}
+          MODEL_RESULT: ${{ needs.model-audit.result }}
+          DRY_RUN: ${{ needs.validate-inputs.outputs.dry_run }}
+        run: |
+          set -euo pipefail
+          node scripts/security-audit/summarize.mjs \
+            --target "${TARGET_SHA:-unknown}" \
+            --scope "${AUDIT_SCOPE:-unknown}" \
+            --codeql "${CODEQL_RESULT}" \
+            --dependency-audit "${DEPENDENCY_RESULT}" \
+            --secret-scan "${SECRET_RESULT}" \
+            --action-pins "${PINS_RESULT}" \
+            --model "${MODEL_RESULT}" \
+            --dry-run "${DRY_RUN:-false}"

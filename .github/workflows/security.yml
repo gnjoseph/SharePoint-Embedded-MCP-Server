@@ -14,32 +14,91 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24.x
           cache: npm
       - run: npm ci
       - run: npm audit --audit-level=high
 
+  # Secret scanning that actually scans.
+  #
+  # The previous implementation used gitleaks/gitleaks-action gated on a
+  # GITLEAKS_LICENSE secret that was never provisioned, and additionally set
+  # continue-on-error, so the job could only ever report green without scanning
+  # anything. The Gitleaks CLI itself is MIT licensed and needs no licence key —
+  # only the marketplace action does — so the CLI is used directly, pinned by
+  # version and verified by SHA-256 before it is executed.
   secrets:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
-      GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+      GITLEAKS_VERSION: '8.30.1'
+      GITLEAKS_SHA256: '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      # gitleaks-action@v2 requires a GITLEAKS_LICENSE when run under a GitHub
-      # organization (free only for personal accounts). Until the owner
-      # provisions the secret, this step is skipped so the workflow stays green;
-      # it is also continue-on-error as a belt-and-suspenders. Owner action:
-      # add GITLEAKS_LICENSE (or switch to GitHub Advanced Security secret
-      # scanning, which is available org-wide) — see SECURITY.md.
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.x
+
+      - name: Download and verify gitleaks
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${asset}"
+          curl --fail --silent --show-error --location --retry 3 --output "$asset" "$url"
+          echo "${GITLEAKS_SHA256}  ${asset}" | sha256sum --check --strict
+          tar -xzf "$asset" gitleaks
+          chmod +x gitleaks
+          ./gitleaks version
+
+      # `--exit-code 2` separates "leaks found" from an operational failure, so a
+      # crashed scanner can never be mistaken for a clean scan. The exit status is
+      # re-raised explicitly; it must not be swallowed by a trailing command.
       - name: Scan for secrets (gitleaks)
-        if: ${{ env.GITLEAKS_LICENSE != '' }}
+        id: scan
         continue-on-error: true
-        uses: gitleaks/gitleaks-action@v3
-        env:
-          GITLEAKS_ENABLE_COMMENTS: "false"
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p .security-audit
+          ./gitleaks git . \
+            --report-format json \
+            --report-path .security-audit/gitleaks.json \
+            --redact \
+            --exit-code 2 \
+            --no-banner
+          status=$?
+          echo "gitleaks exited with ${status}"
+          exit "${status}"
+
+      # The raw report carries match context and commit metadata, so it is reduced
+      # to rule counts and file paths and the original is deleted.
+      - name: Reduce report to sanitized counts
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -f .security-audit/gitleaks.json ] || echo '[]' > .security-audit/gitleaks.json
+          node scripts/security-audit/sanitize-findings.mjs \
+            --kind gitleaks \
+            --in .security-audit/gitleaks.json \
+            --out .security-audit/gitleaks-summary.json
+          rm -f .security-audit/gitleaks.json
+          cat .security-audit/gitleaks-summary.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if secrets were detected
+        if: steps.scan.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "gitleaks reported at least one finding; see the sanitized summary" >&2
+          exit 1
