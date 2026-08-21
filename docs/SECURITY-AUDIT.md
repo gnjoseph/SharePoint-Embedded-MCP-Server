@@ -22,11 +22,11 @@ The audit has two layers:
 
 | Job | What it does | Notes |
 | --- | --- | --- |
-| `validate-inputs` | Normalizes and validates the manual inputs | Target must be a 40-hex SHA reachable from `main`; scope and model come from allowlists |
+| `validate-inputs` | Normalizes and validates the manual inputs | Target must be a 40-hex SHA reachable from `main`; scope and model come from allowlists. Scheduled runs supply no ref, so the current `origin/main` tip is resolved to a full SHA and then validated by the same rules |
 | `codeql` | CodeQL `security-extended` for JavaScript/TypeScript | Uploads SARIF to code scanning (`security-events: write`) |
 | `dependency-audit` | `npm audit --audit-level=high` | The raw JSON is reduced to sanitized counts + advisory URLs before it ever leaves the runner |
 | `secret-scan` | Gitleaks **CLI**, downloaded at a pinned version and SHA256-verified | Report is reduced to file/rule/line — never the matched secret |
-| `action-pins` | Fails if any workflow uses a mutable action ref | Enforces 40-hex commit pinning across `.github/workflows` |
+| `action-pins` | Fails if any workflow uses a mutable action ref | Enforces 40-hex commit pinning recursively across `.github/workflows` **and** every composite `action.yml`/`action.yaml` in the repository |
 | `summary` | Aggregates results into the job summary | Fails the run if any deterministic job did not succeed |
 
 Dependency installation in the audit path uses `npm ci --ignore-scripts`, so no repository
@@ -38,8 +38,11 @@ lifecycle script executes while untrusted content is being collected.
 before anything is retained:
 
 - Corpus caps: 40 files, 96 KiB per file, 512 KiB total (`scripts/security-audit/lib/constants.mjs`).
-- Every file is wrapped in explicit untrusted-content delimiters; the system prompt states the
-  file bodies are data, never instructions.
+- Instruction surfaces (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.github/instructions/`,
+  `.github/agents/`, `.copilot/`, `Skills/*/SKILL.md`, …) are denied from the corpus outright, so
+  agent-directed text can never be re-presented to the auditing model as repository content.
+- Every file is wrapped in **per-run nonce delimiters** — see
+  [Prompt-injection containment](#prompt-injection-containment) below.
 - The job is tool-less: no MCP servers, no shell, no repository write. `copilot-allow-tools`
   is deliberately left unset (empty means no tools).
 - Model output is **never** interpolated into a shell command — only file paths are passed
@@ -51,6 +54,34 @@ before anything is retained:
 
 Nothing from the model layer is published: no issues, no comments, no raw-finding artifacts.
 Sanitized results go to code scanning under the restricted `security-events: write` permission.
+
+### Prompt-injection containment
+
+The corpus is untrusted by construction: it is repository source, and anyone who can land a
+commit can write text into it. Containment is layered, and only the last layer is trusted.
+
+1. **Per-run nonce fences.** `collect-corpus.mjs` generates a 24-byte random nonce for every run
+   and wraps each file in `<<<SPE_AUDIT_UNTRUSTED_FILE_BEGIN:<nonce>>>>` /
+   `…_END:<nonce>>>>`. A static delimiter is forgeable — the literal sentinel already appears in
+   this repository's own `constants.mjs` — so any occurrence of the sentinel inside a file body
+   is rewritten to a neutral marker before fencing, and a body that somehow contains the live
+   nonce aborts the run. After emission the collector re-counts fences and fails unless the
+   begin/end counts both equal the file count, so a corpus that can close its own fence never
+   reaches the model.
+2. **Nonce conveyance.** The nonce is recorded in `corpus-manifest.json`, and `build-prompt.mjs`
+   renders it into both prompt files. The model is told the exact fence to expect, so a forged
+   fence carrying a different (or no) nonce is visibly not the real boundary.
+3. **Trusted suffix, not a privileged role.** `actions/ai-inference` concatenates the system
+   prompt and the prompt, so `system-prompt-file` is *not* a separate privileged channel — text
+   later in the payload is not inherently less authoritative. The output contract is therefore
+   re-asserted **after** the corpus, from `prompt-suffix.md`, as the last thing the model reads.
+4. **`validate-response.mjs` is the enforceable boundary.** Everything above is defence in depth
+   and none of it is a security control on its own: prompt text cannot be enforced. The schema
+   validator is the control. It re-derives the allowlists from `constants.mjs`, requires every
+   finding to anchor to a real corpus file and a line that exists in it, rejects secrets/GUIDs/
+   absolute paths/weaponized payloads, redacts the rest, and **exits non-zero if anything was
+   rejected** (fail-closed). If the model ignores every instruction it was given, the run fails;
+   it does not silently emit attacker-shaped output.
 
 ## Running it locally
 
@@ -71,7 +102,9 @@ npm run security:audit:pins
 
 | File | Contents |
 | --- | --- |
-| `corpus-manifest.json` | Files collected, byte/line counts, skipped files |
+| `corpus-manifest.json` | Files collected, byte/line counts, skipped files, the run nonce |
+| `system.txt` | Rendered auditor preamble (vocabulary injected from `constants.mjs`) |
+| `prompt.txt` | Nonce-fenced corpus followed by the trusted output-contract suffix |
 | `model-report.json` | Accepted findings, rejected findings with reasons, redaction count |
 | `model-report.sarif` | SARIF 2.1.0, flagged `synthetic` |
 
@@ -108,6 +141,22 @@ Related administrative follow-ups (independent of the model layer):
 - Enable **native secret scanning** and **push protection** on the repository.
 - Add the deterministic jobs as **required status checks** in the organization ruleset.
   Do **not** make the model job a required check — it is advisory and non-deterministic.
+
+### Assumption: audited commits are reachable from `main`
+
+`validate-target.mjs` requires the target SHA to be an ancestor of `refs/remotes/origin/main`.
+That is the point of the check — it stops a dispatch from pointing the audit at an arbitrary
+unreviewed commit — but it interacts with the repository's merge settings.
+
+At the time of writing the repository allows **all three** merge methods (merge commit, squash,
+rebase). Squash and rebase merges rewrite commits, so a pull request's original head SHA is
+**not** reachable from `main` after the merge, and passing it here is rejected by design. Audit
+the resulting commit on `main` instead — that is the code that actually ships. Administrators who
+want dispatch-by-PR-head to work must standardize on merge commits; the audit intentionally does
+not relax the reachability rule to accommodate rewritten history.
+
+Scheduled runs are unaffected: they supply no ref, so the current `origin/main` tip is resolved
+and validated by the same rules.
 
 ## Design constraints
 

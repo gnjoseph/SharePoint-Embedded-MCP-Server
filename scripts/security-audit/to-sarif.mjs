@@ -82,7 +82,7 @@ export function toSarif(report, options = {}) {
     message: {
       text: [
         String(finding.title),
-        String(finding.description),
+        String(finding.detail),
         `Control: ${finding.control}`,
         `Confidence: ${finding.confidence}`,
         `Remediation: ${finding.remediation}`,

@@ -9,15 +9,21 @@
  *  - Hard caps on file count, per-file bytes and total bytes. Oversized files are
  *    skipped rather than truncated, so the model never reasons about a partial
  *    file and reports a line number that does not exist upstream.
- *  - Every file body is fenced with fixed delimiters and the prompt instructs the
- *    model to treat the contents as untrusted data, never as instructions.
+ *  - Every file body is fenced with a PER-RUN CRYPTOGRAPHIC NONCE. A static fence
+ *    is forgeable — this repository's own `lib/constants.mjs` contains the fence
+ *    sentinel — so the nonce is generated fresh for every run and cannot appear
+ *    in repository content. Any sentinel literal found inside a collected body is
+ *    neutralized before emission, and a body that somehow contains the run nonce
+ *    aborts the collection outright.
  *  - File discovery uses `git ls-files`, so untracked and ignored files (which
  *    may contain local secrets) are never collected.
  *
  * Emits:
  *  - `<out>/corpus.txt`          delimiter-fenced file bodies
- *  - `<out>/corpus-manifest.json` path -> { bytes, lines } used to validate that
- *                                 model findings reference real files and lines
+ *  - `<out>/corpus-manifest.json` nonce + path -> { bytes, lines } used to
+ *                                 validate that model findings reference real
+ *                                 files and lines, and to render the prompt with
+ *                                 the exact fence in use
  *
  * Usage:
  *   node scripts/security-audit/collect-corpus.mjs --scope <name> --out <dir>
@@ -26,12 +32,15 @@
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   ALLOWED_EXTENSIONS,
-  CORPUS_DELIMITERS,
+  corpusDelimiters,
   CORPUS_DENY_PATTERNS,
   CORPUS_LIMITS,
   DEFAULT_SCOPE,
+  generateCorpusNonce,
+  neutralizeDelimiters,
   SCOPES,
 } from './lib/constants.mjs';
 
@@ -102,6 +111,12 @@ function main() {
   const skipped = [];
   let totalBytes = 0;
   let fileCount = 0;
+  let neutralizedTotal = 0;
+
+  // Fresh, unguessable fence for this run only. Repository content cannot
+  // contain it, so no collected file can close its own fence.
+  const nonce = generateCorpusNonce();
+  const delimiters = corpusDelimiters(nonce);
 
   for (const file of candidates) {
     if (fileCount >= CORPUS_LIMITS.maxFiles) {
@@ -126,7 +141,16 @@ function main() {
       continue;
     }
 
-    const body = readFileSync(file, 'utf8');
+    const rawBody = readFileSync(file, 'utf8');
+
+    // Defence in depth: a body must never be able to emit anything that looks
+    // like a fence. The nonce makes forgery infeasible; neutralization makes it
+    // impossible even to write the sentinel token into the corpus.
+    if (rawBody.includes(nonce)) {
+      fail(`file ${file} contains the run nonce; aborting corpus collection`);
+    }
+    const { value: body, neutralized } = neutralizeDelimiters(rawBody);
+    neutralizedTotal += neutralized;
     const lines = body.split('\n').length;
 
     manifest[file] = { bytes: size, lines };
@@ -135,9 +159,9 @@ function main() {
 
     chunks.push(
       [
-        `${CORPUS_DELIMITERS.begin} path=${file} lines=${lines}`,
+        `${delimiters.begin} path=${file} lines=${lines}`,
         body.replace(/\s+$/, ''),
-        CORPUS_DELIMITERS.end,
+        delimiters.end,
         '',
       ].join('\n'),
     );
@@ -147,25 +171,53 @@ function main() {
     fail(`scope ${scope} produced an empty corpus; nothing to audit`);
   }
 
+  const corpus = chunks.join('\n');
+
+  // Final assertion: exactly one begin and one end fence per collected file.
+  const beginCount = corpus.split(delimiters.begin).length - 1;
+  const endCount = corpus.split(delimiters.end).length - 1;
+  if (beginCount !== fileCount || endCount !== fileCount) {
+    fail(
+      `corpus fence integrity check failed: expected ${fileCount} pairs, found begin=${beginCount} end=${endCount}`,
+    );
+  }
+
   mkdirSync(outDir, { recursive: true });
-  writeFileSync(path.join(outDir, 'corpus.txt'), chunks.join('\n'), 'utf8');
+  writeFileSync(path.join(outDir, 'corpus.txt'), corpus, 'utf8');
   writeFileSync(
     path.join(outDir, 'corpus-manifest.json'),
-    `${JSON.stringify({ scope, fileCount, totalBytes, files: manifest, skipped }, null, 2)}\n`,
+    `${JSON.stringify(
+      {
+        scope,
+        nonce,
+        delimiters: { begin: delimiters.begin, end: delimiters.end },
+        fileCount,
+        totalBytes,
+        neutralized: neutralizedTotal,
+        files: manifest,
+        skipped,
+      },
+      null,
+      2,
+    )}\n`,
     'utf8',
   );
 
   process.stdout.write(
-    `security-audit: corpus scope=${scope} files=${fileCount} bytes=${totalBytes} skipped=${skipped.length}\n`,
+    `security-audit: corpus scope=${scope} files=${fileCount} bytes=${totalBytes} skipped=${skipped.length} neutralized=${neutralizedTotal}\n`,
   );
 
   if (process.env.GITHUB_OUTPUT) {
+    // The nonce is deliberately NOT exported as a step output: it is carried in
+    // the manifest and consumed only by `build-prompt.mjs` inside the same job.
     appendFileSync(
       process.env.GITHUB_OUTPUT,
-      `corpus_files=${fileCount}\ncorpus_bytes=${totalBytes}\n`,
+      `corpus_files=${fileCount}\ncorpus_bytes=${totalBytes}\ncorpus_neutralized=${neutralizedTotal}\n`,
       'utf8',
     );
   }
 }
 
-main();
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main();
+}

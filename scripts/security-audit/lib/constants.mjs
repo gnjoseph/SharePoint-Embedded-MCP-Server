@@ -8,6 +8,8 @@
  * No runtime dependencies: Node built-ins only.
  */
 
+import { randomBytes } from 'node:crypto';
+
 /** Repository-relative path of the control legend used to anchor findings. */
 export const CONTROL_LEGEND_PATH = 'docs/SECURITY-CONTROLS.md';
 
@@ -83,6 +85,7 @@ export const CONFIDENCES = Object.freeze(['high', 'medium', 'low']);
 /** Accepted finding categories. */
 export const CATEGORIES = Object.freeze([
   'injection',
+  'prompt-injection',
   'authz',
   'authn',
   'secret-exposure',
@@ -108,11 +111,73 @@ export const MAX_FINDINGS = 50;
 /** Maximum characters accepted for any single free-text finding field. */
 export const MAX_FIELD_CHARS = 1200;
 
-/** Delimiters that fence untrusted repository content inside the prompt. */
-export const CORPUS_DELIMITERS = Object.freeze({
-  begin: '<<<SPE_AUDIT_UNTRUSTED_FILE_BEGIN>>>',
-  end: '<<<SPE_AUDIT_UNTRUSTED_FILE_END>>>',
-});
+/**
+ * Sentinel token embedded in every corpus fence.
+ *
+ * The token alone is NOT a security boundary: it is a fixed string that lives in
+ * this file, which is itself inside the `workflows` and `full` scopes, so any
+ * attacker (and this repository's own source) can reproduce it verbatim. The
+ * boundary is the per-run nonce appended to it — see `generateCorpusNonce()`.
+ */
+export const DELIMITER_SENTINEL = 'SPE_AUDIT_UNTRUSTED_FILE';
+
+/** Replacement written over any sentinel literal found inside collected content. */
+export const DELIMITER_NEUTRALIZED = 'SPE_AUDIT_NEUTRALIZED_MARKER';
+
+/** Number of random bytes backing a corpus nonce (48 hex characters). */
+export const CORPUS_NONCE_BYTES = 24;
+
+/**
+ * Generate a fresh, unguessable delimiter nonce for a single audit run.
+ *
+ * Rationale: a static fence can be forged by any file that happens to contain
+ * the literal — including this repository's own constants file. A per-run
+ * nonce cannot be present in repository content, so a collected file is
+ * incapable of closing the fence around itself or opening a new one.
+ */
+export function generateCorpusNonce() {
+  return randomBytes(CORPUS_NONCE_BYTES).toString('hex');
+}
+
+/**
+ * Build the begin/end fence for a given run nonce.
+ *
+ * @param {string} nonce Hex nonce from `generateCorpusNonce()`.
+ * @returns {{ nonce: string, begin: string, end: string }}
+ */
+export function corpusDelimiters(nonce) {
+  if (typeof nonce !== 'string' || !/^[0-9a-f]{16,}$/.test(nonce)) {
+    throw new TypeError('corpusDelimiters requires a hex nonce of at least 16 characters');
+  }
+  return Object.freeze({
+    nonce,
+    begin: `<<<${DELIMITER_SENTINEL}_BEGIN:${nonce}>>>`,
+    end: `<<<${DELIMITER_SENTINEL}_END:${nonce}>>>`,
+  });
+}
+
+/**
+ * Neutralize every sentinel literal inside untrusted content.
+ *
+ * Collected files may legitimately contain the sentinel (this file does). They
+ * are escaped rather than rejected so that the `workflows` and `full` scopes
+ * remain auditable, while the emitted corpus can never contain a string that
+ * looks like a fence.
+ *
+ * @param {string} text Untrusted file content.
+ * @returns {{ value: string, neutralized: number }}
+ */
+export function neutralizeDelimiters(text) {
+  const pattern = new RegExp(DELIMITER_SENTINEL, 'g');
+  const matches = String(text).match(pattern);
+  if (!matches) {
+    return { value: String(text), neutralized: 0 };
+  }
+  return {
+    value: String(text).replace(pattern, DELIMITER_NEUTRALIZED),
+    neutralized: matches.length,
+  };
+}
 
 /** SARIF tool driver name, surfaced in code scanning. */
 export const TOOL_NAME = 'SPE MCP Security Audit';

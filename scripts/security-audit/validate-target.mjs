@@ -7,23 +7,38 @@
  *    abbreviated SHAs) and is an ancestor of `origin/main`. This prevents the
  *    audit from being pointed at arbitrary unreviewed code via
  *    `workflow_dispatch`.
+ *  - An omitted/empty `ref` (the `schedule` event supplies no inputs, and the
+ *    `workflow_dispatch` input defaults to empty) resolves to the current
+ *    `origin/main` tip. The resolved value is then subjected to the *same*
+ *    full-SHA and reachability checks as an operator-supplied value — it is a
+ *    default, never a bypass.
  *  - `model` and `scope` are members of a fixed allowlist.
  *  - `dry_run` is a strict boolean literal.
+ *
+ * Reachability is mandatory. There is no production flag to skip it; the only
+ * escape hatch is the `SECURITY_AUDIT_TEST_MODE=1` environment variable, which
+ * exists so unit tests can exercise argument validation inside a scratch
+ * repository that has no `origin/main`. `tests/workflow-invariants.test.mjs`
+ * asserts that no workflow ever sets that variable.
  *
  * Writes the normalized values to `$GITHUB_OUTPUT` when running in Actions.
  * Exits non-zero on any violation so that downstream jobs never start.
  *
  * Usage:
  *   node scripts/security-audit/validate-target.mjs \
- *     --ref <sha> --model <name> --scope <name> --dry-run <true|false>
+ *     [--ref <sha>] --model <name> --scope <name> --dry-run <true|false>
  */
 
 import { execFileSync } from 'node:child_process';
 import { appendFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { ALLOWED_MODELS, DEFAULT_MODEL, DEFAULT_SCOPE, SCOPES } from './lib/constants.mjs';
 
 const BASE_REF = 'refs/remotes/origin/main';
 const FULL_SHA = /^[0-9a-f]{40}$/;
+
+/** Test-only escape hatch; never set by any workflow. */
+const TEST_MODE = process.env.SECURITY_AUDIT_TEST_MODE === '1';
 
 /**
  * @param {string[]} argv
@@ -82,13 +97,45 @@ function assertReachableFromMain(sha) {
   }
 }
 
+/**
+ * Resolves the default audit target: the current tip of `origin/main`.
+ *
+ * Used when no `ref` was supplied — the `schedule` event passes no inputs at
+ * all, and the `workflow_dispatch` input defaults to an empty string. The
+ * returned SHA is *not* trusted implicitly: `main()` re-applies the full-SHA
+ * shape check and the reachability check to it (the tip is trivially its own
+ * ancestor, so the check is satisfied without being weakened).
+ *
+ * @returns {string}
+ */
+function resolveDefaultRef() {
+  try {
+    return execFileSync('git', ['rev-parse', `${BASE_REF}^{commit}`], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    fail(
+      `no ref supplied and ${BASE_REF} could not be resolved. ` +
+        'Ensure the checkout fetched origin/main (fetch-depth: 0).',
+    );
+    return '';
+  }
+}
+
 function main() {
   const args = parseArgs(process.argv.slice(2));
 
-  const ref = (args.ref ?? '').trim();
+  // `schedule` supplies no inputs and the dispatch input defaults to empty, so
+  // an absent ref means "audit the current main tip" rather than "invalid".
+  const suppliedRef = (args.ref ?? '').trim();
+  const ref = suppliedRef === '' ? resolveDefaultRef() : suppliedRef;
+  const refSource = suppliedRef === '' ? `default (${BASE_REF})` : 'input';
+
   if (!FULL_SHA.test(ref)) {
     fail(
-      `ref must be a full 40-character lowercase hex commit SHA; received ${JSON.stringify(ref)}`,
+      `ref must be a full 40-character lowercase hex commit SHA; ` +
+        `received ${JSON.stringify(ref)} from ${refSource}`,
     );
   }
 
@@ -106,7 +153,9 @@ function main() {
 
   const dryRun = parseBoolean(args['dry-run'], 'dry_run');
 
-  if (args['skip-reachability'] !== 'true') {
+  // Mandatory in every non-test invocation. There is deliberately no CLI flag
+  // that disables this; see the module docblock.
+  if (!TEST_MODE) {
     assertReachableFromMain(ref);
   }
 
@@ -129,4 +178,8 @@ function main() {
   }
 }
 
-main();
+export { FULL_SHA, resolveDefaultRef };
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main();
+}

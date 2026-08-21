@@ -88,6 +88,11 @@ jobs:
 
       # Inputs are passed through `env`, never interpolated into the command
       # line, so a crafted value cannot break out into the shell.
+      #
+      # `schedule` supplies no inputs at all, so INPUT_REF is empty on the
+      # weekly run. validate-target.mjs resolves an empty ref to the current
+      # origin/main tip and then applies the *same* full-SHA and
+      # reachable-from-main checks to it — a default, never a bypass.
       - name: Validate target ref and options
         id: validate
         env:
@@ -213,6 +218,11 @@ jobs:
       contents: read
     env:
       GITLEAKS_VERSION: '8.30.1'
+      # Provenance: taken from the upstream release artifact
+      # gitleaks_8.30.1_checksums.txt published at
+      # https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_checksums.txt
+      # (goreleaser-generated, published alongside the binaries). Re-verify this
+      # value against that file whenever GITLEAKS_VERSION is bumped.
       GITLEAKS_SHA256: '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'
     steps:
       - name: Checkout full history
@@ -357,8 +367,10 @@ jobs:
           fi
 
       # Collects an allowlisted, size-capped corpus. Every file body is wrapped
-      # in explicit untrusted-content delimiters so instructions embedded in
-      # repository source are presented as data, not as directives.
+      # in per-run, nonce-bearing untrusted-content delimiters so instructions
+      # embedded in repository source are presented as data, not as directives.
+      # Any occurrence of the static sentinel inside a file body is neutralised,
+      # and collection aborts outright if a body ever contains the run nonce.
       - name: Collect corpus
         env:
           AUDIT_SCOPE: ${{ needs.validate-inputs.outputs.scope }}
@@ -368,20 +380,29 @@ jobs:
             --scope "${AUDIT_SCOPE}" \
             --out .security-audit/model
 
+      # actions/ai-inference concatenates the system prompt and the user prompt
+      # into a single Copilot CLI invocation, so `system-prompt-file` is NOT a
+      # separate privileged channel. build-prompt.mjs therefore renders the
+      # instructions twice: once as a preamble (system.txt) and once as a
+      # trusted suffix appended *after* the corpus (inside prompt.txt), so the
+      # immutable output contract is the last thing the model reads. It also
+      # injects the run nonce and the schema vocabulary from lib/constants.mjs,
+      # making prompt/validator drift structurally impossible.
+      #
+      # None of this is a security boundary on its own: validate-response.mjs
+      # is the enforceable boundary. See docs/SECURITY-AUDIT.md.
       - name: Build prompt
         run: |
           set -euo pipefail
-          cp .security-audit/model/corpus.txt .security-audit/model/prompt.txt
+          node scripts/security-audit/build-prompt.mjs \
+            --corpus .security-audit/model \
+            --out .security-audit/model
 
       # actions/ai-inference v3 shells out to the GitHub Copilot CLI, which must
       # be present on the runner. The version is pinned exactly.
       - name: Install Copilot CLI
         run: npm install -g @github/copilot@1.0.80-1
 
-      # The reviewer instructions are supplied as the system prompt and the
-      # repository corpus as the user prompt, so untrusted file content is never
-      # concatenated into the instruction channel.
-      #
       # `copilot-allow-tools` is deliberately unset: the action passes no
       # `--allow-tool` flags when it is empty, so the model runs tool-less with
       # no MCP servers, no shell and no write access.
@@ -390,7 +411,7 @@ jobs:
         uses: actions/ai-inference@2c43c91ae16266ca159d311430343c67a5ffa222 # v3
         with:
           model: ${{ needs.validate-inputs.outputs.model }}
-          system-prompt-file: scripts/security-audit/prompt.md
+          system-prompt-file: .security-audit/model/system.txt
           prompt-file: .security-audit/model/prompt.txt
         env:
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}

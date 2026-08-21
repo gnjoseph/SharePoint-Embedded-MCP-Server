@@ -3,8 +3,9 @@
  * Offline dry run for the SPE MCP security audit model pipeline.
  *
  * This script exercises the *entire* untrusted-output path -- corpus
- * collection, response schema validation, redaction and SARIF conversion --
- * without invoking any model, without any credential and without any network
+ * collection, nonce fence integrity, prompt assembly, response schema
+ * validation, redaction and SARIF conversion -- without invoking any model,
+ * without any credential and without any network
  * access. It exists so the fail-closed behaviour of the pipeline can be tested
  * locally and in CI while the AI layer is still NOT_CONFIGURED.
  *
@@ -23,7 +24,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { CORPUS_DELIMITERS, DEFAULT_SCOPE, SCOPES } from './lib/constants.mjs';
+import { corpusDelimiters, DEFAULT_SCOPE, SCOPES } from './lib/constants.mjs';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, '..', '..');
@@ -133,8 +134,38 @@ function main() {
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
 
   const corpus = readFileSync(corpusPath, 'utf8');
-  if (!corpus.includes(CORPUS_DELIMITERS.begin) || !corpus.includes(CORPUS_DELIMITERS.end)) {
-    throw new Error('collected corpus is missing the untrusted-file delimiters');
+
+  // Fence integrity: the delimiters are derived from the per-run nonce recorded
+  // in the manifest, so a corpus file cannot forge or close a fence. Assert the
+  // begin/end counts match the manifest file count exactly.
+  const delimiters = corpusDelimiters(manifest.nonce);
+  const beginCount = corpus.split(delimiters.begin).length - 1;
+  const endCount = corpus.split(delimiters.end).length - 1;
+  if (beginCount !== manifest.fileCount || endCount !== manifest.fileCount) {
+    throw new Error(
+      `corpus fence integrity check failed: expected ${manifest.fileCount} begin/end markers, saw ${beginCount}/${endCount}`,
+    );
+  }
+
+  // Assemble the trusted preamble and the corpus + trusted suffix exactly as the
+  // workflow does, so the dry run also covers prompt construction.
+  runStage('build prompt', 'build-prompt.mjs', ['--corpus', outDir, '--out', outDir]);
+
+  const systemPrompt = readFileSync(join(outDir, 'system.txt'), 'utf8');
+  const modelPrompt = readFileSync(join(outDir, 'prompt.txt'), 'utf8');
+  for (const [label, text] of [
+    ['system.txt', systemPrompt],
+    ['prompt.txt', modelPrompt],
+  ]) {
+    if (!text.includes(manifest.nonce)) {
+      throw new Error(`${label} does not carry the per-run corpus nonce`);
+    }
+    if (text.includes('{{')) {
+      throw new Error(`${label} contains an unresolved template placeholder`);
+    }
+  }
+  if (!modelPrompt.endsWith('\n') || !modelPrompt.includes('END OF UNTRUSTED CORPUS')) {
+    throw new Error('prompt.txt is missing the trusted suffix that reasserts the output contract');
   }
 
   const fixture = JSON.parse(
@@ -171,6 +202,7 @@ function main() {
       '--- dry run summary ---',
       `corpus files:    ${manifest.fileCount}`,
       `corpus bytes:    ${manifest.totalBytes}`,
+      `neutralized:     ${manifest.neutralized}`,
       `accepted:        ${report.acceptedCount}`,
       `rejected:        ${report.rejectedCount}`,
       `redactions:      ${report.redactionCount}`,

@@ -41,7 +41,7 @@ import {
 import { loadControlCodes } from './lib/controls.mjs';
 import { findRejectReasons, redact } from './lib/redaction.mjs';
 
-const REQUIRED_TEXT_FIELDS = ['title', 'description', 'remediation', 'test'];
+const REQUIRED_TEXT_FIELDS = ['title', 'detail', 'remediation', 'test'];
 
 /**
  * @param {string[]} argv

@@ -188,6 +188,19 @@ test('dependency install in the audit path never runs repository scripts', () =>
   }
 });
 
+test('no workflow enables the reachability test-mode escape hatch', () => {
+  // `SECURITY_AUDIT_TEST_MODE=1` skips the reachable-from-main check. It exists
+  // solely for offline unit tests and must never appear in a workflow.
+  const files = readdirSync(WORKFLOW_DIR).filter((f) => /\.ya?ml$/.test(f));
+  for (const file of files) {
+    const raw = readFileSync(path.join(WORKFLOW_DIR, file), 'utf8');
+    assert.ok(
+      !raw.includes('SECURITY_AUDIT_TEST_MODE'),
+      `${file}: workflows must not disable the reachability gate`,
+    );
+  }
+});
+
 test('checkouts do not persist credentials', () => {
   const files = readdirSync(WORKFLOW_DIR).filter((f) => /\.ya?ml$/.test(f));
   for (const file of files) {

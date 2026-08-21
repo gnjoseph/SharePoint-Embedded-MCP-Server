@@ -23,7 +23,11 @@ jobs:
         with:
           node-version: 24.x
           cache: npm
-      - run: npm ci
+      # `--ignore-scripts` keeps dependency lifecycle scripts (install/postinstall)
+      # from executing on a runner whose only job is to read the lockfile. `npm
+      # audit` resolves advisories from package-lock.json and does not need a
+      # built dependency tree, so nothing here depends on those scripts running.
+      - run: npm ci --ignore-scripts
       - run: npm audit --audit-level=high
 
   # Secret scanning that actually scans.
@@ -39,6 +43,11 @@ jobs:
     timeout-minutes: 20
     env:
       GITLEAKS_VERSION: '8.30.1'
+      # Provenance: taken from the upstream release artifact
+      # gitleaks_8.30.1_checksums.txt published at
+      # https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_checksums.txt
+      # (goreleaser-generated, published alongside the binaries). Re-verify this
+      # value against that file whenever GITLEAKS_VERSION is bumped.
       GITLEAKS_SHA256: '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
