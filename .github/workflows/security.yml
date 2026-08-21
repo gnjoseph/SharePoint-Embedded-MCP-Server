@@ -92,7 +92,8 @@ jobs:
           exit "${status}"
 
       # The raw report carries match context and commit metadata, so it is reduced
-      # to rule counts and file paths and the original is deleted.
+      # to counts only — no rule identifiers, no file paths — and the original is
+      # deleted. See scripts/security-audit/sanitize-findings.mjs.
       - name: Reduce report to sanitized counts
         shell: bash
         run: |

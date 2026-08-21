@@ -312,8 +312,11 @@ jobs:
           echo "gitleaks exited with ${status}"
           exit "${status}"
 
-      # The raw report contains match context and commit metadata, so it is
-      # reduced to rule counts and file paths and then deleted.
+      # The raw report contains the match context, commit metadata, rule
+      # identifiers and file paths. Everything that locates a finding is
+      # dropped: the published summary carries counts only, and the raw report
+      # is deleted before any upload step runs. Triage uses the scan step logs,
+      # which require repository write access to read.
       - name: Reduce report to sanitized counts
         run: |
           set -euo pipefail
@@ -392,7 +395,14 @@ jobs:
   # ---------------------------------------------------------------------------
   model-audit:
     name: Model-assisted review
-    needs: validate-inputs
+    # `secret-scan` is a hard predecessor, not an ordering preference: it is the
+    # gate that must pass before any repository source leaves the runner. If the
+    # tree still contains a live credential, sending the corpus to the model
+    # provider would export that credential to a third party. A failed or
+    # cancelled secret scan therefore skips this job entirely.
+    needs:
+      - validate-inputs
+      - secret-scan
     if: ${{ vars.SECURITY_AUDIT_AI_ENABLED == 'true' && needs.validate-inputs.outputs.dry_run != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -466,9 +476,26 @@ jobs:
             --out .security-audit/model
 
       # actions/ai-inference v3 shells out to the GitHub Copilot CLI, which must
-      # be present on the runner. The version is pinned exactly.
+      # already be present on the runner. `npm install -g <pkg>@<version>` pins
+      # only the top-level package: transitive versions are resolved at install
+      # time, so the bytes executed here would be decided by the registry rather
+      # than by this repository. The CLI is therefore installed from the
+      # committed manifest + lockfile in tools/copilot-cli, which comes from the
+      # trusted controller checkout at the workspace root, never from target/.
+      # `--ignore-scripts` is safe: @github/copilot declares no `scripts` field,
+      # so nothing legitimate is skipped and install-time code cannot run.
+      # The lockfile is an activation prerequisite (see tools/copilot-cli/README.md);
+      # if it is missing this step fails closed rather than falling back to a
+      # floating install.
       - name: Install Copilot CLI
-        run: npm install -g @github/copilot@1.0.80-1
+        run: |
+          set -euo pipefail
+          if [ ! -f tools/copilot-cli/package-lock.json ]; then
+            echo "::error::tools/copilot-cli/package-lock.json is missing. Generate it on a host with direct registry.npmjs.org access (see tools/copilot-cli/README.md) before enabling the model-assisted audit."
+            exit 1
+          fi
+          ( cd tools/copilot-cli && npm ci --ignore-scripts )
+          test -x tools/copilot-cli/node_modules/.bin/copilot
 
       # `copilot-allow-tools` is deliberately unset: the action passes no
       # `--allow-tool` flags when it is empty, so the model runs tool-less with
@@ -480,6 +507,7 @@ jobs:
           model: ${{ needs.validate-inputs.outputs.model }}
           system-prompt-file: .security-audit/model/system.txt
           prompt-file: .security-audit/model/prompt.txt
+          copilot-cli-path: tools/copilot-cli/node_modules/.bin/copilot
         env:
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
 

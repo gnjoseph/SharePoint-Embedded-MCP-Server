@@ -525,7 +525,36 @@ test('gitleaks reports never carry secret material', () => {
   assert.equal(/SUPER-SECRET-VALUE/.test(text), false);
   assert.equal(/someone@example\.test/.test(text), false);
   assert.equal(sanitized.total, 1);
-  assert.equal(sanitized.byRule['generic-api-key'], 1);
+});
+
+// The sanitized gitleaks summary reaches two public surfaces: the job summary
+// and the `secret-scan-summary` artifact. Before the secret is rotated, a rule
+// identifier paired with a path states which file holds which class of
+// credential, which is itself disclosure. The summary therefore carries counts
+// only; triage happens through the scan step log, which is restricted to
+// collaborators with Actions read access.
+test('the sanitized gitleaks summary publishes counts without locations', () => {
+  const sanitized = sanitizeGitleaks([
+    { RuleID: 'generic-api-key', File: 'src/a.ts', StartLine: 3, Secret: 'x' },
+    { RuleID: 'generic-api-key', File: 'src/b.ts', StartLine: 9, Secret: 'y' },
+    { RuleID: 'aws-access-token', File: 'src/a.ts', StartLine: 1, Secret: 'z' },
+  ]);
+
+  assert.deepEqual(Object.keys(sanitized).sort(), [
+    'fileCount',
+    'kind',
+    'ruleCount',
+    'total',
+  ]);
+  assert.equal(sanitized.total, 3);
+  assert.equal(sanitized.ruleCount, 2, 'two distinct rules fired');
+  assert.equal(sanitized.fileCount, 2, 'across two distinct files');
+
+  const text = JSON.stringify(sanitized);
+  assert.equal(/generic-api-key/.test(text), false, 'rule identifiers must not leak');
+  assert.equal(/aws-access-token/.test(text), false, 'rule identifiers must not leak');
+  assert.equal(/src\//.test(text), false, 'file paths must not leak');
+  assert.equal(/\.ts/.test(text), false, 'file paths must not leak');
 });
 
 // ---------------------------------------------------------------------------
@@ -625,6 +654,33 @@ test('sarif messages carry the finding detail rather than a dropped field', () =
   const message = sarif.runs[0].results[0].message.text;
   assert.ok(message.includes(detail), 'the detail field must reach the SARIF message');
   assert.ok(!message.includes('undefined'), 'no required field may serialize to undefined');
+});
+
+// The SARIF writer used to carry its own severity table with a silent `??`
+// fallback, so a vocabulary change in constants.mjs would have downgraded an
+// unmapped severity to `warning` / 5.0 instead of failing. One canonical
+// vocabulary now spans prompt, validator, SARIF and tests: every severity must
+// map, and anything outside the vocabulary must be a hard error.
+test('sarif maps every canonical severity and refuses an unmapped one', () => {
+  const levels = new Set();
+  for (const severity of SEVERITIES) {
+    const sarif = toSarif({ findings: [finding({ severity })] }, {});
+    const result_ = sarif.runs[0].results[0];
+    assert.ok(result_.level, `severity ${severity} produced no SARIF level`);
+    assert.match(
+      result_.properties['security-severity'],
+      /^\d+(\.\d+)?$/,
+      `severity ${severity} produced no numeric security-severity`,
+    );
+    levels.add(result_.level);
+  }
+  assert.ok(levels.size > 1, 'the severity vocabulary must not collapse to one SARIF level');
+
+  assert.throws(
+    () => toSarif({ findings: [finding({ severity: 'info' })] }, {}),
+    /Unmapped finding severity/,
+    'an out-of-vocabulary severity must fail closed rather than default',
+  );
 });
 
 // ---------------------------------------------------------------------------

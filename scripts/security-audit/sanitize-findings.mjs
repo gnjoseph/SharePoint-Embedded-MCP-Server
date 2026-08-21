@@ -6,6 +6,7 @@
  * report embeds the matched secret material itself. Neither may be retained as a
  * build artifact on a public repository. This script converts either into a
  * summary that is safe to publish, and the raw report is discarded by the caller.
+ * For Gitleaks the published summary is counts only — see `sanitizeGitleaks`.
  *
  * Usage:
  *   node scripts/security-audit/sanitize-findings.mjs \
@@ -65,20 +66,31 @@ export function sanitizeNpmAudit(raw) {
 }
 
 /**
- * Keeps rule identifiers and file paths. Never the matched secret, its
- * surrounding context, the commit author or the commit message.
+ * Reduces a Gitleaks report to counts only.
+ *
+ * Nothing that locates a finding survives this function: not the matched
+ * secret, not its surrounding context, not the commit author or message, and
+ * — deliberately — not the rule identifier or the file path either. On a
+ * public repository the summary is written to the job summary and uploaded as
+ * an artifact, both of which are world-readable for the lifetime of the run.
+ * A rule identifier plus a file path is enough to tell an observer which file
+ * holds which class of credential before the credential can be rotated, so
+ * that pairing is withheld rather than published.
+ *
+ * `ruleCount` and `fileCount` are cardinalities, not identities: they let a
+ * reader judge blast radius ("14 findings across 2 rules in 9 files") without
+ * disclosing where to look. Triage uses the run logs of the scan step, which
+ * are visible only to accounts with repository write access.
  *
  * @param {unknown} raw Parsed Gitleaks JSON report.
  */
 export function sanitizeGitleaks(raw) {
   const entries = Array.isArray(raw) ? raw : [];
-  /** @type {Record<string, number>} */
-  const byRule = {};
+  const rules = new Set();
   const files = new Set();
 
   for (const entry of entries) {
-    const rule = String(entry?.RuleID ?? entry?.ruleID ?? 'unknown');
-    byRule[rule] = (byRule[rule] ?? 0) + 1;
+    rules.add(String(entry?.RuleID ?? entry?.ruleID ?? 'unknown'));
     const file = entry?.File ?? entry?.file;
     if (file) files.add(String(file));
   }
@@ -86,8 +98,8 @@ export function sanitizeGitleaks(raw) {
   return {
     kind: 'gitleaks',
     total: entries.length,
-    byRule,
-    files: [...files].sort(),
+    ruleCount: rules.size,
+    fileCount: files.size,
   };
 }
 

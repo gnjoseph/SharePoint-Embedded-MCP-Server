@@ -12,7 +12,7 @@
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { TOOL_NAME, TOOL_URI } from './lib/constants.mjs';
+import { SEVERITIES, TOOL_NAME, TOOL_URI } from './lib/constants.mjs';
 
 /** Maps finding severity to a SARIF `level`. */
 const SARIF_LEVEL = Object.freeze({
@@ -29,6 +29,20 @@ const SECURITY_SEVERITY = Object.freeze({
   medium: '5.0',
   low: '2.0',
 });
+
+// The severity vocabulary lives in lib/constants.mjs and is enforced by
+// validate-response.mjs. These two maps must cover it exactly. Without this
+// assertion a new severity would silently degrade to `warning` here and lose
+// its security-severity score, so the drift is made fatal at module load
+// rather than discovered in a SARIF upload.
+for (const severity of SEVERITIES) {
+  if (!(severity in SARIF_LEVEL) || !(severity in SECURITY_SEVERITY)) {
+    throw new Error(
+      `to-sarif.mjs is out of sync with SEVERITIES: no mapping for "${severity}". ` +
+        'Add it to SARIF_LEVEL and SECURITY_SEVERITY.',
+    );
+  }
+}
 
 /**
  * @param {string[]} argv
@@ -75,35 +89,46 @@ export function toSarif(report, options = {}) {
     },
   }));
 
-  const results = findings.map((finding) => ({
-    ruleId: `spe-audit/${finding.category}`,
-    ruleIndex: categories.indexOf(String(finding.category)),
-    level: SARIF_LEVEL[String(finding.severity)] ?? 'warning',
-    message: {
-      text: [
-        String(finding.title),
-        String(finding.detail),
-        `Control: ${finding.control}`,
-        `Confidence: ${finding.confidence}`,
-        `Remediation: ${finding.remediation}`,
-        `Suggested test: ${finding.test}`,
-      ].join('\n\n'),
-    },
-    locations: [
-      {
-        physicalLocation: {
-          artifactLocation: { uri: String(finding.file), uriBaseId: '%SRCROOT%' },
-          region: { startLine: Number(finding.line) },
-        },
+  const results = findings.map((finding) => {
+    const severity = String(finding.severity);
+    // validate-response.mjs rejects any severity outside SEVERITIES before a
+    // report reaches this converter, and the module-load assertion above
+    // guarantees every SEVERITIES entry is mapped. An unmapped severity here
+    // means the sanitized report was not produced by the validator, so fail
+    // closed rather than downgrade it to a warning.
+    if (!(severity in SARIF_LEVEL)) {
+      throw new Error(`Unmapped finding severity "${severity}" in sanitized report.`);
+    }
+    return {
+      ruleId: `spe-audit/${finding.category}`,
+      ruleIndex: categories.indexOf(String(finding.category)),
+      level: SARIF_LEVEL[severity],
+      message: {
+        text: [
+          String(finding.title),
+          String(finding.detail),
+          `Control: ${finding.control}`,
+          `Confidence: ${finding.confidence}`,
+          `Remediation: ${finding.remediation}`,
+          `Suggested test: ${finding.test}`,
+        ].join('\n\n'),
       },
-    ],
-    properties: {
-      'security-severity': SECURITY_SEVERITY[String(finding.severity)] ?? '5.0',
-      confidence: finding.confidence,
-      control: finding.control,
-      synthetic: Boolean(options.synthetic),
-    },
-  }));
+      locations: [
+        {
+          physicalLocation: {
+            artifactLocation: { uri: String(finding.file), uriBaseId: '%SRCROOT%' },
+            region: { startLine: Number(finding.line) },
+          },
+        },
+      ],
+      properties: {
+        'security-severity': SECURITY_SEVERITY[severity],
+        confidence: finding.confidence,
+        control: finding.control,
+        synthetic: Boolean(options.synthetic),
+      },
+    };
+  });
 
   return {
     $schema: 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json',

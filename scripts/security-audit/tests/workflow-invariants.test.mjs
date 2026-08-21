@@ -440,3 +440,90 @@ test('the legacy no-op gitleaks gate is gone from the security workflow', () => 
   assert.match(code, /sha256sum --check --strict/);
   assert.match(code, /exit "\$\{status\}"/);
 });
+
+// The model job ships repository source to an external provider. Running it
+// before the secret scanner has passed would mean a freshly committed
+// credential is egressed to the provider before anyone knows it exists, so the
+// dependency edge is part of the security contract rather than an ordering
+// preference.
+test('the model job cannot run before the secret scan succeeds', () => {
+  const needs = audit.doc.jobs['model-audit'].needs;
+  assert.ok(Array.isArray(needs), 'model-audit needs must be a list');
+  assert.ok(
+    needs.includes('validate-inputs'),
+    'model-audit consumes validate-inputs outputs',
+  );
+  assert.ok(
+    needs.includes('secret-scan'),
+    'no source may reach the provider before the secret scan passes',
+  );
+});
+
+// Secret-scan output is the one artifact that can disclose an unrotated
+// credential's location. Everything published outside the job log must be
+// counts only: a rule identifier paired with a file path tells a reader which
+// file holds which credential class, which is pre-rotation disclosure.
+test('the secret-scan job publishes counts only and deletes the raw report first', () => {
+  const steps = audit.doc.jobs['secret-scan'].steps;
+  const sanitizeIndex = steps.findIndex(
+    (step) => typeof step.run === 'string' && /rm -f \.security-audit\/gitleaks\.json/.test(step.run),
+  );
+  const uploadIndex = steps.findIndex(
+    (step) => typeof step.uses === 'string' && step.uses.startsWith('actions/upload-artifact@'),
+  );
+  assert.ok(sanitizeIndex >= 0, 'the raw gitleaks report must be deleted in-job');
+  assert.ok(uploadIndex >= 0, 'the sanitized summary is uploaded');
+  assert.ok(
+    sanitizeIndex < uploadIndex,
+    'the raw report must be gone before any upload step runs',
+  );
+
+  const uploadPath = steps[uploadIndex].with.path;
+  assert.equal(uploadPath, '.security-audit/gitleaks-summary.json');
+  assert.equal(
+    /gitleaks\.json$/.test(uploadPath),
+    false,
+    'the raw report must never be uploaded',
+  );
+
+  for (const step of steps) {
+    if (typeof step.run !== 'string') continue;
+    assert.equal(
+      /gitleaks\.json"? >> "?\$\{?GITHUB_STEP_SUMMARY/.test(step.run),
+      false,
+      'the raw report must never reach the public job summary',
+    );
+  }
+});
+
+// `npm install -g <pkg>@<version>` still resolves ranged transitive
+// dependencies at install time, so the installed tree is not reproducible.
+// The tool is installed from a committed manifest instead, and the job fails
+// closed when the accompanying lockfile has not been provisioned.
+test('the Copilot CLI is installed reproducibly from a committed manifest', () => {
+  const code = audit.code;
+  assert.equal(
+    /npm install -g/.test(code),
+    false,
+    'a global ranged install is not reproducible',
+  );
+  assert.match(code, /npm ci --ignore-scripts/);
+  assert.match(code, /if \[ ! -f tools\/copilot-cli\/package-lock\.json \]/);
+  assert.match(code, /exit 1/);
+
+  const inference = audit.doc.jobs['model-audit'].steps.find(
+    (step) => typeof step.uses === 'string' && step.uses.startsWith('actions/ai-inference@'),
+  );
+  assert.ok(inference, 'the model job runs the inference action');
+  assert.equal(
+    inference.with['copilot-cli-path'],
+    'tools/copilot-cli/node_modules/.bin/copilot',
+  );
+
+  const manifest = JSON.parse(
+    readFileSync(path.join(REPO_ROOT, 'tools', 'copilot-cli', 'package.json'), 'utf8'),
+  );
+  assert.equal(manifest.private, true, 'the tool manifest must never be published');
+  const pin = manifest.dependencies['@github/copilot'];
+  assert.match(pin, /^\d+\.\d+\.\d+/, 'the Copilot CLI must be pinned to an exact version');
+});

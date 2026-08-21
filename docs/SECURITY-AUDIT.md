@@ -167,27 +167,68 @@ Individual stages can be run directly — see
 ## Triaging results
 
 1. **Deterministic findings are authoritative.** CodeQL and dependency findings appear in the
-   **Security** tab. Secret-scan hits are reported as file + rule + line; open the file at that
-   line to confirm, then rotate the credential *before* removing it from the source.
-2. **Model findings are leads, not verdicts.** Each accepted finding carries a confidence and a
+   **Security** tab.
+2. **Secret-scan hits publish counts only.** The job summary and the `secret-scan-summary`
+   artifact are world-readable on a public repository, so they carry `total`, `ruleCount` and
+   `fileCount` — never rule identifiers and never file paths. A rule id paired with a path
+   states which file holds which class of credential, which is exactly the pre-rotation
+   disclosure an attacker wants. To locate a hit, open the **`Scan for committed secrets`**
+   step log of the failing run (visible to collaborators with read access to Actions logs);
+   the scanner runs with `--redact`, so the log shows location without the secret value.
+   The raw Gitleaks report is deleted inside the job and is never uploaded. Rotate the
+   credential *before* removing it from source, then re-run the workflow to confirm.
+3. **Model findings are leads, not verdicts.** Each accepted finding carries a confidence and a
    control anchor. Confirm the code path by hand before filing anything.
-3. **Check the rejected list.** A high rejection count usually means the model drifted off the
+4. **Check the rejected list.** A high rejection count usually means the model drifted off the
    corpus or attempted to smuggle content — treat it as a signal about the run, not about the code.
-4. **Report real vulnerabilities privately** per [`SECURITY.md`](../SECURITY.md). Never open a
+5. **Report real vulnerabilities privately** per [`SECURITY.md`](../SECURITY.md). Never open a
    public issue for an unfixed vulnerability.
 
 ## Activating the model-assisted layer
 
-These steps require repository-administrator rights and are deliberately **not** automated.
+The model layer ships **disabled**. Nothing in this repository stores, references or reuses a
+credential, and the deterministic jobs are fully functional without one. Activation requires
+repository-administrator rights and is deliberately **not** automated.
 
-1. Create the `security-audit-ai` environment and protect it: required reviewers, and a
+**Approval gate.** The model layer sends repository source to a third-party inference provider.
+Obtain **CELA and Privacy sign-off before setting `SECURITY_AUDIT_AI_ENABLED`**. Enabling the
+variable is the act that authorizes egress; every other step below is inert without it.
+
+Steps, in order:
+
+1. **Generate and commit the Copilot CLI lockfile.** The install step fails closed when
+   `tools/copilot-cli/package-lock.json` is absent. Generate it on a network with direct access
+   to `registry.npmjs.org` and verify the `resolved` and `integrity` fields before committing —
+   see [`tools/copilot-cli/README.md`](../tools/copilot-cli/README.md).
+2. **Create and protect the `security-audit-ai` environment**: required reviewers, plus a
    deployment-branch rule limited to `main`.
-2. Add a least-scope `COPILOT_PAT` **environment** secret (Copilot Requests only — no `repo`,
-   no `workflow`, no `write:*`), or wire an approved Foundry OIDC configuration instead.
-3. Set the repository variable `SECURITY_AUDIT_AI_ENABLED` to `true`. The job stays skipped
-   until this exists, so the protected environment is never implicitly created.
-4. Validate that the configured model id is accepted by the provider before the first real run;
-   the default (`claude-opus-5`) is an allowlist entry that has not been exercised end to end.
+3. **Add a least-scope `COPILOT_PAT` environment secret** (Copilot Requests only — no `repo`,
+   no `workflow`, no `write:*`). This is the only supported credential path; see the governance
+   requirements below.
+4. **Set the repository variable `SECURITY_AUDIT_AI_ENABLED` to `true`.** The job stays skipped
+   until this variable exists, so the protected environment is never implicitly created.
+5. **Validate the model id** is accepted by the provider before the first real run. The default
+   (`claude-opus-5`) is an allowlist entry that has not been exercised end to end.
+
+### `COPILOT_PAT` governance requirements
+
+These are prerequisites for step 3, not suggestions. If any cannot be met, leave the layer
+disabled — the deterministic jobs are unaffected.
+
+| Requirement | Obligation |
+| --- | --- |
+| Owner | Name a single accountable owner (a team alias, not a personal account) recorded with the environment. A personal token silently inherits that person's entitlements. |
+| Scope | Copilot Requests only. Any `repo`, `workflow`, `write:*` or `admin:*` scope is disqualifying. |
+| Rotation | Rotate on a fixed cadence no longer than the organization's standard for CI credentials, and immediately on any suspected exposure. |
+| Offboarding | Revoke and reissue whenever the owning individual changes role or leaves. Add this to the team's offboarding checklist — an orphaned token keeps working. |
+| Billing | Requests are metered against the token owner's Copilot entitlement. Confirm the cost centre before enabling; a weekly run over the full corpus is not free. |
+| Provider terms | Confirm the provider's terms of service and acceptable-use policy permit automated source analysis for this repository's content. |
+| Retention | Confirm and record how long the provider retains prompts and completions. The corpus is repository source; treat retention as a data-handling decision, not a detail. |
+| Debug logs | Do **not** enable `ACTIONS_STEP_DEBUG` or `ACTIONS_RUNNER_DEBUG` on runs of this workflow. Debug logging can surface prompt and response content into world-readable logs, defeating the redaction boundary. |
+
+There is **no** alternative credential mechanism implemented. If a different provider or an
+OIDC-based flow is adopted later, it must be implemented and reviewed on its own merits — do not
+assume it is available.
 
 Related administrative follow-ups (independent of the model layer):
 
