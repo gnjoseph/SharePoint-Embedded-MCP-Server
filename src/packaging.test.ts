@@ -118,6 +118,7 @@ describe("packaging: THIRD-PARTY-NOTICES", () => {
 describe("packaging: disclosure documents are published", () => {
   const DISCLOSURE_DOCS = [
     "CHANGELOG.md",
+    "CONTRIBUTING.md",
     "NOTICE.md",
     "PRIVACY.md",
     "README.md",
@@ -145,6 +146,28 @@ describe("packaging: disclosure documents are published", () => {
     // `.npmignore` takes precedence over `files` for directory contents; its
     // absence is what makes the allow-list above authoritative.
     expect(existsSync(join(pkgRoot, ".npmignore"))).toBe(false);
+  });
+
+  /**
+   * The README ships in the tarball and links to CONTRIBUTING.md with a *relative*
+   * link, so the doc has to be published for that link to resolve in an installed
+   * copy. This test pins the link target and the allow-list entry together so a
+   * rename of either side fails loudly instead of silently breaking the link.
+   */
+  it("publishes every root document the README links to relatively", () => {
+    const readme = readFileSync(join(pkgRoot, "README.md"), "utf8");
+    const files = (pkg.files ?? []) as string[];
+
+    const linked = new Set<string>();
+    for (const match of readme.matchAll(/\]\(\.?\/?([A-Z][A-Z0-9._-]*\.md)\)/g)) {
+      linked.add(match[1]!);
+    }
+
+    expect(linked, "README should link to CONTRIBUTING.md").toContain("CONTRIBUTING.md");
+    for (const doc of linked) {
+      expect(files, `README links to ${doc}; it must be published`).toContain(doc);
+      expect(existsSync(join(pkgRoot, doc)), `${doc} is missing from the repo`).toBe(true);
+    }
   });
 
   /**

@@ -42,7 +42,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   connection discloses IP address, the static `User-Agent`, standard TLS/HTTP connection
   metadata, and the request time; that no auto-update exists; and
   that Node's built-in `fetch` cannot route through `HTTP(S)_PROXY` — an open, unresolved
-  tradeoff accepted to preserve the zero-runtime-dependency budget.
+  tradeoff accepted to preserve the zero-runtime-dependency budget. `docs/DATA-FLOW.md`
+  states precisely that the registry lookup sends no customer content and no
+  application-level user, tenant, subscription, or install identifier, while the HTTPS
+  connection itself still exposes the source IP address and standard transport metadata —
+  it makes no absolute-anonymity claim.
 - **Informational-only update guidance.** The update notice and `status_get` state that the
   message is informational, that nothing is installed or changed automatically, and that
   updating requires a person to change the MCP client configuration (or reinstall the copy the
@@ -50,8 +54,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   execution-mode neutral (`npx`, global install, or project-local install) and reports the
   package spec to target rather than a single install command. The published package now also
   ships `NOTICE.md`, `PRIVACY.md`, `CHANGELOG.md`, `SUPPORT.md`, `SECURITY.md`,
-  `docs/DATA-FLOW.md`, `docs/SECURITY-CONTROLS.md`, and `docs/TROUBLESHOOTING.md`, so the
-  disclosure links in the installed `README.md` resolve.
+  `CONTRIBUTING.md`, `docs/DATA-FLOW.md`, `docs/SECURITY-CONTROLS.md`, and
+  `docs/TROUBLESHOOTING.md`, so the disclosure links in the installed `README.md` resolve.
 - **Per-instance data directory.** New `--data-dir <path>` flag and `SPE_DATA_DIR`
   environment variable select where the provisioning `state.json` and MSAL token
   cache are stored (precedence: flag > env > default `~/.spe-mcp`). Point each

@@ -16,8 +16,12 @@ MCP client  <--stdio-->  spe-mcp-server (local process)  <--HTTPS-->  Microsoft 
 - Every outbound network call is HTTPS. All calls that carry your data go to a
   **Microsoft-operated** endpoint, made **on your behalf**, using **your** credentials, into
   **your** tenant and subscription. The single exception is an unauthenticated public-package
-  lookup on the npm registry (below), sent without a user identifier, which carries no data of
-  yours.
+  lookup on the npm registry (below). That request sends **no customer content and no
+  application-level user, tenant, subscription, or install identifier** — the package name in
+  the request path is the only application-level content. As with any HTTPS request, the
+  connection itself necessarily exposes your **source IP address** and **standard transport
+  metadata** (TLS handshake and SNI, `Host`/`Accept`/`User-Agent` headers, request timing) to
+  the registry operator; see the endpoint table below for the full disclosure.
 
 ## Outbound endpoints
 
@@ -96,6 +100,8 @@ stamped on outbound Graph/ARM requests. It is **on by default**; set
 new signal — outbound calls simply fall back to the underlying tool's default `User-Agent`
 (the Azure CLI's own token for `az`/`azd`; the Node runtime default for direct Graph calls),
 whose logging is governed by those services' own terms. The npm update check is **not**
-telemetry: it is an inbound-information request (does a newer version exist?) that transmits
-nothing about you and can be disabled independently. See [PRIVACY.md](../PRIVACY.md) for
-details.
+telemetry: it is an inbound-information request (does a newer version exist?) that sends **no
+customer content and no application-level user, tenant, subscription, or install identifier**,
+and can be disabled independently. Like any HTTPS request it still exposes your **source IP
+address** and **standard transport metadata** to the registry operator, as documented in the
+endpoint table above. See [PRIVACY.md](../PRIVACY.md) for details.
