@@ -31,7 +31,7 @@ MCP client  <--stdio-->  spe-mcp-server (local process)  <--HTTPS-->  Microsoft 
 | Microsoft Graph (`graph.microsoft.com`) | Create/manage app registrations, container types, containers, and content | Your delegated token | The requests you invoke, in your tenant | Microsoft first-party, in-tenant |
 | Azure Resource Manager (`management.azure.com`) | Register the `Microsoft.Syntex` provider and wire SPE billing to your subscription | Your Azure token | ARM requests in your subscription | Microsoft first-party, in-subscription |
 | Microsoft Learn MCP (`learn.microsoft.com/api/mcp`) | Read-only public documentation lookup (`docs_search`) | **None** | Documentation queries only — **no customer data** | Microsoft first-party, public docs |
-| Public npm registry (`registry.npmjs.org`, default) | Update check: read the published version list for `@microsoft/spe-mcp` at most once per 24 h (control **SEC-008**) | **None** | Package name in the request path only. Necessarily discloses your **IP address**, the static **`User-Agent`** `spe-mcp-server/<version>`, **standard TLS/HTTP connection metadata** (TLS handshake and SNI, `Host`/`Accept` headers, request timing), and the request time. Opting out of telemetry suppresses this request entirely. **No** customer data, tenant/user/subscription identifier, install GUID, machine name, session ID, or usage data | ⚠️ **Third party (npm, Inc. / GitHub) — not a Microsoft 365 or Azure Online Service; OUTSIDE the Microsoft 365 / Azure compliance boundary and not covered by the Microsoft Product Terms, DPA, or EUDB** |
+| Public npm registry (`registry.npmjs.org`, default) | Update check: read the published version list for `@microsoft/spe-mcp` at most once per 24 h for the same running package version and registry while the shared cache is retained (control **SEC-008**) | **None** | Package name in the request path only. Necessarily discloses your **IP address**, the static **`User-Agent`** `spe-mcp-server/<version>`, **standard TLS/HTTP connection metadata** (TLS handshake and SNI, `Host`/`Accept` headers, request timing), and the request time. Opting out of telemetry suppresses this request entirely. **No** customer data, tenant/user/subscription identifier, install GUID, machine name, session ID, or usage data | ⚠️ **Third party (npm, Inc. / GitHub) — not a Microsoft 365 or Azure Online Service; OUTSIDE the Microsoft 365 / Azure compliance boundary and not covered by the Microsoft Product Terms, DPA, or EUDB** |
 | Configured registry (`SPE_NPM_REGISTRY`, when set) | Same update check, sent to the configured HTTPS endpoint instead of the public npm registry | **None** | Same minimal request shape and observable connection metadata as above | **Configuration-dependent.** The operator, terms, data handling, and compliance boundary are determined by the configured endpoint; the server does not classify it as npm/GitHub or assign it to a boundary |
 
 By default, two calls use public endpoints outside your tenant, and neither carries customer data:
@@ -74,6 +74,21 @@ These never leave your machine:
   have already been notified about — **no identifiers of any kind**. It is **retained until you
   delete it**; `spe-mcp logout` and `spe-mcp auth --reset` remove it, and `status_get` prints
   its full path.
+- The transient owner-only **update-check lock files** (`update-check.json.lock`, plus a recovery
+  lock only while reclaiming an abandoned lock). They contain only the local process ID and
+  lock-acquisition timestamp, serialize stale-cache refreshes and cache suppression writes
+  across processes sharing the data directory, and are removed after use (or reclaimed after 30
+  seconds once the recorded process is no longer alive). Neither value is transmitted or copied
+  to the persistent cache. The refresh-lock owner records the 24-hour attempt in the cache
+  before egress. An abrupt exit while atomically publishing a lock can leave an owner-only
+  `.tmp-*` lock file; the next eligible check cleans it after the same liveness/30-second test,
+  or it remains local until the data directory is deleted.
+- The owner-only **update-check deletion generation** (`update-check.json.deleted`), containing
+  only a timestamp. Logout/reset advances it before deleting the cached registry result so an
+  in-flight refresh cannot recreate that result afterward. It is not transmitted and remains
+  until the data directory is deleted. An abrupt exit during atomic cache replacement can also
+  leave an owner-only `update-check.json.tmp-*` file; the next eligible check removes it after
+  30 seconds, and logout/reset removes it immediately.
 - **stderr** diagnostic logs, with tokens and secrets redacted (`src/logging.ts`).
 
 ## Compliance boundary and EU Data Boundary (EUDB)

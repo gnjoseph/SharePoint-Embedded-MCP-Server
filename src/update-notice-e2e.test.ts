@@ -75,6 +75,12 @@ const SEED_LATEST = "999.0.0";
 const SEED_CHANNEL_VERSION = CHANNEL_TAG ? `999.0.0-${CHANNEL_TAG}.1` : undefined;
 /** Channel-first, exactly as a live check would resolve it. */
 const EXPECTED_LATEST = SEED_CHANNEL_VERSION ?? SEED_LATEST;
+const EXPECTED_NOTIFICATION_KEYS = [
+  ...(CHANNEL_TAG && SEED_CHANNEL_VERSION
+    ? [`channel:${CHANNEL_TAG}:${SEED_CHANNEL_VERSION}`]
+    : []),
+  `stable:${SEED_LATEST}`,
+];
 
 let isolatedHome = "";
 let dataDir = "";
@@ -231,6 +237,7 @@ describe("update notice delivery over spawned JSON-RPC (AB#3219517)", () => {
       expect(update, "structuredContent.updateAvailable should be created").toBeDefined();
       expect(update?.["latest"]).toBe(EXPECTED_LATEST);
       expect(update?.["current"]).toBe(pkg.version);
+      expect(update?.["target"]).toBe(CHANNEL_TAG ? "channel" : "stable");
 
       const second = await callSafeTool(client);
       expect(second.text, "the notice must not repeat within a session").not.toMatch(
@@ -245,7 +252,7 @@ describe("update notice delivery over spawned JSON-RPC (AB#3219517)", () => {
     expect(
       cache?.notifiedFor,
       "delivery should persist the announced target for future processes",
-    ).toEqual([EXPECTED_LATEST]);
+    ).toEqual(EXPECTED_NOTIFICATION_KEYS);
   }, 60000);
 
   // (3) Cross-process suppression: once delivered, never again for that target.
@@ -261,8 +268,8 @@ describe("update notice delivery over spawned JSON-RPC (AB#3219517)", () => {
       await stopServer(client, transport);
     }
 
-    expect(readCacheFile()?.notifiedFor, "suppression list should not grow").toEqual([
-      EXPECTED_LATEST,
-    ]);
+    expect(readCacheFile()?.notifiedFor, "suppression list should not grow").toEqual(
+      EXPECTED_NOTIFICATION_KEYS,
+    );
   }, 60000);
 });

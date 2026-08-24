@@ -66,8 +66,13 @@
  *   strict SemVer parser before it is compared or shown.
  * - Results are cached under the server data dir with the same owner-only
  *   secure-fs primitives as the token cache (SEC-003: 0700 dir / 0600 file, no
- *   symlink traversal), with a 24h TTL applied to successes *and* failures so
- *   the "at most one request per day" promise holds even offline.
+ *   symlink traversal), with a 24h TTL applied to successes *and* failures.
+ * - A cross-process exclusive lock serializes stale-cache refreshes. The process
+ *   that owns it writes a 24h failure reservation BEFORE egress, then replaces
+ *   that reservation with success data after a valid response. For the same
+ *   running package version and registry, concurrent processes, crashes after
+ *   egress, lock errors, and stale-lock recovery therefore cannot cause a
+ *   second request inside the reservation window while the cache is retained.
  *
  * KNOWN LIMITATION (accepted tradeoff, not a sign-off)
  * - Node's built-in `fetch` does not honour `HTTP_PROXY` / `HTTPS_PROXY` /
@@ -75,10 +80,6 @@
  *   which this package deliberately does not take. On a proxy-only network the
  *   probe simply fails closed (silent no-op) rather than bypassing the proxy.
  *   Operators who must not egress at all should turn the check off outright.
- * - Cache writes are last-writer-wins. `secure-fs` has no compare-and-swap, and
- *   this change deliberately does not alter that shared primitive. Two servers
- *   delivering a notice at the same instant can therefore drop one suppression
- *   entry, costing at most one extra notice; tracked as follow-up work.
  *
  * ZERO-NETWORK OPT-OUTS — each skips the check entirely (no request, no notice,
  * no cache read, no cache write): `--no-update-check`, `SPE_MCP_UPDATE_CHECK=false`,
@@ -86,12 +87,18 @@
  * `SPE_MCP_COLLECT_TELEMETRY=false`, any CI marker, and source checkouts.
  */
 
-import { existsSync, unlinkSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, unlinkSync } from "node:fs";
+import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createLogger } from "./logger.js";
 import { getDataDir, getUpdateCacheFile } from "./paths.js";
-import { ensureSecureDir, readSecureFile, writeSecureFile } from "./secure-fs.js";
+import {
+  ensureSecureDir,
+  readSecureFile,
+  tryCreateSecureFileExclusive,
+  writeSecureFileAtomic,
+} from "./secure-fs.js";
 import { isNewer, parseSemver, releaseChannel, type SemVer } from "./semver.js";
 import { applyProductUserAgent } from "./user-agent.js";
 import { PACKAGE_NAME, PACKAGE_VERSION } from "./version.js";
@@ -111,12 +118,21 @@ export const CHECK_TTL_MS = 24 * 60 * 60 * 1000;
 /**
  * How long a failed probe is remembered before retrying.
  *
- * Deliberately identical to {@link CHECK_TTL_MS}: the documented promise is "at
- * most one request per day", and a shorter failure backoff would quietly make
- * that promise false for anyone who is offline (a failing probe would be retried
- * several times a day). Success and failure are both remembered for 24h.
+ * Deliberately identical to {@link CHECK_TTL_MS}: for the same package version
+ * and registry, a shorter failure backoff would quietly retry several times a
+ * day while offline. Success and failure are both remembered for 24h.
  */
 export const FAILURE_BACKOFF_MS = CHECK_TTL_MS;
+
+/**
+ * Age after which an abandoned refresh lock can be reclaimed.
+ *
+ * A normal request is hard-capped at two seconds. Thirty seconds leaves ample
+ * room for scheduling and cache I/O without allowing a crashed process to block
+ * refreshes forever. The pre-request cache reservation below remains the
+ * authoritative 24-hour request gate even when a stale lock is reclaimed.
+ */
+export const REFRESH_LOCK_STALE_MS = 30_000;
 
 /** Cap on remembered "already told the user about this version" entries. */
 const MAX_NOTIFIED_ENTRIES = 10;
@@ -217,6 +233,8 @@ export interface UpdateAvailable {
   readonly current: string;
   /** The newest version on the user's own channel (or stable, when on stable). */
   readonly latest: string;
+  /** Whether {@link latest} is the running prerelease channel or stable target. */
+  readonly target: "channel" | "stable";
   /** Release channel of the running build (`alpha`, `beta`, …), or `null`. */
   readonly channel: string | null;
   /** Newest STABLE release, when it is also newer than the running build. */
@@ -281,11 +299,19 @@ interface UpdateCache {
   notifiedFor: string[];
 }
 
+type NoticeTarget =
+  | { readonly kind: "channel"; readonly channel: string; readonly version: string }
+  | { readonly kind: "stable"; readonly version: string };
+
+interface PendingUpdateNotice extends UpdateNotice {
+  readonly suppressionKeys: readonly string[];
+}
+
 // ---------------------------------------------------------------------------
 // Process-local state
 // ---------------------------------------------------------------------------
 
-let pendingNotice: UpdateNotice | null = null;
+let pendingNotice: PendingUpdateNotice | null = null;
 let status: UpdateCheckStatus = { enabled: true, state: "pending", currentVersion: PACKAGE_VERSION };
 let inFlight: Promise<void> | null = null;
 /** Test-only override for "am I running from an installed package?". */
@@ -617,17 +643,279 @@ function readCache(): UpdateCache | null {
   }
 }
 
-/** Persist the cache with owner-only permissions. Failures are non-fatal. */
-function writeCache(cache: UpdateCache): void {
+/** Persist the cache with owner-only permissions. Returns false on any refusal. */
+function writeCache(cache: UpdateCache): boolean {
   try {
     ensureSecureDir(getDataDir());
-    writeSecureFile(
+    writeSecureFileAtomic(
       getUpdateCacheFile(),
       JSON.stringify({ ...cache, notifiedFor: cache.notifiedFor.slice(-MAX_NOTIFIED_ENTRIES) }, null, 2),
     );
+    return true;
   } catch {
-    // Best-effort: an unwritable cache only costs an extra probe next time.
+    return false;
   }
+}
+
+/** Persistent local generation used to cancel writes that raced cache deletion. */
+function getDeletionGenerationFile(): string {
+  return `${getUpdateCacheFile()}.deleted`;
+}
+
+/** Read the current deletion generation. Corruption fails closed as a new value. */
+function readDeletionGeneration(): string | null {
+  try {
+    return readSecureFile(getDeletionGenerationFile());
+  } catch {
+    return "unreadable";
+  }
+}
+
+/**
+ * Advance the deletion generation before removing the cache.
+ *
+ * A refresh captures the prior value under its lock and verifies it both before
+ * and after each atomic cache replacement. A logout that races the replacement
+ * therefore wins: the refresh removes its own write and never resurrects data.
+ */
+function advanceDeletionGeneration(): boolean {
+  try {
+    ensureSecureDir(getDataDir());
+    const current = readDeletionGeneration();
+    const parsed = current === null ? 0 : Number(current);
+    const next = Math.max(
+      Date.now(),
+      Number.isSafeInteger(parsed) && parsed >= 0 ? parsed + 1 : 1,
+    );
+    writeSecureFileAtomic(getDeletionGenerationFile(), String(next));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function removeCacheFileOnly(): void {
+  try {
+    unlinkSync(getUpdateCacheFile());
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+  }
+}
+
+/**
+ * Atomically persist only while logout's deletion generation is unchanged.
+ * Called under the refresh lock, so deleting our mismatched write cannot remove
+ * a successor refresh's cache.
+ */
+function writeCacheForGeneration(
+  cache: UpdateCache,
+  deletionGeneration: string | null,
+): boolean {
+  if (readDeletionGeneration() !== deletionGeneration) return false;
+  if (!writeCache(cache)) return false;
+  if (readDeletionGeneration() === deletionGeneration) return true;
+  try {
+    removeCacheFileOnly();
+  } catch {
+    // The deletion generation still prevents this process from writing again.
+  }
+  return false;
+}
+
+/** Ephemeral owner-only lock beside the update cache. */
+function getRefreshLockFile(): string {
+  return `${getUpdateCacheFile()}.lock`;
+}
+
+/** Serializes recovery of an abandoned refresh lock. */
+function getRefreshRecoveryLockFile(): string {
+  return `${getRefreshLockFile()}.recovery`;
+}
+
+/**
+ * Whether an owner-only lock path currently exists. A security/read error is
+ * treated as "present" so acquisition fails closed.
+ */
+function secureLockExists(file: string): boolean {
+  try {
+    return readSecureFile(file) !== null;
+  } catch {
+    return true;
+  }
+}
+
+/** Parsed ownership data for one of this module's transient lock files. */
+function lockOwner(raw: string): { pid: number; createdAt: number } | null {
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      !Number.isSafeInteger(parsed["pid"]) ||
+      (parsed["pid"] as number) <= 0 ||
+      typeof parsed["createdAt"] !== "number" ||
+      !Number.isFinite(parsed["createdAt"])
+    ) {
+      return null;
+    }
+    return { pid: parsed["pid"] as number, createdAt: parsed["createdAt"] };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether the local process recorded in a lock may still be alive.
+ *
+ * Anything except an explicit ESRCH/"no such process" result is treated as
+ * alive. In particular, EPERM means the OS knows the process but will not let
+ * us signal it. This conservative check prevents a paused stale owner from
+ * resuming and deleting a replacement lock.
+ */
+function lockOwnerMayBeAlive(raw: string): boolean {
+  const owner = lockOwner(raw);
+  // Malformed metadata can be a partially migrated/corrupt/hostile file. There
+  // is no proof its creator is gone, so fail closed rather than reclaim it.
+  if (!owner) return true;
+  if (owner.pid === process.pid) return true;
+  try {
+    process.kill(owner.pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code !== "ESRCH";
+  }
+}
+
+/**
+ * Remove abandoned temp inodes left if a process exited while atomically
+ * publishing a lock. These names are never synchronization points, so deleting
+ * an old malformed temp is fail-closed: at worst its still-live creator's link
+ * operation fails and no request occurs.
+ */
+function cleanupAbandonedUpdateTemps(now: number): void {
+  const dir = getDataDir();
+  const prefixes = [
+    `${basename(getUpdateCacheFile())}.tmp-`,
+    `${basename(getRefreshLockFile())}.tmp-`,
+    `${basename(getRefreshRecoveryLockFile())}.tmp-`,
+  ];
+  try {
+    for (const name of readdirSync(dir)) {
+      if (!prefixes.some((prefix) => name.startsWith(prefix))) continue;
+      const file = join(dir, name);
+      try {
+        const stat = lstatSync(file);
+        if (stat.isSymbolicLink() || !stat.isFile()) continue;
+        const age = now - stat.mtimeMs;
+        if (!Number.isFinite(age) || age < REFRESH_LOCK_STALE_MS) continue;
+
+        const raw = readSecureFile(file);
+        if (raw === null) continue;
+        const owner = lockOwner(raw);
+        if (owner && lockOwnerMayBeAlive(raw)) continue;
+        unlinkSync(file);
+      } catch {
+        // Best-effort local hygiene; temp cleanup must never enable egress.
+      }
+    }
+  } catch {
+    // Missing/unreadable directory: acquisition below fails closed as usual.
+  }
+}
+
+/**
+ * Remove an abandoned regular-file lock, but never follow or remove a symlink
+ * or non-file entry. Returns true only when the path is absent afterward.
+ *
+ * Refresh-lock callers invoke this while holding the recovery lock. Normal
+ * acquirers check that recovery lock both before and after creating the refresh
+ * lock, closing the stale-observer/replacement race.
+ */
+function removeStaleLock(file: string, now: number): boolean {
+  try {
+    const first = readSecureFile(file);
+    if (first === null) return true;
+
+    const stat = lstatSync(file);
+    if (stat.isSymbolicLink() || !stat.isFile()) return false;
+    const age = now - stat.mtimeMs;
+    if (!Number.isFinite(age) || age < REFRESH_LOCK_STALE_MS) return false;
+    if (lockOwnerMayBeAlive(first)) return false;
+
+    // Re-read the ownership token immediately before unlinking. This narrows
+    // the release/reacquire race so an old observer does not remove a successor
+    // process's lock.
+    if (readSecureFile(file) !== first) return false;
+    unlinkSync(file);
+    return true;
+  } catch (error) {
+    // A concurrent owner may have released the lock after our first check.
+    return (error as NodeJS.ErrnoException)?.code === "ENOENT";
+  }
+}
+
+/**
+ * Atomically acquire the cross-process refresh lock.
+ *
+ * Any filesystem/security error fails closed: no lock means no registry
+ * request. A stale lock is reclaimed once and acquisition is retried.
+ */
+function acquireRefreshLock(now: number): string | null {
+  const file = getRefreshLockFile();
+  const recoveryFile = getRefreshRecoveryLockFile();
+  // The local PID is used only to prove that a stale lock owner is gone before
+  // replacement. It is transient, never enters the cache/request, and is
+  // disclosed in PRIVACY.md.
+  const token = JSON.stringify({ pid: process.pid, createdAt: now });
+  try {
+    ensureSecureDir(getDataDir());
+    cleanupAbandonedUpdateTemps(now);
+
+    // A crashed recovery operation must not block forever. Multiple contenders
+    // may observe it as stale, but each revalidates the main lock under whichever
+    // recovery lock it obtains; a newly created main lock is never stale.
+    if (secureLockExists(recoveryFile) && !removeStaleLock(recoveryFile, now)) {
+      return null;
+    }
+
+    // Fast path. Re-check recovery AFTER the atomic create: if a stale-lock
+    // reclaimer raced us, surrender our lock before any cache write or egress.
+    if (tryCreateSecureFileExclusive(file, token)) {
+      if (secureLockExists(recoveryFile)) {
+        releaseLock(file, token);
+        return null;
+      }
+      return token;
+    }
+
+    const recoveryToken = token;
+    if (!tryCreateSecureFileExclusive(recoveryFile, recoveryToken)) return null;
+    try {
+      // Revalidate under the recovery lock. If another contender replaced the
+      // stale lock, its fresh mtime prevents us from removing it.
+      if (!removeStaleLock(file, now)) return null;
+      return tryCreateSecureFileExclusive(file, token) ? token : null;
+    } finally {
+      releaseLock(recoveryFile, recoveryToken);
+    }
+  } catch {
+    return null;
+  }
+}
+
+/** Release only the lock at `file` created with `token`. */
+function releaseLock(file: string, token: string): void {
+  try {
+    if (readSecureFile(file) !== token) return;
+    unlinkSync(file);
+  } catch {
+    // Best-effort. A surviving lock is reclaimed after REFRESH_LOCK_STALE_MS.
+  }
+}
+
+/** Release only the refresh lock created by this caller. */
+function releaseRefreshLock(token: string): void {
+  releaseLock(getRefreshLockFile(), token);
 }
 
 /** Whether a cache entry is still authoritative for `registry` and this build. */
@@ -642,15 +930,34 @@ function isCacheFresh(cache: UpdateCache, registry: string, now: number): boolea
 /**
  * Delete the local update-check cache.
  *
- * Wired into `spe-mcp logout` (and `auth --reset`) so signing out clears every
- * file this server wrote under the data directory, not just the token cache.
- * Best-effort and never throws: a missing or unremovable file is not an error.
+ * Wired into `spe-mcp logout` (and `auth --reset`) so signing out clears the
+ * cached registry result and cancels in-flight cache writers. Best-effort and
+ * never throws: a missing or unremovable file is not an error.
  */
 export function removeUpdateCache(): void {
   try {
     const file = getUpdateCacheFile();
-    if (!existsSync(file)) return;
-    unlinkSync(file);
+    // Do not create a data directory solely for an empty tombstone. If the data
+    // directory already exists, always advance the generation: a refresh may be
+    // between writing its fully formed temp lock and atomically publishing it,
+    // during which neither the final lock nor cache exists yet.
+    if (!existsSync(getDataDir())) return;
+    if (!advanceDeletionGeneration()) return;
+    removeCacheFileOnly();
+
+    // Cache replacement temps are never synchronization points. Removing one
+    // that belongs to an in-flight writer makes its atomic rename fail closed.
+    const prefix = `${basename(file)}.tmp-`;
+    try {
+      for (const name of readdirSync(getDataDir())) {
+        if (!name.startsWith(prefix)) continue;
+        const candidate = join(getDataDir(), name);
+        const stat = lstatSync(candidate);
+        if (stat.isFile() && !stat.isSymbolicLink()) unlinkSync(candidate);
+      }
+    } catch {
+      // Best-effort cleanup; the generation still prevents resurrection.
+    }
     logger.debug("Removed update-check cache.");
   } catch {
     // Best-effort: leaving the file behind is not a failure worth surfacing.
@@ -676,6 +983,26 @@ function newerTagVersion(
 }
 
 /**
+ * Pick a newer stable target from npm's `latest` tag.
+ *
+ * npm permits any SemVer string in a dist-tag, including prereleases. The name
+ * `latest` alone is therefore not evidence of GA: only a value with no
+ * prerelease identifiers is exposed as the stable target.
+ */
+function newerStableVersion(
+  tags: Record<string, string>,
+  current: SemVer,
+): string | undefined {
+  const raw = Object.prototype.hasOwnProperty.call(tags, "latest")
+    ? tags["latest"]
+    : undefined;
+  if (raw === undefined) return undefined;
+  const parsed = parseSemver(raw);
+  if (!parsed || parsed.prerelease.length > 0) return undefined;
+  return isNewer(parsed, current) ? parsed.raw : undefined;
+}
+
+/**
  * Reconstruct the version a cached result would have pointed at, using exactly
  * the same channel-first rule as a live check. Purely local: this reads the
  * cache file only and never touches the network.
@@ -685,13 +1012,45 @@ function cachedTargetVersion(cache: UpdateCache): string | undefined {
   const current = parseSemver(PACKAGE_VERSION);
   if (current) {
     const channel = releaseChannel(current);
-    const target =
-      newerTagVersion(tags, channel, current) ?? newerTagVersion(tags, "latest", current);
+    const target = newerTagVersion(tags, channel, current) ?? newerStableVersion(tags, current);
     if (target) return target;
   }
-  // Nothing newer is known: still report the newest version we saw, so the
-  // status table can show what the cache actually holds.
-  return cache.channelVersion ?? cache.latest;
+  // Nothing newer on the running channel or on a non-prerelease `latest` tag is
+  // a target for this build. Do not surface an arbitrary cached prerelease as a
+  // stable fallback.
+  return undefined;
+}
+
+/**
+ * Build the public update model from independently selected channel/stable
+ * targets. The channel wins when both are present; stable is then carried as a
+ * separate target rather than inferred from the `latest` tag name.
+ */
+function buildUpdateAvailable(
+  channel: string | null,
+  channelTarget: Extract<NoticeTarget, { kind: "channel" }> | undefined,
+  stableTarget: Extract<NoticeTarget, { kind: "stable" }> | undefined,
+): UpdateAvailable | null {
+  const primary = channelTarget ?? stableTarget;
+  if (!primary) return null;
+
+  return {
+    package: PACKAGE_NAME,
+    current: PACKAGE_VERSION,
+    latest: primary.version,
+    target: primary.kind,
+    channel,
+    ...(channelTarget && stableTarget && stableTarget.version !== primary.version
+      ? {
+          stable: stableTarget.version,
+          stablePackageSpec: `${PACKAGE_NAME}@latest`,
+        }
+      : {}),
+    packageSpec:
+      primary.kind === "channel"
+        ? `${PACKAGE_NAME}@${primary.channel}`
+        : `${PACKAGE_NAME}@latest`,
+  };
 }
 
 /**
@@ -712,7 +1071,7 @@ function cachedTargetVersion(cache: UpdateCache): string | undefined {
 function renderNotice(update: UpdateAvailable): string {
   const lines = [
     `Update available: ${update.package} ${update.current} -> ${update.latest}` +
-      `${update.channel ? ` (${update.channel} channel)` : ""}.`,
+      `${update.target === "channel" && update.channel ? ` (${update.channel} channel)` : ""}.`,
     `This notice is informational only — nothing is installed or changed ` +
       `automatically, and no command should be run in response to it. Updating ` +
       `requires a person to change the MCP client configuration or the installed ` +
@@ -791,7 +1150,40 @@ async function runUpdateCheck(options: StartUpdateCheckOptions): Promise<void> {
 
     const now = Date.now();
     const cached = readCache();
-    const fresh = cached && isCacheFresh(cached, registry, now) ? cached : null;
+    let fresh = cached && isCacheFresh(cached, registry, now) ? cached : null;
+    let refreshLock: string | null = null;
+    let deletionGeneration: string | null = null;
+
+    if (!fresh) {
+      refreshLock = acquireRefreshLock(now);
+      if (refreshLock) {
+        // Another process may have completed between our first cache read and
+        // lock acquisition. Re-check under the lock before reserving a request.
+        const afterLock = readCache();
+        fresh = afterLock && isCacheFresh(afterLock, registry, now) ? afterLock : null;
+      } else {
+        // The lock owner may have completed between contention and this read.
+        // If not, fail closed rather than issuing a concurrent request.
+        const afterContention = readCache();
+        fresh =
+          afterContention && isCacheFresh(afterContention, registry, now)
+            ? afterContention
+            : null;
+        if (!fresh) {
+          status = {
+            enabled: true,
+            state: "unavailable",
+            currentVersion: PACKAGE_VERSION,
+          };
+          return;
+        }
+      }
+    }
+    if (fresh && refreshLock) {
+      releaseRefreshLock(refreshLock);
+      refreshLock = null;
+    }
+    if (!fresh) deletionGeneration = readDeletionGeneration();
 
     let tags: Record<string, string> | null;
     let checkedAt: number;
@@ -817,48 +1209,84 @@ async function runUpdateCheck(options: StartUpdateCheckOptions): Promise<void> {
     } else {
       notifiedFor = cached ? [...cached.notifiedFor] : [];
       checkedAt = now;
-      tags = await fetchDistTags(url, registry);
-      if (tags === null) {
-        writeCache({
+
+      try {
+        // Reserve this 24-hour attempt BEFORE egress. If the process exits after
+        // the request starts but before it can record the response, the failure
+        // reservation still prevents another process from issuing a duplicate.
+        const reserved = writeCacheForGeneration({
           version: 1,
           checkedAt: now,
           currentVersion: PACKAGE_VERSION,
           registry,
           outcome: "failure",
           notifiedFor,
-        });
-        status = {
-          enabled: true,
-          state: "unavailable",
+        }, deletionGeneration);
+        if (!reserved) {
+          status = {
+            enabled: true,
+            state: "unavailable",
+            currentVersion: PACKAGE_VERSION,
+          };
+          return;
+        }
+
+        tags = await fetchDistTags(url, registry);
+        if (tags === null) {
+          status = {
+            enabled: true,
+            state: "unavailable",
+            currentVersion: PACKAGE_VERSION,
+            lastCheckedAt: new Date(now).toISOString(),
+          };
+          return;
+        }
+
+        const channel = releaseChannel(current);
+        const persisted = writeCacheForGeneration({
+          version: 1,
+          checkedAt,
           currentVersion: PACKAGE_VERSION,
-          lastCheckedAt: new Date(now).toISOString(),
-        };
-        return;
+          registry,
+          outcome: "success",
+          latest: tags["latest"],
+          channelTag: channel ?? undefined,
+          channelVersion: channel ? tags[channel] : undefined,
+          notifiedFor,
+        }, deletionGeneration);
+        if (!persisted) {
+          status = {
+            enabled: true,
+            state: "unavailable",
+            currentVersion: PACKAGE_VERSION,
+            lastCheckedAt: new Date(now).toISOString(),
+          };
+          return;
+        }
+      } finally {
+        if (refreshLock) releaseRefreshLock(refreshLock);
       }
     }
 
     const channel = releaseChannel(current);
     const channelVersion = newerTagVersion(tags ?? {}, channel, current);
-    const stableVersion = newerTagVersion(tags ?? {}, "latest", current);
+    const stableVersion = newerStableVersion(tags ?? {}, current);
+    const channelTarget =
+      channel && channelVersion
+        ? ({ kind: "channel", channel, version: channelVersion } as const)
+        : undefined;
+    const stableTarget = stableVersion
+      ? ({ kind: "stable", version: stableVersion } as const)
+      : undefined;
+    const targets: NoticeTarget[] = [
+      ...(channelTarget ? [channelTarget] : []),
+      ...(stableTarget ? [stableTarget] : []),
+    ];
 
     // Prefer the user's own channel; fall back to stable (the only target when
     // the running build is itself a stable release).
-    const latest = channelVersion ?? stableVersion;
+    const latest = channelTarget?.version ?? stableTarget?.version;
     const lastCheckedAt = new Date(checkedAt).toISOString();
-
-    if (!fresh) {
-      writeCache({
-        version: 1,
-        checkedAt,
-        currentVersion: PACKAGE_VERSION,
-        registry,
-        outcome: "success",
-        latest: tags?.["latest"],
-        channelTag: channel ?? undefined,
-        channelVersion: channel ? tags?.[channel] : undefined,
-        notifiedFor,
-      });
-    }
 
     if (!latest) {
       status = {
@@ -871,17 +1299,8 @@ async function runUpdateCheck(options: StartUpdateCheckOptions): Promise<void> {
       return;
     }
 
-    const update: UpdateAvailable = {
-      package: PACKAGE_NAME,
-      current: PACKAGE_VERSION,
-      latest,
-      channel,
-      // Only call out stable separately when it is a different, additional target.
-      ...(stableVersion && stableVersion !== latest
-        ? { stable: stableVersion, stablePackageSpec: `${PACKAGE_NAME}@latest` }
-        : {}),
-      packageSpec: `${PACKAGE_NAME}@${channelVersion && channel ? channel : "latest"}`,
-    };
+    const update = buildUpdateAvailable(channel, channelTarget, stableTarget);
+    if (!update) return;
 
     status = {
       enabled: true,
@@ -898,9 +1317,31 @@ async function runUpdateCheck(options: StartUpdateCheckOptions): Promise<void> {
     // `takePendingUpdateNotice()` at *delivery* time, not here: a process that
     // probes and then exits before any tool call would otherwise burn the only
     // announcement without the user ever seeing it.
-    if (notifiedFor.includes(latest)) return;
+    const unnotifiedTargets = targets.filter(
+      (target) => !isTargetNotified(notifiedFor, target),
+    );
+    if (unnotifiedTargets.length === 0) return;
 
-    pendingNotice = { text: renderNotice(update), updateAvailable: update };
+    const noticeChannelTarget = unnotifiedTargets.find(
+      (target): target is Extract<NoticeTarget, { kind: "channel" }> =>
+        target.kind === "channel",
+    );
+    const noticeStableTarget = unnotifiedTargets.find(
+      (target): target is Extract<NoticeTarget, { kind: "stable" }> =>
+        target.kind === "stable",
+    );
+    const noticeUpdate = buildUpdateAvailable(
+      channel,
+      noticeChannelTarget,
+      noticeStableTarget,
+    );
+    if (!noticeUpdate) return;
+
+    pendingNotice = {
+      text: renderNotice(noticeUpdate),
+      updateAvailable: noticeUpdate,
+      suppressionKeys: unnotifiedTargets.map(targetSuppressionKey),
+    };
     logger.debug(`Update available: ${PACKAGE_VERSION} -> ${latest}`);
   } catch {
     // A best-effort courtesy must never affect the server.
@@ -947,32 +1388,65 @@ export function startUpdateCheck(options: StartUpdateCheckOptions = {}): void {
  * Cross-process suppression is persisted *here*, at delivery, rather than when
  * the probe found the update: a process that exits before any tool call leaves
  * the cache untouched, so the next process still announces the version. The
- * cache is re-read immediately before writing so a concurrent process's entries
- * are merged rather than clobbered. Known residual risk: two processes that
- * deliver at the same instant can still interleave (last writer wins) and one
- * suppression entry may be lost, costing at most one extra notice; fixing that
- * needs compare-and-swap support in `secure-fs`, tracked as follow-up work.
+ * cache is re-read immediately before writing under the same cross-process lock
+ * as refreshes, so concurrent entries are merged rather than clobbered.
  *
  * An absent cache file is never re-created here: `spe-mcp logout` deletes it,
  * and delivery must not resurrect state the user just erased.
  */
 export function takePendingUpdateNotice(): UpdateNotice | null {
-  const notice = pendingNotice;
+  const pending = pendingNotice;
   pendingNotice = null;
-  if (notice) persistNotified(notice.updateAvailable.latest);
-  return notice;
+  if (!pending) return null;
+  persistNotified(pending.suppressionKeys);
+  return { text: pending.text, updateAvailable: pending.updateAvailable };
 }
 
-/** Record `version` as announced, merging into whatever is on disk right now. */
-function persistNotified(version: string): void {
+/** Namespaced suppression key so channel and stable targets advance independently. */
+function targetSuppressionKey(target: NoticeTarget): string {
+  return target.kind === "stable"
+    ? `stable:${target.version}`
+    : `channel:${target.channel}:${target.version}`;
+}
+
+/**
+ * Backward-compatible suppression check.
+ *
+ * Version-only entries came from cache version 1 before target namespacing. A
+ * matching historical version still counts as delivered; new writes always use
+ * namespaced keys so a channel update cannot suppress a later stable target.
+ */
+function isTargetNotified(notifiedFor: readonly string[], target: NoticeTarget): boolean {
+  return (
+    notifiedFor.includes(targetSuppressionKey(target)) ||
+    notifiedFor.includes(target.version)
+  );
+}
+
+/** Record target keys as announced, serialized with refresh cache writes. */
+function persistNotified(suppressionKeys: readonly string[]): void {
+  let lock: string | null = null;
   try {
+    // No cache (never written, or deleted by logout) => do not create a lock or
+    // resurrect state the user intentionally removed.
+    if (!readCache()) return;
+    lock = acquireRefreshLock(Date.now());
+    if (!lock) return;
+    const deletionGeneration = readDeletionGeneration();
+
     const cache = readCache();
     // No cache (never written, or deleted by logout) => nothing to update.
     if (!cache) return;
-    if (cache.notifiedFor.includes(version)) return;
-    writeCache({ ...cache, notifiedFor: [...cache.notifiedFor, version] });
+    const missing = suppressionKeys.filter((key) => !cache.notifiedFor.includes(key));
+    if (missing.length === 0) return;
+    writeCacheForGeneration(
+      { ...cache, notifiedFor: [...cache.notifiedFor, ...missing] },
+      deletionGeneration,
+    );
   } catch {
     // Best-effort: at worst the notice is shown once more next run.
+  } finally {
+    if (lock) releaseRefreshLock(lock);
   }
 }
 
@@ -1038,7 +1512,18 @@ export const __testing = {
   readCappedText,
   readCache,
   writeCache,
+  getRefreshLockFile,
+  getRefreshRecoveryLockFile,
+  getDeletionGenerationFile,
+  acquireRefreshLock,
+  releaseRefreshLock,
   isCacheFresh,
+  newerStableVersion,
+  targetSuppressionKey,
+  isTargetNotified,
+  lockOwner,
+  lockOwnerMayBeAlive,
+  cleanupAbandonedUpdateTemps,
   renderNotice,
   removeUpdateCache,
   envFlagDisabled,

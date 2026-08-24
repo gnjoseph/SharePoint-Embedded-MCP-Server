@@ -91,9 +91,11 @@ Access can be disabled later with `content_access_revoke`.
 
 ## Update notice: missing, stale, or registry unreachable
 
-The server checks the public npm registry at most once every 24 hours and, if a newer release
-exists, appends a one-line `Update available: …` notice to a single tool result. It never
-blocks, never retries in-band, and **never updates itself** — there is no auto-update.
+The server checks the public npm registry at most once every 24 hours for the same running
+package version and registry across processes sharing the retained data-directory cache. If a
+newer release exists, it appends a one-line
+`Update available: …` notice to a single tool result. It never blocks, never retries in-band,
+and **never updates itself** — there is no auto-update.
 
 Common situations:
 
@@ -102,8 +104,9 @@ Common situations:
   opt-out is set: `SPE_MCP_UPDATE_CHECK=false` (preferred), `--no-update-check`,
   `SPE_NO_UPDATE_CHECK=1` (legacy alias), `NO_UPDATE_NOTIFIER=1`, or
   `SPE_MCP_COLLECT_TELEMETRY=false` (the telemetry opt-out suppresses the registry request
-  entirely; it does not merely omit the `User-Agent`). The notice is also shown only once per detected version
-  per cache. Run `status_get` to see the **Update check** row, which reports the exact state
+  entirely; it does not merely omit the `User-Agent`). Channel and stable targets are suppressed
+  independently, so each detected target version is shown only once per cache. Run `status_get`
+  to see the **Update check** row, which reports the exact state
   and skip reason. When skipped, **no network request, stderr notice, or cache write occurs**.
 - **Offline, proxied, or firewalled registry.** The lookup has a 2-second timeout and fails
   silently; the failure is cached so the server does not retry on every call. `status_get`
@@ -128,6 +131,13 @@ Common situations:
   shown by `status_get`), contains **no identifier**, and is retained until removed. Delete it
   with `spe-mcp logout`, `spe-mcp auth --reset`, or by removing the file manually. Deleting it
   also forces a re-check on the next start.
+- **Multiple server processes start together.** An owner-only `update-check.json.lock` file
+  serializes stale-cache refreshes. The lock owner records the 24-hour attempt before egress;
+  other processes make no request. The lock is normally removed immediately and an abandoned
+  regular-file lock is reclaimed after 30 seconds only after its recorded local process is no
+  longer alive. Lock or cache errors fail closed without contacting the registry. Changing the
+  running package version or registry, or deleting the cache, intentionally starts a new
+  24-hour window.
 
 ## Correlation IDs
 

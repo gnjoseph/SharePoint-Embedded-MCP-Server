@@ -11,7 +11,15 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -22,6 +30,7 @@ import {
   CHECK_TTL_MS,
   FAILURE_BACKOFF_MS,
   MAX_RESPONSE_BYTES,
+  REFRESH_LOCK_STALE_MS,
   REQUEST_TIMEOUT_MS,
   __testing,
   getUpdateStatus,
@@ -50,6 +59,10 @@ const NEWER_STABLE = `${CURRENT.major + 1}.0.0`;
 const NEWER_CHANNEL = CHANNEL ? `${CURRENT.major + 1}.0.0-${CHANNEL}.1` : null;
 /** What the check should settle on: the user's own channel, else stable. */
 const EXPECTED_LATEST = NEWER_CHANNEL ?? NEWER_STABLE;
+const EXPECTED_NOTIFICATION_KEYS = [
+  ...(CHANNEL && NEWER_CHANNEL ? [`channel:${CHANNEL}:${NEWER_CHANNEL}`] : []),
+  `stable:${NEWER_STABLE}`,
+];
 
 /** A registry payload offering a newer build on both `latest` and the channel. */
 function tagsFixture(): Record<string, string> {
@@ -123,6 +136,17 @@ function cacheExists(): boolean {
 
 function readCacheFile(): Record<string, unknown> {
   return JSON.parse(readFileSync(getUpdateCacheFile(), "utf8")) as Record<string, unknown>;
+}
+
+function mockExitedProcess(pid: number): void {
+  vi.spyOn(process, "kill").mockImplementation(
+    ((candidate: number) => {
+      if (candidate === pid) {
+        throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+      }
+      return true;
+    }) as typeof process.kill,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -466,6 +490,7 @@ describe("renderNotice", () => {
       package: PACKAGE_NAME,
       current: "1.0.0-alpha.1",
       latest: "1.0.0-alpha.2",
+      target: "channel",
       channel: "alpha",
       packageSpec: `${PACKAGE_NAME}@alpha`,
     });
@@ -484,6 +509,7 @@ describe("renderNotice", () => {
       package: PACKAGE_NAME,
       current: "1.0.0-alpha.1",
       latest: "1.0.0-alpha.2",
+      target: "channel",
       channel: "alpha",
       packageSpec: `${PACKAGE_NAME}@alpha`,
     });
@@ -507,6 +533,7 @@ describe("renderNotice", () => {
       package: PACKAGE_NAME,
       current: "1.0.0-alpha.1",
       latest: "1.0.0-alpha.2",
+      target: "channel",
       channel: "alpha",
       packageSpec: `${PACKAGE_NAME}@alpha`,
     });
@@ -525,6 +552,7 @@ describe("renderNotice", () => {
       package: PACKAGE_NAME,
       current: "1.0.0-alpha.1",
       latest: "1.0.0-alpha.2",
+      target: "channel",
       channel: "alpha",
       stable: "2.0.0",
       packageSpec: `${PACKAGE_NAME}@alpha`,
@@ -539,6 +567,7 @@ describe("renderNotice", () => {
       package: PACKAGE_NAME,
       current: "1.0.0",
       latest: "1.1.0",
+      target: "stable",
       channel: null,
       packageSpec: `${PACKAGE_NAME}@latest`,
     });
@@ -570,7 +599,9 @@ describe("runUpdateCheck", () => {
     // Take-and-clear: a second consumer must not see it again.
     expect(takePendingUpdateNotice()).toBeNull();
 
-    expect(readCacheFile()["notifiedFor"]).toEqual([EXPECTED_LATEST]);
+    expect(readCacheFile()["notifiedFor"]).toEqual([
+      ...EXPECTED_NOTIFICATION_KEYS,
+    ]);
   });
 
   it("requests the abbreviated packument with the product user agent and no credentials", async () => {
@@ -608,6 +639,88 @@ describe("runUpdateCheck", () => {
     await __testing.runUpdateCheck({});
     expect(getUpdateStatus().state).toBe("update-available");
     expect(takePendingUpdateNotice()).toBeNull();
+  });
+
+  it.runIf(CHANNEL === "alpha")(
+    "announces GA when alpha is unchanged after an earlier alpha notice",
+    async () => {
+      const alpha2 = `${CURRENT.major}.${CURRENT.minor}.${CURRENT.patch}-alpha.2`;
+      const ga = `${CURRENT.major + 1}.0.0`;
+
+      respondWith(packument({ alpha: alpha2 }));
+      await __testing.runUpdateCheck({});
+      const alphaNotice = takePendingUpdateNotice();
+      expect(alphaNotice?.updateAvailable).toMatchObject({
+        latest: alpha2,
+        target: "channel",
+        channel: "alpha",
+      });
+      expect(readCacheFile()["notifiedFor"]).toEqual([`channel:alpha:${alpha2}`]);
+
+      // Restart after the TTL. The alpha target is unchanged, but `latest` has
+      // advanced to GA. Stable suppression must be independent from alpha.
+      __testing.reset();
+      __testing.setInstalled(true);
+      const stale = readCacheFile();
+      writeFileSync(
+        getUpdateCacheFile(),
+        JSON.stringify({ ...stale, checkedAt: Date.now() - CHECK_TTL_MS }),
+        "utf8",
+      );
+      respondWith(packument({ alpha: alpha2, latest: ga }));
+
+      await __testing.runUpdateCheck({});
+      const gaNotice = takePendingUpdateNotice();
+      expect(gaNotice?.updateAvailable).toMatchObject({
+        latest: ga,
+        target: "stable",
+        channel: "alpha",
+      });
+      expect(gaNotice?.updateAvailable.stable).toBeUndefined();
+      expect(gaNotice?.text).toContain(`${PACKAGE_VERSION} -> ${ga}`);
+      expect(gaNotice?.text).not.toContain(alpha2);
+      expect(gaNotice?.text).not.toContain("(alpha channel)");
+      expect(readCacheFile()["notifiedFor"]).toEqual([
+        `channel:alpha:${alpha2}`,
+        `stable:${ga}`,
+      ]);
+    },
+  );
+
+  it("never labels a prerelease value from the latest tag as stable", async () => {
+    const prereleaseLatest = `${CURRENT.major + 2}.0.0-rc.1`;
+    respondWith(
+      packument({
+        latest: prereleaseLatest,
+        ...(CHANNEL && NEWER_CHANNEL ? { [CHANNEL]: NEWER_CHANNEL } : {}),
+      }),
+    );
+
+    await __testing.runUpdateCheck({});
+
+    const status = getUpdateStatus();
+    expect(status.updateAvailable?.stable).toBeUndefined();
+    expect(status.updateAvailable?.stablePackageSpec).toBeUndefined();
+    expect(takePendingUpdateNotice()?.text).not.toContain("Latest stable release");
+    if (!CHANNEL) expect(status.state).toBe("up-to-date");
+  });
+
+  it("does not expose a cached prerelease latest tag as a stable fallback", () => {
+    writeFileSync(
+      getUpdateCacheFile(),
+      JSON.stringify({
+        version: 1,
+        checkedAt: Date.now(),
+        currentVersion: PACKAGE_VERSION,
+        registry: DEFAULT_REGISTRY,
+        outcome: "success",
+        latest: `${CURRENT.major + 2}.0.0-rc.1`,
+        notifiedFor: [],
+      }),
+      "utf8",
+    );
+
+    expect(getUpdateStatus().latestVersion).toBeUndefined();
   });
 
   it("reports up-to-date when the registry offers nothing newer", async () => {
@@ -674,6 +787,168 @@ describe("runUpdateCheck", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(getUpdateStatus().state).toBe("unavailable");
+  });
+
+  it("reserves the 24-hour request window before egress and blocks a concurrent process", async () => {
+    let finishFetch: ((response: Response) => void) | undefined;
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          finishFetch = resolve;
+        }),
+    );
+
+    const first = __testing.runUpdateCheck({});
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    // The failure reservation exists before fetch resolves. A second module
+    // instance/process sharing this data directory sees it as fresh and does
+    // not issue another request.
+    expect(readCacheFile()).toMatchObject({
+      outcome: "failure",
+      currentVersion: PACKAGE_VERSION,
+      registry: DEFAULT_REGISTRY,
+    });
+    await __testing.runUpdateCheck({});
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    finishFetch?.(new Response(packument(tagsFixture()), { status: 200 }));
+    await first;
+    expect(readCacheFile()["outcome"]).toBe("success");
+    expect(existsSync(__testing.getRefreshLockFile())).toBe(false);
+  });
+
+  it("fails closed without egress while another process holds an active refresh lock", async () => {
+    writeFileSync(__testing.getRefreshLockFile(), "other-process", "utf8");
+    respondWith(packument(tagsFixture()));
+
+    await __testing.runUpdateCheck({});
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(cacheExists()).toBe(false);
+    expect(getUpdateStatus().state).toBe("unavailable");
+    expect(readFileSync(__testing.getRefreshLockFile(), "utf8")).toBe("other-process");
+  });
+
+  it("reclaims an abandoned stale refresh lock and completes one request", async () => {
+    const lock = __testing.getRefreshLockFile();
+    const createdAt = Date.now() - REFRESH_LOCK_STALE_MS - 1_000;
+    const deadPid = 999_999_991;
+    mockExitedProcess(deadPid);
+    writeFileSync(lock, JSON.stringify({ pid: deadPid, createdAt }), "utf8");
+    const staleTime = new Date(createdAt);
+    utimesSync(lock, staleTime, staleTime);
+    respondWith(packument(tagsFixture()));
+
+    await __testing.runUpdateCheck({});
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(readCacheFile()["outcome"]).toBe("success");
+    expect(existsSync(lock)).toBe(false);
+  });
+
+  it("fails closed on stale malformed lock metadata", async () => {
+    const lock = __testing.getRefreshLockFile();
+    writeFileSync(lock, "partially-written", "utf8");
+    const staleTime = new Date(Date.now() - REFRESH_LOCK_STALE_MS - 1_000);
+    utimesSync(lock, staleTime, staleTime);
+    respondWith(packument(tagsFixture()));
+
+    await __testing.runUpdateCheck({});
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(getUpdateStatus().state).toBe("unavailable");
+    expect(existsSync(lock)).toBe(true);
+  });
+
+  it("never replaces an old lock while its recorded process is still alive", async () => {
+    const lock = __testing.getRefreshLockFile();
+    writeFileSync(
+      lock,
+      JSON.stringify({
+        pid: process.pid,
+        createdAt: Date.now() - REFRESH_LOCK_STALE_MS - 1_000,
+      }),
+      "utf8",
+    );
+    const staleTime = new Date(Date.now() - REFRESH_LOCK_STALE_MS - 1_000);
+    utimesSync(lock, staleTime, staleTime);
+    respondWith(packument(tagsFixture()));
+
+    await __testing.runUpdateCheck({});
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(getUpdateStatus().state).toBe("unavailable");
+    expect(existsSync(lock)).toBe(true);
+  });
+
+  it("does not remove or bypass a non-file refresh lock entry", async () => {
+    mkdirSync(__testing.getRefreshLockFile());
+    respondWith(packument(tagsFixture()));
+
+    await __testing.runUpdateCheck({});
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(getUpdateStatus().state).toBe("unavailable");
+    expect(existsSync(__testing.getRefreshLockFile())).toBe(true);
+  });
+
+  it("does not acquire or egress while stale-lock recovery is active", async () => {
+    writeFileSync(__testing.getRefreshRecoveryLockFile(), "other-reclaimer", "utf8");
+    respondWith(packument(tagsFixture()));
+
+    await __testing.runUpdateCheck({});
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(getUpdateStatus().state).toBe("unavailable");
+    expect(existsSync(__testing.getRefreshLockFile())).toBe(false);
+  });
+
+  it("reclaims an abandoned recovery lock before acquiring the refresh lock", () => {
+    const recovery = __testing.getRefreshRecoveryLockFile();
+    const createdAt = Date.now() - REFRESH_LOCK_STALE_MS - 1_000;
+    const deadPid = 999_999_992;
+    mockExitedProcess(deadPid);
+    writeFileSync(recovery, JSON.stringify({ pid: deadPid, createdAt }), "utf8");
+    const staleTime = new Date(createdAt);
+    utimesSync(recovery, staleTime, staleTime);
+
+    const token = __testing.acquireRefreshLock(Date.now());
+
+    expect(token).not.toBeNull();
+    expect(existsSync(recovery)).toBe(false);
+    expect(existsSync(__testing.getRefreshLockFile())).toBe(true);
+    __testing.releaseRefreshLock(token as string);
+    expect(existsSync(__testing.getRefreshLockFile())).toBe(false);
+  });
+
+  it("cleans an abandoned atomic-publication temp lock on the next acquisition", () => {
+    const createdAt = Date.now() - REFRESH_LOCK_STALE_MS - 1_000;
+    const deadPid = 999_999_993;
+    mockExitedProcess(deadPid);
+    const tempLock = `${__testing.getRefreshLockFile()}.tmp-abandoned`;
+    writeFileSync(tempLock, JSON.stringify({ pid: deadPid, createdAt }), "utf8");
+    const staleTime = new Date(createdAt);
+    utimesSync(tempLock, staleTime, staleTime);
+
+    const token = __testing.acquireRefreshLock(Date.now());
+
+    expect(token).not.toBeNull();
+    expect(existsSync(tempLock)).toBe(false);
+    __testing.releaseRefreshLock(token as string);
+  });
+
+  it("cleans an abandoned atomic cache temp on the next acquisition", () => {
+    const tempCache = `${getUpdateCacheFile()}.tmp-abandoned`;
+    writeFileSync(tempCache, '{"partial":true}', "utf8");
+    const staleTime = new Date(Date.now() - REFRESH_LOCK_STALE_MS - 1_000);
+    utimesSync(tempCache, staleTime, staleTime);
+
+    const token = __testing.acquireRefreshLock(Date.now());
+
+    expect(token).not.toBeNull();
+    expect(existsSync(tempCache)).toBe(false);
+    __testing.releaseRefreshLock(token as string);
   });
 
   it.each([
@@ -822,7 +1097,7 @@ describe("runUpdateCheck", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("never throws even when the cache directory is unusable", async () => {
+  it("fails closed without egress when the cache directory is unusable", async () => {
     respondWith(packument(tagsFixture()));
     // Point the data dir at a path whose parent is a file: every write fails.
     const blocker = join(dataDir, "blocker");
@@ -830,7 +1105,8 @@ describe("runUpdateCheck", () => {
     setDataDirOverride(join(blocker, "nested"));
 
     await expect(__testing.runUpdateCheck({})).resolves.toBeUndefined();
-    expect(getUpdateStatus().state).toBe("update-available");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(getUpdateStatus().state).toBe("unavailable");
   });
 });
 
@@ -1235,9 +1511,9 @@ describe("privacy: cache retention and deletion", () => {
     }).not.toThrow();
   });
 
-  // Deleting the cache is a privacy promise: after logout there must be no
-  // residue, and delivering a notice that was already in flight must not quietly
-  // recreate the file the user just asked to be removed.
+  // Deleting the cached registry result is a privacy promise. A small local
+  // deletion-generation tombstone may remain to prevent in-flight writers from
+  // quietly recreating the result the user asked to remove.
   it("does not recreate the cache when a pending notice is delivered after deletion", async () => {
     respondWith(packument(tagsFixture()));
     await __testing.runUpdateCheck({});
@@ -1249,6 +1525,31 @@ describe("privacy: cache retention and deletion", () => {
     const notice = takePendingUpdateNotice();
     expect(notice, "a notice was pending before the deletion").not.toBeNull();
     expect(cacheExists(), "delivery must not resurrect a deleted cache").toBe(false);
+  });
+
+  it("does not recreate the cache when logout races an in-flight registry request", async () => {
+    let finishFetch: ((response: Response) => void) | undefined;
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          finishFetch = resolve;
+        }),
+    );
+
+    const check = __testing.runUpdateCheck({});
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(cacheExists(), "pre-egress reservation should exist").toBe(true);
+
+    removeUpdateCache();
+    expect(cacheExists()).toBe(false);
+    expect(existsSync(__testing.getDeletionGenerationFile())).toBe(true);
+
+    finishFetch?.(new Response(packument(tagsFixture()), { status: 200 }));
+    await check;
+
+    expect(cacheExists(), "post-fetch write must not undo logout").toBe(false);
+    expect(takePendingUpdateNotice()).toBeNull();
+    expect(getUpdateStatus().state).toBe("unavailable");
   });
 
   // The CLI is where the deletion is actually triggered. Spawning `logout` would
@@ -1320,7 +1621,8 @@ describe("privacy: status_get reporting is offline", () => {
 
 // ---------------------------------------------------------------------------
 // Code review follow-ups: the notice is only "spent" once a caller has actually
-// received it, one probe per process, and hostile cache content stays inert.
+// received it, refreshes are serialized across processes, and hostile cache
+// content stays inert.
 // ---------------------------------------------------------------------------
 
 describe("notice delivery is what marks a version as notified", () => {
@@ -1339,7 +1641,7 @@ describe("notice delivery is what marks a version as notified", () => {
     expect(readCacheFile()["notifiedFor"]).toEqual([]);
 
     expect(takePendingUpdateNotice()).not.toBeNull();
-    expect(readCacheFile()["notifiedFor"]).toEqual([EXPECTED_LATEST]);
+    expect(readCacheFile()["notifiedFor"]).toEqual(EXPECTED_NOTIFICATION_KEYS);
   });
 
   it("survives a process exit before the notice was delivered", async () => {
@@ -1354,7 +1656,7 @@ describe("notice delivery is what marks a version as notified", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const notice = takePendingUpdateNotice();
     expect(notice?.updateAvailable.latest).toBe(EXPECTED_LATEST);
-    expect(readCacheFile()["notifiedFor"]).toEqual([EXPECTED_LATEST]);
+    expect(readCacheFile()["notifiedFor"]).toEqual(EXPECTED_NOTIFICATION_KEYS);
   });
 
   it("keeps replaying the notice until one restart actually delivers it", async () => {
@@ -1367,7 +1669,7 @@ describe("notice delivery is what marks a version as notified", () => {
     }
 
     expect(takePendingUpdateNotice()).not.toBeNull();
-    expect(readCacheFile()["notifiedFor"]).toEqual([EXPECTED_LATEST]);
+    expect(readCacheFile()["notifiedFor"]).toEqual(EXPECTED_NOTIFICATION_KEYS);
   });
 
   it("merges with the cache written by another process before delivery", async () => {
@@ -1379,7 +1681,7 @@ describe("notice delivery is what marks a version as notified", () => {
     writeFileSync(getUpdateCacheFile(), JSON.stringify(concurrent), "utf8");
 
     expect(takePendingUpdateNotice()).not.toBeNull();
-    expect(readCacheFile()["notifiedFor"]).toEqual(["7.7.7", EXPECTED_LATEST]);
+    expect(readCacheFile()["notifiedFor"]).toEqual(["7.7.7", ...EXPECTED_NOTIFICATION_KEYS]);
   });
 
   it("does not recreate a cache that logout deleted", async () => {

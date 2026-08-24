@@ -135,7 +135,9 @@ package if you installed it globally or locally).
 To make it obvious when you are running an old build, the server checks the
 public npm registry by default (or the HTTPS registry you set with
 `SPE_NPM_REGISTRY`) **once a day, in the background**, for a newer published
-release and — if one exists — appends a short notice to a single tool result:
+release and — if one exists — appends a short notice to a single tool result.
+That daily limit applies to processes sharing the data directory for the same
+running package version and registry while the cache is retained:
 
 ```text
 Update available: @microsoft/spe-mcp 0.2.0-alpha.1 -> 0.2.0-alpha.4 (alpha channel).
@@ -153,8 +155,10 @@ How it behaves:
 - **Never blocks a tool call.** The check is fire-and-forget with a 2-second
   timeout; if the registry is slow or unreachable, the result is simply dropped.
 - **Channel-aware.** A prerelease install (e.g. `alpha`) is compared against its
-  own dist-tag, and a newer **stable** release is mentioned separately.
-- **Quiet.** The notice is shown once per newer version, not on every call.
+  own dist-tag. The `latest` target is mentioned separately as **stable** only
+  when it resolves to a non-prerelease version.
+- **Quiet.** Channel and stable targets are tracked independently, and each is
+  shown once per newer version rather than on every call.
 - **Unauthenticated, without a user identifier.** Exactly one unauthenticated
   `GET` of the package metadata — by default,
   `https://registry.npmjs.org/@microsoft%2fspe-mcp` — with no query string and
@@ -175,7 +179,11 @@ How it behaves:
 - **Cached locally.** The result is stored owner-only at
   `<data dir>/update-check.json` and **kept until you delete it**;
   `spe-mcp logout` and `spe-mcp auth --reset` remove it, and `status_get` prints
-  the path.
+  the path. Processes sharing the data directory coordinate stale-cache
+  refreshes with an owner-only lock and write the 24-hour attempt reservation
+  before egress, preventing concurrent starts or a mid-request process exit from
+  producing another request inside that window. Changing the running package
+  version or registry, or deleting the cache, intentionally starts a new window.
 
 > ⚠️ **Boundary note.** `registry.npmjs.org` is operated by npm, Inc. (GitHub).
 > It is **not a Microsoft 365 or Azure Online Service**, so it is not covered by
@@ -693,7 +701,8 @@ handling of data you send to its online services is described in the
 
 The one destination contacted by default that is **not a Microsoft 365 or Azure Online Service**
 is the public npm registry (`https://registry.npmjs.org`, operated by npm, Inc./GitHub), contacted
-at most once a day by the [update check](#update-notifications) to read the published version list for
+at most once a day per running package version and registry (while the shared cache is retained)
+by the [update check](#update-notifications) to read the published version list for
 `@microsoft/spe-mcp`. ⚠️ Because it is not a Microsoft Online Service, it is **not covered by the
 Microsoft Product Terms, the Microsoft Products and Services Data Protection Addendum (DPA), or
 the EU Data Boundary**, and it is **outside the Microsoft 365 / Azure compliance

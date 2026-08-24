@@ -36,7 +36,9 @@ newer releases, which can also be turned off. Specifically:
   not a separate data feed — and it is **on by default**; set `SPE_MCP_COLLECT_TELEMETRY=false`
   to omit it (see [Turning it off](#turning-it-off)).
 - **Update check (public npm registry by default; configurable).** At most once every 24 hours
-  the tool reads the published version list for `@microsoft/spe-mcp` from
+  for the same running package version and registry, across server processes sharing the same
+  retained data-directory cache, the tool reads the
+  published version list for `@microsoft/spe-mcp` from
   `https://registry.npmjs.org`, or from the HTTPS registry you set with `SPE_NPM_REGISTRY`, so
   it can tell you when a newer release exists (`src/update-check.ts`).
 
@@ -52,8 +54,8 @@ newer releases, which can also be turned off. Specifically:
   > and compliance boundary depend on your configuration; this project does not classify a
   > configured endpoint as npm/GitHub or as inside or outside any particular boundary.
 
-  **Exactly one request is made,** to the exact package path with no query string and no
-  fragment:
+  **Each refresh attempt makes exactly one request,** to the exact package path
+  with no query string and no fragment:
 
   ```text
   GET https://registry.npmjs.org/@microsoft%2fspe-mcp
@@ -81,9 +83,11 @@ newer releases, which can also be turned off. Specifically:
   **What is never sent:** no credentials, tokens, cookies, or `Authorization` header; no
   `.npmrc` and no npm subprocess; **no install GUID, machine identifier, hostname, user name,
   tenant ID, subscription ID, correlation ID, or session ID**; no usage, prompt, or content
-  data; no data about which tools you invoked. The tool generates and stores **no identifier of
-  any kind** for this feature. Redirects are rejected outright, so the request cannot be
-  bounced to a different host.
+  data; no data about which tools you invoked. The request and persistent cache contain **no
+  identifier of any kind**. A transient local lock records the operating-system process ID only
+  to verify that an abandoned lock owner has exited; it is never transmitted or copied into the
+  persistent cache. Redirects are rejected outright, so the request cannot be bounced to a
+  different host.
 
   **No auto-update.** Nothing is downloaded, installed, executed, or modified. The tool only
   *notifies* you; the notice is informational, and acting on it is a human decision — updating
@@ -99,7 +103,26 @@ newer releases, which can also be turned off. Specifically:
   registry URL, a timestamp, and which versions you have already been told about — **no
   identifier**. It is **retained locally until you delete it**: there is no automatic expiry of
   the file itself, only of its freshness. Run `spe-mcp logout` or `spe-mcp auth --reset` to
-  delete it, or remove the file by hand.
+  delete it, or remove the file by hand. A transient owner-only
+  `update-check.json.lock` file (plus a recovery lock only while reclaiming an abandoned lock)
+  coordinates processes that share the data directory. Each contains only the local process ID
+  and lock-acquisition timestamp, is removed after the operation, and an abandoned lock can be
+  reclaimed after 30 seconds only after the recorded process is no longer alive. The
+  refresh-lock owner writes the 24-hour attempt timestamp to the cache
+  before opening the registry connection, so another process cannot start a duplicate request
+  if the first process exits after egress. Changing the running package version or registry, or
+  deleting the cache, intentionally starts a new 24-hour window. If the process exits while
+  atomically publishing a lock, an owner-only `.tmp-*` lock file can remain; the next eligible
+  check removes it after 30 seconds once its recorded process has exited. With no later check it
+  remains local until you delete the data directory. The same atomic-write pattern can leave an
+  owner-only `update-check.json.tmp-*` file after an abrupt exit; it is cleaned by the next
+  eligible check after 30 seconds or by logout/reset.
+
+  Logout/reset also writes an owner-only `update-check.json.deleted` generation containing only
+  a timestamp before deleting the cached result. That local tombstone prevents a registry
+  request already in flight from recreating the cache after deletion. It is not transmitted,
+  does not contain the registry result or any identifier, and remains until the data directory
+  is deleted.
 
   **First-run notice.** Before the **first** network request in a process, the tool prints a
   one-time notice to **stderr** naming the endpoint and how to turn the check off. The default
