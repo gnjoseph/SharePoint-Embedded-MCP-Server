@@ -50,6 +50,10 @@ const SUBMIT_SCRIPT = path.join(REPO_ROOT, 'scripts', 'security-audit', 'submit-
 const SHA = 'a'.repeat(39) + '9';
 const REPO = 'microsoft/SharePoint-Embedded-MCP-Server';
 const TOKEN = 'test-credential';
+const API_BASE = 'http://127.0.0.1:1';
+const DEDUP_STATES = ['triage', 'draft', 'published', 'closed'];
+const PAGE_SIZE = 100;
+const MAX_PAGES = 50;
 
 /** The single line the submitter is permitted to print. */
 const STDOUT_CONTRACT = /^report: (submitted|existing|none|failed)\n$/;
@@ -86,13 +90,19 @@ function writeReport(findings, scope = 'src') {
 /**
  * Minimal stand-in for a `fetch` Response, carrying only what `request` reads.
  *
- * @param {{ status?: number, body?: unknown }} [spec]
+ * @param {{ status?: number, body?: unknown, headers?: Record<string, string> }} [spec]
  */
-function fakeResponse({ status = 200, body = null } = {}) {
+function fakeResponse({ status = 200, body = null, headers = {} } = {}) {
+  const normalizedHeaders = new Map(
+    Object.entries(headers).map(([name, value]) => [name.toLowerCase(), value]),
+  );
   return {
     ok: status >= 200 && status < 300,
     status,
     text: async () => (body === null ? '' : JSON.stringify(body)),
+    headers: {
+      get: (name) => normalizedHeaders.get(name.toLowerCase()) ?? null,
+    },
   };
 }
 
@@ -128,9 +138,12 @@ function stubSleep() {
   return impl;
 }
 
-/** A full dedup page of advisories that do not match. */
-function fullPage() {
-  return Array.from({ length: 100 }, (_, index) => ({ summary: `unrelated ${index}` }));
+/** A same-origin, same-endpoint cursor Link for a dedup state. */
+function nextLink(state, cursor, overrides = {}) {
+  const base = overrides.base ?? API_BASE;
+  const repo = overrides.repo ?? REPO;
+  const query = overrides.query ?? `state=${state}&per_page=100&after=${cursor}`;
+  return `<${base}/repos/${repo}/security-advisories?${query}>; rel="next"`;
 }
 
 /** Requests the submitter made, split by method. */
@@ -357,6 +370,24 @@ test('a persistent 5xx gives up after the retry budget', async () => {
   assert.equal(fetchImpl.calls.length, REPORT_RETRY_LIMIT + 1);
 });
 
+test('a non-idempotent POST is never retried after an ambiguous 5xx', async () => {
+  const fetchImpl = stubFetch(() => ({ status: 503 }));
+  const sleepImpl = stubSleep();
+
+  const result = await request({
+    url: `${API_BASE}/repos/${REPO}/security-advisories/reports`,
+    method: 'POST',
+    token: TOKEN,
+    body: { summary: 'opaque' },
+    fetchImpl,
+    sleepImpl,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(fetchImpl.calls.length, 1);
+  assert.deepEqual(sleepImpl.delays, []);
+});
+
 test('a client error is never retried', async () => {
   for (const status of [403, 404, 422]) {
     const fetchImpl = stubFetch(() => ({ status }));
@@ -393,17 +424,27 @@ test('every request is sent as an authorised, versioned GitHub API call', async 
   assert.equal(call.headers['content-type'], undefined);
 });
 
-// Deduplication. One report per audited commit, across both states a report
-// can be sitting in.
+// Deduplication. One report per audited commit, across every state a report can
+// be sitting in. Cursor URLs come only from validated GitHub Link headers.
 
-test('the dedup scan pages through triage before looking at draft', async () => {
+test('the dedup scan follows a validated cursor before scanning every state', async () => {
   const fetchImpl = stubFetch((_url, _init, index) => {
-    if (index === 0) return { status: 200, body: fullPage() };
+    if (index === 0) {
+      return {
+        status: 200,
+        body: [{ summary: 'unrelated' }],
+        headers: {
+          link:
+            `${nextLink('triage', 'cursor-2')}, ` +
+            `<${API_BASE}/repos/${REPO}/security-advisories?state=triage&per_page=100&after=last>; rel="last"`,
+        },
+      };
+    }
     return { status: 200, body: [] };
   });
 
   const exists = await reportExists({
-    apiBase: 'http://127.0.0.1:1',
+    apiBase: API_BASE,
     repo: REPO,
     token: TOKEN,
     summary: buildSummary(SHA),
@@ -412,22 +453,31 @@ test('the dedup scan pages through triage before looking at draft', async () => 
   });
 
   assert.equal(exists, false);
-  // triage page 1 (full), triage page 2 (short, stop), draft page 1 (short, stop).
-  assert.equal(fetchImpl.calls.length, 3);
-  assert.match(fetchImpl.calls[0].url, /state=triage&per_page=100&page=1$/);
-  assert.match(fetchImpl.calls[1].url, /state=triage&per_page=100&page=2$/);
-  assert.match(fetchImpl.calls[2].url, /state=draft&per_page=100&page=1$/);
+  assert.equal(fetchImpl.calls.length, 5);
+  assert.match(fetchImpl.calls[0].url, /state=triage&per_page=100$/);
+  assert.match(fetchImpl.calls[1].url, /state=triage&per_page=100&after=cursor-2$/);
+  assert.match(fetchImpl.calls[2].url, /state=draft&per_page=100$/);
+  assert.match(fetchImpl.calls[3].url, /state=published&per_page=100$/);
+  assert.match(fetchImpl.calls[4].url, /state=closed&per_page=100$/);
+  assert.equal(fetchImpl.calls.some((call) => /[?&]page=/.test(call.url)), false);
 });
 
 test('a matching summary on a later page counts as an existing report', async () => {
   const summary = buildSummary(SHA);
-  const fetchImpl = stubFetch((_url, _init, index) =>
-    index === 0 ? { status: 200, body: fullPage() } : { status: 200, body: [{ summary }] },
-  );
+  const fetchImpl = stubFetch((_url, _init, index) => {
+    if (index === 0) {
+      return {
+        status: 200,
+        body: [],
+        headers: { link: nextLink('triage', 'later') },
+      };
+    }
+    return { status: 200, body: [{ summary }] };
+  });
 
   assert.equal(
     await reportExists({
-      apiBase: 'http://127.0.0.1:1',
+      apiBase: API_BASE,
       repo: REPO,
       token: TOKEN,
       summary,
@@ -439,23 +489,28 @@ test('a matching summary on a later page counts as an existing report', async ()
   assert.equal(fetchImpl.calls.length, 2);
 });
 
-test('a draft report suppresses a duplicate submission', async () => {
+test('reports in every relevant state suppress duplicate submission', async () => {
   const summary = buildSummary(SHA);
-  const fetchImpl = stubFetch((url) =>
-    url.includes('state=draft') ? { status: 200, body: [{ summary }] } : { status: 200, body: [] },
-  );
+  for (const [stateIndex, state] of DEDUP_STATES.entries()) {
+    const fetchImpl = stubFetch((url) => ({
+      status: 200,
+      body: url.includes(`state=${state}`) ? [{ summary }] : [],
+    }));
 
-  assert.equal(
-    await reportExists({
-      apiBase: 'http://127.0.0.1:1',
-      repo: REPO,
-      token: TOKEN,
-      summary,
-      fetchImpl,
-      sleepImpl: stubSleep(),
-    }),
-    true,
-  );
+    assert.equal(
+      await reportExists({
+        apiBase: API_BASE,
+        repo: REPO,
+        token: TOKEN,
+        summary,
+        fetchImpl,
+        sleepImpl: stubSleep(),
+      }),
+      true,
+      `${state} must be searched`,
+    );
+    assert.equal(fetchImpl.calls.length, stateIndex + 1);
+  }
 });
 
 test('dedup matches the summary exactly, so a retitled report does not mask a new commit', async () => {
@@ -467,7 +522,7 @@ test('dedup matches the summary exactly, so a retitled report does not mask a ne
 
   assert.equal(
     await reportExists({
-      apiBase: 'http://127.0.0.1:1',
+      apiBase: API_BASE,
       repo: REPO,
       token: TOKEN,
       summary,
@@ -476,6 +531,149 @@ test('dedup matches the summary exactly, so a retitled report does not mask a ne
     }),
     false,
   );
+  assert.equal(fetchImpl.calls.length, DEDUP_STATES.length);
+});
+
+test('unsafe or non-cursor advisory continuation links fail closed', async () => {
+  const cases = [
+    nextLink('triage', 'x', { base: 'http://attacker.example.com' }),
+    nextLink('triage', 'x', { repo: 'other/repository' }),
+    `<${API_BASE}/repos/${REPO}/security-advisories/reports?state=triage&after=x>; rel="next"`,
+    nextLink('draft', 'x'),
+    nextLink('triage', 'x', { query: 'state=triage&per_page=100&page=2' }),
+  ];
+
+  for (const link of cases) {
+    const fetchImpl = stubFetch(() => ({
+      status: 200,
+      body: [],
+      headers: { link },
+    }));
+    await assert.rejects(
+      () =>
+        reportExists({
+          apiBase: API_BASE,
+          repo: REPO,
+          token: TOKEN,
+          summary: buildSummary(SHA),
+          fetchImpl,
+          sleepImpl: stubSleep(),
+        }),
+      /advisory pagination/,
+    );
+    assert.equal(fetchImpl.calls.length, 1);
+  }
+});
+
+test('the dedup scan fails closed when the cursor limit still has a next page', async () => {
+  const fetchImpl = stubFetch((_url, _init, index) => ({
+    status: 200,
+    body: [],
+    headers: { link: nextLink('triage', `cursor-${index + 1}`) },
+  }));
+
+  await assert.rejects(
+    () =>
+      reportExists({
+        apiBase: API_BASE,
+        repo: REPO,
+        token: TOKEN,
+        summary: buildSummary(SHA),
+        fetchImpl,
+        sleepImpl: stubSleep(),
+      }),
+    /pagination limit reached/,
+  );
+  assert.equal(fetchImpl.calls.length, MAX_PAGES);
+});
+
+test('a full capped page without a continuation is still deduplication uncertainty', async () => {
+  const fetchImpl = stubFetch((_url, _init, index) => {
+    if (index < MAX_PAGES - 1) {
+      return {
+        status: 200,
+        body: [],
+        headers: { link: nextLink('triage', `cursor-${index + 1}`) },
+      };
+    }
+    return {
+      status: 200,
+      body: Array.from({ length: PAGE_SIZE }, (_, item) => ({ summary: `unrelated ${item}` })),
+    };
+  });
+
+  await assert.rejects(
+    () =>
+      reportExists({
+        apiBase: API_BASE,
+        repo: REPO,
+        token: TOKEN,
+        summary: buildSummary(SHA),
+        fetchImpl,
+        sleepImpl: stubSleep(),
+      }),
+    /pagination limit reached/,
+  );
+  assert.equal(fetchImpl.calls.length, MAX_PAGES);
+});
+
+test('a partial capped page without a continuation proves that state is exhausted', async () => {
+  const fetchImpl = stubFetch((_url, _init, index) => {
+    if (index < MAX_PAGES - 1) {
+      return {
+        status: 200,
+        body: [],
+        headers: { link: nextLink('triage', `cursor-${index + 1}`) },
+      };
+    }
+    return { status: 200, body: [{ summary: 'unrelated' }] };
+  });
+
+  assert.equal(
+    await reportExists({
+      apiBase: API_BASE,
+      repo: REPO,
+      token: TOKEN,
+      summary: buildSummary(SHA),
+      fetchImpl,
+      sleepImpl: stubSleep(),
+    }),
+    false,
+  );
+  assert.equal(fetchImpl.calls.length, MAX_PAGES + DEDUP_STATES.length - 1);
+});
+
+test('pagination uncertainty prevents the report POST entirely', async () => {
+  const fetchImpl = stubFetch((_url, init, index) => {
+    assert.equal(init.method, 'GET', 'uncertainty must prevent every POST');
+    if (index < MAX_PAGES - 1) {
+      return {
+        status: 200,
+        body: [],
+        headers: { link: nextLink('triage', `cursor-${index + 1}`) },
+      };
+    }
+    return {
+      status: 200,
+      body: Array.from({ length: PAGE_SIZE }, (_, item) => ({ summary: `unrelated ${item}` })),
+    };
+  });
+
+  await assert.rejects(
+    () =>
+      submitReport({
+        report: { scope: 'src', findings: [finding()] },
+        sha: SHA,
+        repo: REPO,
+        token: TOKEN,
+        apiBase: API_BASE,
+        fetchImpl,
+        sleepImpl: stubSleep(),
+      }),
+    /pagination limit reached/,
+  );
+  assert.equal(fetchImpl.calls.length, MAX_PAGES);
+  assert.equal(methods(fetchImpl.calls).includes('POST'), false);
 });
 
 test('an unreadable advisory list fails closed', async () => {
@@ -483,7 +681,7 @@ test('an unreadable advisory list fails closed', async () => {
     await assert.rejects(
       () =>
         reportExists({
-          apiBase: 'http://127.0.0.1:1',
+          apiBase: API_BASE,
           repo: REPO,
           token: TOKEN,
           summary: buildSummary(SHA),
@@ -530,7 +728,7 @@ test('findings are submitted as one aggregate report for the audited commit', as
   });
 
   assert.equal(result, REPORT_RESULTS.submitted);
-  assert.deepEqual(methods(fetchImpl.calls), ['GET', 'GET', 'POST']);
+  assert.deepEqual(methods(fetchImpl.calls), ['GET', 'GET', 'GET', 'GET', 'POST']);
 
   const post = fetchImpl.calls.at(-1);
   assert.equal(post.url, `http://127.0.0.1:1/repos/${REPO}/security-advisories/reports`);
@@ -580,8 +778,31 @@ test('a rejected submission fails closed with no fallback publication', async ()
       /report submission was rejected/,
     );
     // One POST, no second attempt down any other route.
-    assert.deepEqual(methods(fetchImpl.calls), ['GET', 'GET', 'POST']);
+    assert.deepEqual(methods(fetchImpl.calls), ['GET', 'GET', 'GET', 'GET', 'POST']);
   }
+});
+
+test('an ambiguous 5xx submission is not retried or published elsewhere', async () => {
+  const fetchImpl = stubFetch((_url, init) =>
+    init.method === 'POST' ? { status: 503 } : { status: 200, body: [] },
+  );
+  const sleepImpl = stubSleep();
+
+  await assert.rejects(
+    () =>
+      submitReport({
+        report: { scope: 'src', findings: [finding()] },
+        sha: SHA,
+        repo: REPO,
+        token: TOKEN,
+        apiBase: API_BASE,
+        fetchImpl,
+        sleepImpl,
+      }),
+    /report submission was rejected/,
+  );
+  assert.deepEqual(methods(fetchImpl.calls), ['GET', 'GET', 'GET', 'GET', 'POST']);
+  assert.deepEqual(sleepImpl.delays, []);
 });
 
 test('a capability failure during dedup never reaches the POST', async () => {
@@ -618,7 +839,7 @@ test('a successful submission prints only the result token', async () => {
     assert.equal(run.stdout, `report: ${REPORT_RESULTS.submitted}\n`);
     assert.match(run.stdout, STDOUT_CONTRACT);
     assert.equal(run.stderr, '');
-    assert.deepEqual(methods(requests), ['GET', 'GET', 'POST']);
+    assert.deepEqual(methods(requests), ['GET', 'GET', 'GET', 'GET', 'POST']);
   });
 });
 

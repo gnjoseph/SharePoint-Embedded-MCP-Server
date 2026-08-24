@@ -43,6 +43,7 @@ import { loadControlCodes } from './lib/controls.mjs';
 import { findRejectReasons, redact } from './lib/redaction.mjs';
 
 const REQUIRED_TEXT_FIELDS = ['title', 'detail', 'remediation', 'test'];
+const IN_GITHUB_ACTIONS = process.env.GITHUB_ACTIONS === 'true';
 
 /**
  * @param {string[]} argv
@@ -67,7 +68,9 @@ function parseArgs(argv) {
 
 /** @param {string} message */
 function fail(message) {
-  process.stderr.write(`security-audit: ${message}\n`);
+  if (!IN_GITHUB_ACTIONS) {
+    process.stderr.write(`security-audit: ${message}\n`);
+  }
   process.exit(1);
 }
 
@@ -133,12 +136,32 @@ export function validateFindings(parsed, manifest, controlCodes) {
     }
 
     const file = typeof finding.file === 'string' ? finding.file.trim() : '';
-    const entry = manifest.files?.[file];
+    const files =
+      manifest &&
+      typeof manifest === 'object' &&
+      manifest.files &&
+      typeof manifest.files === 'object' &&
+      !Array.isArray(manifest.files)
+        ? manifest.files
+        : null;
+    const candidate =
+      files && Object.prototype.hasOwnProperty.call(files, file) ? files[file] : null;
+    const entry =
+      candidate &&
+      typeof candidate === 'object' &&
+      !Array.isArray(candidate) &&
+      Number.isInteger(candidate.lines) &&
+      candidate.lines >= 1
+        ? candidate
+        : null;
     if (!entry) reasons.push('file-not-in-corpus');
 
-    const line = Number(finding.line);
-    if (!Number.isInteger(line) || line < 1) reasons.push('line-not-a-positive-integer');
-    else if (entry && line > entry.lines) reasons.push('line-out-of-range');
+    const line = finding.line;
+    if (typeof line !== 'number' || !Number.isInteger(line) || line < 1) {
+      reasons.push('line-not-a-positive-integer');
+    } else if (entry && line > entry.lines) {
+      reasons.push('line-out-of-range');
+    }
 
     if (!CATEGORIES.includes(finding.category)) reasons.push('category-not-allowlisted');
     if (!SEVERITIES.includes(finding.severity)) reasons.push('severity-not-allowlisted');
@@ -244,15 +267,23 @@ function main() {
 
   writeFileSync(outPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
 
-  process.stdout.write(
-    `security-audit: accepted=${result.accepted.length} rejected=${result.rejected.length} redactions=${result.redactions.length}\n`,
-  );
+  if (!IN_GITHUB_ACTIONS) {
+    process.stdout.write(
+      `security-audit: accepted=${result.accepted.length} rejected=${result.rejected.length} redactions=${result.redactions.length}\n`,
+    );
+  }
 
   if (failClosed) {
-    process.stderr.write(
-      'security-audit: rejected findings detected; failing closed. ' +
-        'The sanitized report was still written and contains only reason codes for the rejected entries.\n',
-    );
+    // The report is intentionally written before this failure so that any
+    // accepted findings can still take the sole permitted egress path. Counts
+    // and rejection/redaction status are not printed in Actions; local runs
+    // retain their diagnostics.
+    if (!IN_GITHUB_ACTIONS) {
+      process.stderr.write(
+        'security-audit: rejected findings detected; failing closed. ' +
+          'The sanitized report was still written and contains only reason codes for the rejected entries.\n',
+      );
+    }
     process.exit(3);
   }
 }

@@ -22,12 +22,39 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24.x
-          cache: npm
-      # `--ignore-scripts` keeps dependency lifecycle scripts (install/postinstall)
-      # from executing on a runner whose only job is to read the lockfile. `npm
-      # audit` resolves advisories from package-lock.json and does not need a
-      # built dependency tree, so nothing here depends on those scripts running.
-      - run: npm ci --ignore-scripts
+
+      # The checked-out PR controls `.npmrc` and every non-manifest project file.
+      # Copy only the package manifests to a runner-owned directory and use
+      # empty runner-owned config files plus an explicit registry for both npm
+      # commands.
+      - name: Prepare isolated dependency workspace
+        env:
+          AUDIT_NPM_DIR: ${{ runner.temp }}/security-audit-npm
+          NPM_USER_CONFIG: ${{ runner.temp }}/security-audit-npm/user.npmrc
+          NPM_GLOBAL_CONFIG: ${{ runner.temp }}/security-audit-npm/global.npmrc
+        run: |
+          set -euo pipefail
+          rm -rf "${AUDIT_NPM_DIR}"
+          mkdir -p "${AUDIT_NPM_DIR}"
+          cp package.json package-lock.json "${AUDIT_NPM_DIR}/"
+          : > "${NPM_USER_CONFIG}"
+          : > "${NPM_GLOBAL_CONFIG}"
+
+      # `--ignore-scripts` prevents dependency lifecycle code from executing.
+      - name: Install dependencies without lifecycle scripts
+        working-directory: ${{ runner.temp }}/security-audit-npm
+        env:
+          NPM_USER_CONFIG: ${{ runner.temp }}/security-audit-npm/user.npmrc
+          NPM_GLOBAL_CONFIG: ${{ runner.temp }}/security-audit-npm/global.npmrc
+        run: |
+          npm ci \
+            --ignore-scripts \
+            --no-audit \
+            --fund=false \
+            --registry=https://registry.npmjs.org/ \
+            --userconfig="${NPM_USER_CONFIG}" \
+            --globalconfig="${NPM_GLOBAL_CONFIG}"
+
       # `npm audit` prints advisory titles, severities, package names, versions
       # and GHSA advisory URLs. On a public repository the Actions log is
       # world-readable, so that output would publish a machine-readable list of
@@ -38,11 +65,21 @@ jobs:
         id: audit
         continue-on-error: true
         shell: bash
+        working-directory: ${{ runner.temp }}/security-audit-npm
+        env:
+          NPM_USER_CONFIG: ${{ runner.temp }}/security-audit-npm/user.npmrc
+          NPM_GLOBAL_CONFIG: ${{ runner.temp }}/security-audit-npm/global.npmrc
         run: |
           set -uo pipefail
-          mkdir -p .security-audit
-          npm audit --audit-level=high --json > .security-audit/npm-audit.json 2>/dev/null
-          exit $?
+          mkdir -p "${GITHUB_WORKSPACE}/.security-audit"
+          npm audit \
+            --package-lock-only \
+            --audit-level=high \
+            --json \
+            --registry=https://registry.npmjs.org/ \
+            --userconfig="${NPM_USER_CONFIG}" \
+            --globalconfig="${NPM_GLOBAL_CONFIG}" \
+            > "${GITHUB_WORKSPACE}/.security-audit/npm-audit.json" 2>/dev/null
 
       - name: Reduce report to sanitized counts
         shell: bash
@@ -55,13 +92,21 @@ jobs:
             --out .security-audit/npm-audit-summary.json
           rm -f .security-audit/npm-audit.json
 
+      - name: Discard dependency audit workspace
+        if: ${{ always() }}
+        env:
+          AUDIT_NPM_DIR: ${{ runner.temp }}/security-audit-npm
+        run: |
+          rm -rf "${AUDIT_NPM_DIR}"
+          rm -f .security-audit/npm-audit.json .security-audit/npm-audit-summary.json
+
       # Generic by design: no package, version, advisory identifier or URL. A
       # maintainer reproduces locally with `npm audit --audit-level=high`.
       - name: Fail if vulnerable dependencies were detected
         if: steps.audit.outcome == 'failure'
         shell: bash
         run: |
-          echo "Security audit: FAIL — details were reported privately to maintainers." >&2
+          echo "Security audit: FAIL" >&2
           exit 1
 
   # Secret scanning that actually scans.
@@ -155,5 +200,5 @@ jobs:
         if: steps.scan.outcome == 'failure'
         shell: bash
         run: |
-          echo "Security audit: FAIL — details were reported privately to maintainers." >&2
+          echo "Security audit: FAIL" >&2
           exit 1

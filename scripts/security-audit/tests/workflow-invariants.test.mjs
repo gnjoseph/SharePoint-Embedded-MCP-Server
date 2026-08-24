@@ -9,12 +9,13 @@ import path from 'node:path';
 import { test } from 'node:test';
 
 import { parseYaml } from '../lib/mini-yaml.mjs';
-import { ALLOWED_MODELS, DEFAULT_MODEL, SCOPES } from '../lib/constants.mjs';
+import { checkWorkflowSource } from '../check-action-pins.mjs';
 
 const REPO_ROOT = path.resolve(import.meta.dirname, '..', '..', '..');
 const WORKFLOW_DIR = path.join(REPO_ROOT, '.github', 'workflows');
 const SCRIPT_DIR = path.join(REPO_ROOT, 'scripts', 'security-audit');
 const AUDIT_WORKFLOW = path.join(WORKFLOW_DIR, 'security-audit.yml');
+const SECURITY_WORKFLOW = path.join(WORKFLOW_DIR, 'security.yml');
 
 // Comments are allowed to name a construct in order to explain why it is
 // absent; only executable lines are checked for the dangerous constructs.
@@ -31,14 +32,16 @@ function readWorkflow(file) {
 }
 
 const audit = readWorkflow(AUDIT_WORKFLOW);
+const security = readWorkflow(SECURITY_WORKFLOW);
 
 test('audit workflow has no pull request triggers', () => {
   const triggers = Object.keys(audit.doc.on);
-  assert.deepEqual(triggers.sort(), ['schedule', 'workflow_dispatch']);
+  assert.deepEqual(triggers.sort(), ['repository_dispatch', 'schedule']);
   assert.equal(triggers.includes('pull_request'), false);
   assert.equal(triggers.includes('pull_request_target'), false);
   assert.equal(triggers.includes('issue_comment'), false);
   assert.equal(triggers.includes('fork'), false);
+  assert.deepEqual(audit.doc.on.repository_dispatch.types, ['security-audit']);
 });
 
 test('audit workflow runs weekly on Monday', () => {
@@ -123,13 +126,20 @@ test('every job declares a timeout and the workflow declares concurrency', () =>
   }
 });
 
-test('manual inputs are constrained to allowlists', () => {
-  const inputs = audit.doc.on.workflow_dispatch.inputs;
-  assert.deepEqual(inputs.model.options.sort(), [...ALLOWED_MODELS].sort());
-  assert.equal(inputs.model.default, DEFAULT_MODEL);
-  assert.deepEqual(inputs.scope.options.sort(), Object.keys(SCOPES).sort());
-  assert.equal(inputs.dry_run.type, 'boolean');
-  assert.equal(inputs.dry_run.default, 'false');
+test('repository-dispatch payload values flow only through the validator', () => {
+  const step = audit.doc.jobs['validate-inputs'].steps.find((entry) =>
+    /validate-target\.mjs/.test(entry.run ?? ''),
+  );
+  assert.ok(step, 'validate-inputs must run validate-target.mjs');
+  assert.match(step.env.INPUT_REF, /github\.event\.client_payload\.ref/);
+  assert.match(step.env.INPUT_SCOPE, /github\.event\.client_payload\.scope/);
+  assert.match(step.env.INPUT_MODEL, /github\.event\.client_payload\.model/);
+  assert.match(step.env.INPUT_DRY_RUN, /github\.event\.client_payload\.dry_run/);
+  assert.match(step.run, /--ref\s+"\$\{INPUT_REF:-\}"/);
+  assert.match(step.run, /--scope\s+"\$\{INPUT_SCOPE:-server-core\}"/);
+  assert.match(step.run, /--model\s+"\$\{INPUT_MODEL:-claude-opus-5\}"/);
+  assert.match(step.run, /--dry-run\s+"\$\{INPUT_DRY_RUN:-false\}"/);
+  assert.equal(/\$\{\{\s*inputs\./.test(audit.code), false);
 });
 
 test('all workflow actions are pinned to 40-hex commit SHAs', () => {
@@ -137,20 +147,11 @@ test('all workflow actions are pinned to 40-hex commit SHAs', () => {
   assert.ok(files.length >= 3, 'expected the repo workflows to be present');
   for (const file of files) {
     const raw = readFileSync(path.join(WORKFLOW_DIR, file), 'utf8');
-    const lines = raw.split(/\r?\n/);
-    lines.forEach((line, index) => {
-      const match = /^\s*(?:-\s+)?uses:\s*(\S+)/.exec(line);
-      if (!match) return;
-      const ref = match[1].replace(/^['"]|['"]$/g, '');
-      if (ref.startsWith('./') || ref.startsWith('docker://')) return;
-      const at = ref.lastIndexOf('@');
-      assert.notEqual(at, -1, `${file}:${index + 1} action has no ref`);
-      assert.match(
-        ref.slice(at + 1),
-        /^[0-9a-f]{40}$/,
-        `${file}:${index + 1} action ${ref} must be SHA-pinned`,
-      );
-    });
+    assert.deepEqual(
+      checkWorkflowSource(raw, file),
+      [],
+      `${file}: every action must satisfy the shared YAML-aware pin policy`,
+    );
   }
 });
 
@@ -201,14 +202,19 @@ test('the dry-run job holds no secret and publishes nothing', () => {
 });
 
 test('dependency install in the audit path never runs repository scripts', () => {
-  const installs = audit.raw.match(/npm (?:ci|install)[^\n]*/g) ?? [];
-  for (const line of installs) {
-    if (line.includes('--global') || line.includes('-g ')) continue;
-    assert.match(
-      line,
-      /--ignore-scripts/,
-      `install without --ignore-scripts executes repository lifecycle code: ${line}`,
-    );
+  for (const workflow of [audit, security]) {
+    for (const [jobName, job] of Object.entries(workflow.doc.jobs ?? {})) {
+      for (const step of job.steps ?? []) {
+        const command = step.run ?? '';
+        if (!/\bnpm (?:ci|install)\b/.test(command)) continue;
+        if (command.includes('--global') || command.includes('-g ')) continue;
+        assert.match(
+          command,
+          /--ignore-scripts/,
+          `${jobName}/${step.name ?? '<unnamed>'}: install may execute lifecycle code`,
+        );
+      }
+    }
   }
 });
 
@@ -370,29 +376,52 @@ test('no helper script is ever executed from the target checkout', () => {
   }
 });
 
-test('npm operations against the audited tree are confined to target/', () => {
-  const job = audit.doc.jobs['dependency-audit'];
-  const npmSteps = (job.steps ?? []).filter((step) =>
-    /^\s*npm (?:ci|audit)\b/m.test(step.run ?? ''),
-  );
-  assert.ok(npmSteps.length >= 2, 'expected npm ci and npm audit steps');
-  for (const step of npmSteps) {
-    assert.equal(
-      step['working-directory'],
-      'target',
-      `npm step "${step.name}" must operate on the audited tree`,
+test('dependency commands use runner-owned workspaces and npm configuration', () => {
+  for (const [label, workflow, jobName, packagePrefix] of [
+    ['weekly audit', audit, 'dependency-audit', 'target/'],
+    ['pull-request gate', security, 'audit', ''],
+  ]) {
+    const job = workflow.doc.jobs[jobName];
+    const prepare = (job.steps ?? []).find((step) =>
+      /Prepare isolated dependency workspace/.test(step.name ?? ''),
     );
+    assert.ok(prepare, `${label}: isolated workspace preparation is required`);
+    assert.match(
+      prepare.run,
+      new RegExp(`cp ${packagePrefix}package\\.json ${packagePrefix}package-lock\\.json`),
+    );
+    assert.match(prepare.run, /: > "\$\{NPM_USER_CONFIG\}"/);
+    assert.match(prepare.run, /: > "\$\{NPM_GLOBAL_CONFIG\}"/);
+
+    const npmSteps = (job.steps ?? []).filter((step) =>
+      /^\s*npm (?:ci|audit)\b/m.test(step.run ?? ''),
+    );
+    assert.equal(npmSteps.length, 2, `${label}: expected npm ci and npm audit`);
+    for (const step of npmSteps) {
+      assert.equal(
+        step['working-directory'],
+        '${{ runner.temp }}/security-audit-npm',
+        `${label}/${step.name}: npm must not run in the checked-out project`,
+      );
+      assert.match(step.run, /--registry=https:\/\/registry\.npmjs\.org\//);
+      assert.match(step.run, /--userconfig="\$\{NPM_USER_CONFIG\}"/);
+      assert.match(step.run, /--globalconfig="\$\{NPM_GLOBAL_CONFIG\}"/);
+    }
+
+    const install = npmSteps.find((step) => /^\s*npm ci\b/m.test(step.run));
+    assert.match(install.run, /--ignore-scripts/);
+    assert.match(install.run, /--no-audit/);
+    assert.match(install.run, /--fund=false/);
+
+    const npmAudit = npmSteps.find((step) => /^\s*npm audit\b/m.test(step.run));
+    assert.match(npmAudit.run, /--package-lock-only/);
+    assert.match(npmAudit.run, /> "[^"]*npm-audit\.json" 2>\/dev\/null/);
+
+    const setupNode = (job.steps ?? []).find((step) =>
+      /actions\/setup-node@/.test(step.uses ?? ''),
+    );
+    assert.equal(setupNode.with.cache, undefined, `${label}: setup-node cache must not consult project npm config`);
   }
-  // setup-node's dependency cache keys off the workspace root lockfile, which
-  // now belongs to the controller rather than the audited commit.
-  const setupNode = (job.steps ?? []).find((step) =>
-    /actions\/setup-node@/.test(step.uses ?? ''),
-  );
-  assert.equal(
-    setupNode.with.cache,
-    undefined,
-    'setup-node caching would key off the controller lockfile, not the audited one',
-  );
 });
 
 // ---------------------------------------------------------------------------
@@ -441,6 +470,65 @@ test('the model job submits a private report attributed to the audited commit', 
     submit.env.SECURITY_ADVISORY_TOKEN,
     /secrets\.SECURITY_ADVISORY_TOKEN/,
   );
+  assert.match(submit.run, /> \/dev\/null/);
+  assert.equal(/2>\s*\/dev\/null/.test(submit.run), false, 'submission stderr must remain available');
+});
+
+test('partial validation submits accepted findings privately before the job fails closed', () => {
+  const steps = audit.doc.jobs['model-audit'].steps;
+  const validateIndex = steps.findIndex((step) => step.id === 'validate');
+  const submitIndex = steps.findIndex((step) => step.id === 'submit');
+  const cleanupIndex = steps.findIndex((step) => /Discard model response/.test(step.name ?? ''));
+  const gateIndex = steps.findIndex((step) =>
+    /steps\.validate\.outcome == 'failure'/.test(step.if ?? ''),
+  );
+
+  assert.ok(validateIndex >= 0, 'validation must have a stable outcome id');
+  assert.equal(steps[validateIndex]['continue-on-error'], 'true');
+  assert.match(steps[validateIndex].run, /> \.security-audit\/model\/validation-diagnostics\.log 2>&1/);
+  assert.match(steps[validateIndex].run, /rm -f \.security-audit\/model\/validation-diagnostics\.log/);
+
+  assert.ok(submitIndex > validateIndex, 'private submission must follow validation');
+  assert.match(steps[submitIndex].if, /always\(\)/);
+  assert.match(steps[submitIndex].if, /hashFiles\('\.security-audit\/model\/report\.json'\)/);
+  assert.equal(
+    /steps\.validate\.outcome == 'success'/.test(steps[submitIndex].if),
+    false,
+    'a partial rejection must not suppress accepted findings',
+  );
+
+  assert.ok(cleanupIndex > submitIndex, 'runner-local response data must be deleted after submission');
+  assert.match(steps[cleanupIndex].run, /rm -f \.security-audit\/model\/report\.json/);
+  assert.match(steps[cleanupIndex].run, /rm -f -- "\$\{RESPONSE_FILE\}"/);
+
+  assert.ok(gateIndex > cleanupIndex, 'the validation failure is re-raised only after submission and cleanup');
+  assert.match(steps[gateIndex].if, /steps\.submit\.outcome == 'skipped'/);
+  assert.equal(steps[gateIndex].run.trim(), 'echo "Security audit: FAIL" >&2\nexit 1');
+});
+
+test('a malformed response cannot invoke submission and still fails generically', () => {
+  const steps = audit.doc.jobs['model-audit'].steps;
+  const validate = steps.find((step) => step.id === 'validate');
+  const submit = steps.find((step) => step.id === 'submit');
+  const gate = steps.find((step) => /steps\.submit\.outcome == 'skipped'/.test(step.if ?? ''));
+
+  assert.ok(validate && submit && gate);
+  assert.match(submit.if, /report\.json/);
+  assert.match(gate.if, /steps\.validate\.outcome == 'failure'/);
+  assert.equal(/cat |tee |GITHUB_STEP_SUMMARY/.test(validate.run), false);
+  assert.equal(/report\.json/.test(gate.run), false);
+  assert.equal(/validation|model|finding|rejected|accepted/i.test(gate.run), false);
+});
+
+test('the summary receives both real and dry-run model job outcomes', () => {
+  const step = audit.doc.jobs.summary.steps.find((entry) =>
+    /summarize\.mjs/.test(entry.run ?? ''),
+  );
+  assert.ok(step, 'the summary job must invoke summarize.mjs');
+  assert.match(step.env.MODEL_RESULT, /needs\.model-audit\.result/);
+  assert.match(step.env.MODEL_DRY_RUN_RESULT, /needs\.model-audit-dry-run\.result/);
+  assert.match(step.run, /--model\s+"\$\{MODEL_RESULT\}"/);
+  assert.match(step.run, /--model-dry-run\s+"\$\{MODEL_DRY_RUN_RESULT\}"/);
 });
 
 test('the advisory credential is scoped to the submit step, never to inference', () => {
@@ -459,21 +547,26 @@ test('the advisory credential is scoped to the submit step, never to inference',
       `step "${step.name}" must not see the advisory credential`,
     );
   }
-  // Only the pre-flight capability guard and the submit step may name it.
-  const holders = (job.steps ?? []).filter((step) =>
-    JSON.stringify(step).includes('SECURITY_ADVISORY_TOKEN'),
+  const guard = (job.steps ?? []).find((step) => step.name === 'Require credentials');
+  assert.ok(guard, 'the model job needs a credential pre-flight guard');
+  assert.equal(guard.env.SECURITY_ADVISORY_TOKEN, undefined);
+  assert.equal(guard.env.COPILOT_PAT, undefined);
+  assert.match(guard.env.HAS_SECURITY_ADVISORY_TOKEN, /secrets\.SECURITY_ADVISORY_TOKEN != ''/);
+  assert.match(guard.env.HAS_COPILOT_PAT, /secrets\.COPILOT_PAT != ''/);
+
+  // The real advisory token value is bound only to the submit process.
+  const holders = (job.steps ?? []).filter(
+    (step) => step.env?.SECURITY_ADVISORY_TOKEN !== undefined,
   );
-  assert.equal(holders.length, 2, 'exactly the guard and the submit step may hold it');
+  assert.deepEqual(holders.map((step) => step.id), ['submit']);
 });
 
 test('the model job fails closed when the advisory credential is missing', () => {
   const job = audit.doc.jobs['model-audit'];
-  const guard = (job.steps ?? []).find(
-    (step) =>
-      /SECURITY_ADVISORY_TOKEN/.test(JSON.stringify(step)) &&
-      !/submit-report\.mjs/.test(step.run ?? ''),
-  );
+  const guard = (job.steps ?? []).find((step) => step.name === 'Require credentials');
   assert.ok(guard, 'the model job needs a credential pre-flight guard');
+  assert.match(guard.run, /HAS_SECURITY_ADVISORY_TOKEN/);
+  assert.match(guard.run, /HAS_COPILOT_PAT/);
   assert.match(guard.run, /exit 1/);
   assert.equal(
     /continue-on-error/.test(JSON.stringify(guard)),
@@ -489,11 +582,10 @@ test('validate-inputs publishes the outputs the attribution gates depend on', ()
   }
 });
 
-// A manual dispatch selects the workflow *and* the controller ref. If that ref is
-// attacker-selectable, every "trusted controller" guarantee collapses, so the
-// validator refuses any dispatch whose controller ref is not main, and every job
-// re-checks-out the controller at the validated main SHA before running a helper.
-test('a manual dispatch is only honoured when the controller ref is main', () => {
+// Repository dispatch is default-branch-only. The validator still checks the
+// runner ref as defence in depth, and every job pins its helper checkout to the
+// validated main SHA.
+test('the trusted dispatch retains a main-ref defence-in-depth guard', () => {
   const job = audit.doc.jobs['validate-inputs'];
   const step = job.steps.find((entry) => /validate-target\.mjs/.test(entry.run ?? ''));
   assert.ok(step, 'validate-inputs must run validate-target.mjs');
@@ -501,8 +593,7 @@ test('a manual dispatch is only honoured when the controller ref is main', () =>
   const source = readFileSync(path.join(SCRIPT_DIR, 'validate-target.mjs'), 'utf8');
   const code = stripComments(source);
 
-  // `GITHUB_REF` / `GITHUB_EVENT_NAME` are supplied automatically by the runner,
-  // so the guard needs no workflow wiring -- but it must actually read them.
+  // `GITHUB_REF` / `GITHUB_EVENT_NAME` are supplied automatically by the runner.
   assert.match(
     code,
     /GITHUB_EVENT_NAME/,
@@ -594,8 +685,57 @@ test('the secret-scan failure message names no rule, path or count', () => {
   const steps = audit.doc.jobs['secret-scan'].steps;
   const gate = steps.find((step) => /steps\.scan\.outcome == 'failure'/.test(step.if ?? ''));
   assert.ok(gate, 'a fail gate must re-raise the suppressed scan failure');
-  assert.match(gate.run, /Security audit: FAIL — details were reported privately to maintainers\./);
+  assert.equal(gate.run.trim(), 'echo "Security audit: FAIL" >&2\nexit 1');
   assert.equal(/gitleaks-summary|RuleID|jq /.test(gate.run), false);
+});
+
+test('both pull-request security gates use the truthful generic failure literal', () => {
+  for (const [jobName, stepId] of [
+    ['audit', 'audit'],
+    ['secrets', 'scan'],
+  ]) {
+    const gate = security.doc.jobs[jobName].steps.find((step) =>
+      new RegExp(`steps\\.${stepId}\\.outcome == 'failure'`).test(step.if ?? ''),
+    );
+    assert.ok(gate, `${jobName}: failure gate must exist`);
+    assert.equal(gate.run.trim(), 'echo "Security audit: FAIL" >&2\nexit 1');
+  }
+  assert.equal(
+    /details were reported privately to maintainers/i.test(security.code),
+    false,
+    'deterministic checks must not imply that a private report exists',
+  );
+});
+
+test('the action-pin job captures detailed CLI diagnostics and emits only generic failure', () => {
+  const steps = audit.doc.jobs['action-pins'].steps;
+  const installIndex = steps.findIndex((step) => step.name === 'Install audit helper dependencies');
+  const check = steps.find((step) => step.id === 'pin-check');
+  const checkIndex = steps.indexOf(check);
+  const gate = steps.find((step) => /steps\.pin-check\.outcome == 'failure'/.test(step.if ?? ''));
+
+  assert.ok(installIndex >= 0, 'the YAML-aware checker dependency must be installed');
+  assert.ok(installIndex < checkIndex, 'the parser must be installed before the checker runs');
+  assert.match(steps[installIndex].run, /npm ci/);
+  assert.match(steps[installIndex].run, /--ignore-scripts/);
+  assert.match(steps[installIndex].run, /--registry=https:\/\/registry\.npmjs\.org\//);
+  assert.equal(
+    audit.doc.jobs['secret-scan'].steps.some(
+      (step) => step.name === 'Install audit helper dependencies',
+    ),
+    false,
+    'the parser install belongs only in the action-pin job',
+  );
+
+  assert.ok(check, 'the action-pin check must expose an outcome to a fail gate');
+  assert.equal(check['continue-on-error'], 'true');
+  assert.match(check.run, /> \.security-audit\/action-pins-diagnostics\.log 2>&1/);
+  assert.match(check.run, /rm -f \.security-audit\/action-pins-diagnostics\.log/);
+  assert.equal(/cat |tee |GITHUB_STEP_SUMMARY/.test(check.run), false);
+
+  assert.ok(gate, 'the captured action-pin failure must be re-raised');
+  assert.equal(gate.run.trim(), 'echo "Security audit: FAIL" >&2\nexit 1');
+  assert.equal(/path|line|action|reason|private|report/i.test(gate.run), false);
 });
 
 // `npm install -g <pkg>@<version>` still resolves ranged transitive

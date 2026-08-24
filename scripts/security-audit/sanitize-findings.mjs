@@ -136,7 +136,9 @@ function main() {
   }
 
   writeFileSync(args.out, `${JSON.stringify(summary, null, 2)}\n`, 'utf8');
-  process.stdout.write(`security-audit: sanitized ${kind} summary written to ${args.out}\n`);
+  if (process.env.GITHUB_ACTIONS !== 'true') {
+    process.stdout.write(`security-audit: sanitized ${kind} summary written to ${args.out}\n`);
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

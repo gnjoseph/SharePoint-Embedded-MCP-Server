@@ -6,10 +6,11 @@
  * A floating tag (`@v4`) is mutable: whoever controls the tag controls what runs
  * inside the workflow, including in the job that holds the advisory credential
  * used to file a private vulnerability report.
- * Local (`./…`) and Docker (`docker://…`) references are out of scope.
+ * Local (`./…`) references are out of scope. Docker references must use an
+ * immutable `sha256` digest.
  *
- * The check is line-based rather than YAML-based so that it still fires on files
- * this repository's YAML subset parser cannot represent.
+ * The check parses YAML before inspecting `uses` mappings. Unsupported or
+ * ambiguous constructs fail closed rather than being ignored.
  *
  * Both surfaces are scanned:
  *   - every `*.yml` / `*.yaml` under the workflow directory, recursively; and
@@ -25,12 +26,159 @@
 import { readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import {
+  LineCounter,
+  isAlias,
+  isMap,
+  isPair,
+  isScalar,
+  isSeq,
+  parseAllDocuments,
+} from 'yaml';
 
-const USES_RE = /^\s*(?:-\s+)?uses:\s*(\S+)\s*(.*)$/;
 const SHA_RE = /^[0-9a-f]{40}$/;
-const VERSION_COMMENT_RE = /#\s*\S+/;
+const DOCKER_DIGEST_RE = /^docker:\/\/[^\s]+@sha256:[0-9a-fA-F]{64}$/;
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'coverage', '.security-audit']);
 const COMPOSITE_NAMES = new Set(['action.yml', 'action.yaml']);
+
+/**
+ * Returns the YAML comment on a physical line, ignoring `#` characters inside
+ * quoted scalars.
+ *
+ * @param {string} line
+ * @returns {string}
+ */
+function lineComment(line) {
+  let inSingle = false;
+  let inDouble = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index];
+    if (character === "'" && !inDouble) {
+      if (inSingle && line[index + 1] === "'") {
+        index += 1;
+        continue;
+      }
+      inSingle = !inSingle;
+      continue;
+    }
+    if (character === '"' && !inSingle) {
+      let escaped = false;
+      for (let cursor = index - 1; cursor >= 0 && line[cursor] === '\\'; cursor -= 1) {
+        escaped = !escaped;
+      }
+      if (!escaped) inDouble = !inDouble;
+      continue;
+    }
+    if (
+      character === '#' &&
+      !inSingle &&
+      !inDouble &&
+      (index === 0 || /\s/u.test(line[index - 1]))
+    ) {
+      return line.slice(index + 1).trim();
+    }
+  }
+  return '';
+}
+
+/**
+ * Parses a workflow or composite action and returns every `uses` mapping.
+ *
+ * The traversal is intentionally schema-agnostic and conservative: a `uses`
+ * key in any mapping is checked. Aliases, anchors, tags, merge keys, complex
+ * keys, multi-document streams, and multi-line `uses` values are rejected
+ * because they can make the executable reference ambiguous.
+ *
+ * @param {string} text
+ * @param {string} file
+ * @returns {Array<{ file: string, line: number, uses: string, comment: string }>}
+ */
+export function extractUses(text, file) {
+  const lineCounter = new LineCounter();
+  const documents = parseAllDocuments(text, {
+    lineCounter,
+    prettyErrors: false,
+    strict: true,
+    uniqueKeys: true,
+  });
+
+  if (documents.length !== 1) {
+    throw new Error(`${file}: expected exactly one YAML document`);
+  }
+
+  const document = documents[0];
+  const problems = [...document.errors, ...document.warnings];
+  if (problems.length > 0) {
+    throw new Error(`${file}: invalid YAML: ${problems[0].message}`);
+  }
+
+  const lines = text.split(/\r?\n/);
+  /** @type {Array<{ file: string, line: number, uses: string, comment: string }>} */
+  const references = [];
+
+  /** @param {unknown} node */
+  function walk(node) {
+    if (node === null || node === undefined) return;
+    if (isAlias(node)) {
+      throw new Error(`${file}: YAML aliases are not supported by the pin policy`);
+    }
+    if (
+      typeof node === 'object' &&
+      node !== null &&
+      ('anchor' in node || 'tag' in node) &&
+      (node.anchor || node.tag)
+    ) {
+      throw new Error(`${file}: YAML anchors and tags are not supported by the pin policy`);
+    }
+    if (isSeq(node)) {
+      for (const item of node.items) walk(item);
+      return;
+    }
+    if (!isMap(node)) return;
+
+    for (const pair of node.items) {
+      if (!isPair(pair) || !isScalar(pair.key) || typeof pair.key.value !== 'string') {
+        throw new Error(`${file}: complex YAML mapping keys are not supported by the pin policy`);
+      }
+      if (pair.key.value === '<<') {
+        throw new Error(`${file}: YAML merge keys are not supported by the pin policy`);
+      }
+
+      if (pair.key.value === 'uses') {
+        if (
+          !isScalar(pair.value) ||
+          typeof pair.value.value !== 'string' ||
+          !pair.key.range ||
+          !pair.value.range
+        ) {
+          throw new Error(`${file}: every uses value must be a scalar string`);
+        }
+
+        const keyPosition = lineCounter.linePos(pair.key.range[0]);
+        const valueStart = lineCounter.linePos(pair.value.range[0]);
+        const valueEnd = lineCounter.linePos(pair.value.range[1]);
+        if (
+          keyPosition.line !== valueStart.line ||
+          valueStart.line !== valueEnd.line
+        ) {
+          throw new Error(`${file}:${keyPosition.line}: multi-line uses values are not supported`);
+        }
+
+        references.push({
+          file,
+          line: keyPosition.line,
+          uses: pair.value.value,
+          comment: lineComment(lines[keyPosition.line - 1] ?? ''),
+        });
+      }
+
+      walk(pair.value);
+    }
+  }
+
+  walk(document.contents);
+  return references;
+}
 
 /**
  * @param {string} text
@@ -40,33 +188,38 @@ const COMPOSITE_NAMES = new Set(['action.yml', 'action.yaml']);
 export function checkWorkflowSource(text, file) {
   /** @type {Array<{ file: string, line: number, uses: string, reason: string }>} */
   const violations = [];
-  const lines = text.split(/\r?\n/);
 
-  lines.forEach((line, index) => {
-    const match = USES_RE.exec(line);
-    if (!match) return;
-
-    const [, reference, trailing] = match;
-    if (reference.startsWith('./') || reference.startsWith('docker://')) return;
-
+  for (const { line, uses: reference, comment } of extractUses(text, file)) {
+    if (reference.startsWith('./')) continue;
     const at = reference.lastIndexOf('@');
-    const record = { file, line: index + 1, uses: reference };
+    const record = { file, line, uses: reference };
+
+    if (reference.startsWith('docker://')) {
+      if (!DOCKER_DIGEST_RE.test(reference)) {
+        violations.push({ ...record, reason: 'not-digest-pinned' });
+        continue;
+      }
+      if (comment === '') {
+        violations.push({ ...record, reason: 'missing-version-comment' });
+      }
+      continue;
+    }
 
     if (at === -1) {
       violations.push({ ...record, reason: 'missing-ref' });
-      return;
+      continue;
     }
 
     const ref = reference.slice(at + 1);
     if (!SHA_RE.test(ref)) {
       violations.push({ ...record, reason: 'not-sha-pinned' });
-      return;
+      continue;
     }
 
-    if (!VERSION_COMMENT_RE.test(trailing)) {
+    if (comment === '') {
       violations.push({ ...record, reason: 'missing-version-comment' });
     }
-  });
+  }
 
   return violations;
 }
@@ -141,7 +294,9 @@ export function collectFiles(dir, predicate) {
         throw new Error(`security-audit: refusing to follow symlink: ${full}`);
       }
       if (entry.isDirectory()) {
-        if (entry.name.startsWith('.') && entry.name !== '.github') continue;
+        // Hidden directories are scanned unless explicitly named here. Local
+        // composite actions often live in `.actions/`; skipping them wholesale
+        // would let nested mutable `uses` references bypass enforcement.
         if (SKIP_DIRS.has(entry.name)) continue;
         const real = assertWithinRoot(rootReal, full);
         if (seen.has(real)) {
@@ -216,9 +371,11 @@ function main() {
   }
 
   if (violations.length === 0) {
-    process.stdout.write(
-      `security-audit: all actions are SHA-pinned across ${scanned} workflow/composite file(s)\n`,
-    );
+    if (process.env.GITHUB_ACTIONS !== 'true') {
+      process.stdout.write(
+        `security-audit: all actions are SHA-pinned across ${scanned} workflow/composite file(s)\n`,
+      );
+    }
     return;
   }
 

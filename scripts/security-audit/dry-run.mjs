@@ -16,11 +16,12 @@
  * and "line must be within range" rather than being handed a pre-baked answer.
  *
  * Disclosure policy: the dry run validates the schema *privately*. Stage output
- * is captured rather than inherited and is echoed only when a stage fails, and
- * the success path prints a single generic line with no file paths, rule names,
- * finding counts or redaction counts. Even though the dry-run corpus is
- * synthetic, the same code path runs in CI against the audited tree, so it must
- * never be capable of printing finding-shaped detail to a public log.
+ * is captured rather than inherited and is echoed only for local failures. In
+ * Actions a failure emits only the fixed generic verdict, and the success path
+ * prints a single generic line with no file paths, rule names, finding counts or
+ * redaction counts. Even though the dry-run corpus is synthetic, the same code
+ * path runs in CI against the audited tree, so it must never be capable of
+ * printing finding-shaped detail to a public log.
  *
  * `--repo-root` selects the tree that is *audited*. It defaults to `.` for local
  * use, and the workflow passes `target` so the dry run reads the separately
@@ -40,6 +41,8 @@ import { corpusDelimiters, DEFAULT_SCOPE, SCOPES } from './lib/constants.mjs';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, '..', '..');
+const IN_GITHUB_ACTIONS = process.env.GITHUB_ACTIONS === 'true';
+const PUBLIC_FAILURE = 'Security audit: FAIL\n';
 
 /**
  * @param {string[]} argv
@@ -88,11 +91,13 @@ function runStage(label, script, scriptArgs, allowedExitCodes = [0]) {
   }
   const code = result.status ?? 1;
   if (!allowedExitCodes.includes(code)) {
-    // Failure path only: surface the captured stage output so a maintainer
-    // running this locally can diagnose it. CI treats a dry-run failure as a
-    // configuration failure, not as a published finding.
-    process.stderr.write(result.stdout ?? '');
-    process.stderr.write(result.stderr ?? '');
+    // Failure path only: surface captured stage output for a local maintainer.
+    // In Actions even fixture-backed stage detail is withheld so this rehearsal
+    // cannot become a bypass around the production logging boundary.
+    if (!IN_GITHUB_ACTIONS) {
+      process.stderr.write(result.stdout ?? '');
+      process.stderr.write(result.stderr ?? '');
+    }
     throw new Error(`${label} exited with ${code} (expected one of ${allowedExitCodes.join(', ')})`);
   }
   return code;
@@ -137,10 +142,9 @@ function main() {
   const args = parseArgs(process.argv.slice(2));
   const scope = args.scope ?? DEFAULT_SCOPE;
   if (!Object.prototype.hasOwnProperty.call(SCOPES, scope)) {
-    process.stderr.write(
-      `dry-run: scope "${scope}" is not allowlisted (expected one of ${Object.keys(SCOPES).join(', ')})\n`,
+    throw new Error(
+      `scope "${scope}" is not allowlisted (expected one of ${Object.keys(SCOPES).join(', ')})`,
     );
-    process.exit(1);
   }
 
   const outDir = resolve(REPO_ROOT, args.out ?? join('.security-audit', 'dry-run'));
@@ -249,7 +253,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   try {
     main();
   } catch (error) {
-    process.stderr.write(`dry-run: ${error.message}\n`);
+    process.stderr.write(IN_GITHUB_ACTIONS ? PUBLIC_FAILURE : `dry-run: ${error.message}\n`);
     process.exit(1);
   }
 }

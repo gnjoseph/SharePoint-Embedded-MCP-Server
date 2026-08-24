@@ -26,7 +26,14 @@ export const REJECT_PATTERNS = Object.freeze([
     label: 'guid',
     pattern: /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/,
   },
-  { label: 'absolute-path-posix', pattern: /(?:^|[\s"'`(])\/(?:home|Users|root|etc|var)\// },
+  {
+    label: 'absolute-path-posix',
+    // A bounded absolute token with at least two path segments. The left
+    // boundary and `(?!\/)` exclude URL `//` sequences; relative prose such as
+    // `src/tools/read.ts` has no leading slash and is not matched.
+    pattern:
+      /(?:^|[\s"'`([{=:;,])\/(?!\/)[A-Za-z0-9._~+@%=-]+(?:\/[A-Za-z0-9._~+@%=-]+)+(?:[)\]}.,;:!?])?(?=$|[\s"'`)\]}>.,;:!?])/u,
+  },
   { label: 'absolute-path-runner', pattern: /\/github\/workspace/ },
   { label: 'absolute-path-windows', pattern: /\b[A-Za-z]:\\(?:[^\s"'`]+)/ },
   { label: 'pipe-to-shell', pattern: /\b(?:curl|wget)\b[^\n|]*\|\s*(?:ba|z|d|k)?sh\b/i },

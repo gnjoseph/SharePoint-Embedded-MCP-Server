@@ -313,9 +313,11 @@ function main() {
     'utf8',
   );
 
-  process.stdout.write(
-    `security-audit: corpus scope=${scope} files=${fileCount} bytes=${totalBytes} skipped=${skipped.length} neutralized=${neutralizedTotal}\n`,
-  );
+  if (process.env.GITHUB_ACTIONS !== 'true') {
+    process.stdout.write(
+      `security-audit: corpus scope=${scope} files=${fileCount} bytes=${totalBytes} skipped=${skipped.length} neutralized=${neutralizedTotal}\n`,
+    );
+  }
 
   if (process.env.GITHUB_OUTPUT) {
     // The nonce is deliberately NOT exported as a step output: it is carried in

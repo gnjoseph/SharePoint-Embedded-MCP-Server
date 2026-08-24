@@ -38,7 +38,7 @@ export const SCOPES = Object.freeze({
   full: ['src/', 'scripts/', '.github/workflows/'],
 });
 
-/** Default scope when `workflow_dispatch` does not supply one. */
+/** Default scope when a schedule or repository-dispatch payload does not supply one. */
 export const DEFAULT_SCOPE = 'server-core';
 
 /**
@@ -86,8 +86,8 @@ export const CORPUS_DENY_PATTERNS = Object.freeze([
 ]);
 
 /**
- * Models the workflow is permitted to request. The `workflow_dispatch` input is
- * validated against this list; anything else aborts before any credential is
+ * Models the workflow is permitted to request. The repository-dispatch payload
+ * is validated against this list; anything else aborts before any credential is
  * touched.
  *
  * The MVP allowlist deliberately holds exactly one entry. Each model family is
@@ -95,8 +95,8 @@ export const CORPUS_DENY_PATTERNS = Object.freeze([
  * covers only the single chain named here. Widening this list changes where
  * repository source is processed, so a new entry requires its own CELA and
  * Privacy determination before it may be added — it is not a configuration
- * detail. Keep this list, the `model` choices in
- * `.github/workflows/security-audit.yml`, and `DEFAULT_MODEL` identical.
+ * detail. Keep this list, the trusted operator documentation, and
+ * `DEFAULT_MODEL` identical.
  */
 export const ALLOWED_MODELS = Object.freeze(['claude-opus-5']);
 
@@ -239,7 +239,7 @@ export const REPORT_RESULTS = Object.freeze({
   failed: 'failed',
 });
 
-/** Retries are attempted for transient 5xx responses only. */
+/** Idempotent GET retries attempted for transient 5xx responses. */
 export const REPORT_RETRY_LIMIT = 2;
 
 /** Fixed delay between retries; deliberately not randomised or exponential. */
@@ -254,8 +254,7 @@ export const REPORT_RETRY_DELAY_MS = 5000;
 export const PUBLIC_SUMMARY_PASS = 'Security audit: PASS';
 
 /** Failure counterpart of {@link PUBLIC_SUMMARY_PASS}. */
-export const PUBLIC_SUMMARY_FAIL =
-  'Security audit: FAIL — details were reported privately to maintainers.';
+export const PUBLIC_SUMMARY_FAIL = 'Security audit: FAIL';
 
 /** Status literals emitted by the audit; asserted by tests and the summary job. */
 export const STATUS = Object.freeze({

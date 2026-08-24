@@ -5,10 +5,10 @@
  * Guarantees enforced here:
  *  - `ref` is a full 40-character hex commit SHA (no branch names, no tags, no
  *    abbreviated SHAs) and is an ancestor of `origin/main`. This prevents the
- *    audit from being pointed at arbitrary unreviewed code via
- *    `workflow_dispatch`.
+ *    audit from being pointed at arbitrary unreviewed code via a
+ *    `repository_dispatch` payload.
  *  - An omitted/empty `ref` (the `schedule` event supplies no inputs, and the
- *    `workflow_dispatch` input defaults to empty) resolves to the current
+ *    dispatch payload may omit the field) resolves to the current
  *    `origin/main` tip. The resolved value is then subjected to the *same*
  *    full-SHA and reachability checks as an operator-supplied value — it is a
  *    default, never a bypass.
@@ -115,8 +115,8 @@ function assertReachableFromMain(sha) {
  * The tip serves three purposes, all of which must agree:
  *
  * 1. The default audit target when no `ref` was supplied — the `schedule` event
- *    passes no inputs at all, and the `workflow_dispatch` input defaults to an
- *    empty string. The returned SHA is *not* trusted implicitly: `main()`
+ *    passes no payload, and a repository dispatch may omit the field. The
+ *    returned SHA is *not* trusted implicitly: `main()`
  *    re-applies the full-SHA shape check and the reachability check to it (the
  *    tip is trivially its own ancestor, so the check is satisfied without being
  *    weakened).
@@ -124,7 +124,7 @@ function assertReachableFromMain(sha) {
  *    current tip or a historical ancestor.
  * 3. The `controller_sha` output that every downstream job pins its *controller*
  *    checkout to, so the helper scripts always come from protected main rather
- *    than from whatever branch the dispatch was started on.
+ *    than from the audited target.
  *
  * Because (3) is a trust boundary, an unresolvable tip is fatal rather than
  * degraded: without it there is no verified commit to pin the controller to.
@@ -170,18 +170,11 @@ function tryResolveMainTip() {
  * Rejects any Actions run whose controller ref is not the protected default
  * branch.
  *
- * `workflow_dispatch` lets any actor with write access choose the branch that
- * supplies *both* the workflow YAML and every helper script it invokes. Without
- * this check a contributor could push `attacker/branch`, weaken
- * `collect-corpus.mjs` or `validate-response.mjs` there, dispatch the audit, and
- * have the run exfiltrate or publish whatever the weakened controller allows.
- *
- * This guard is deliberately defence in depth, not the primary control: the YAML
- * that actually executes for a dispatch is the copy on the event-selected ref,
- * so an actor with write access could simply delete this step. The substantive
- * control is that every job re-checks-out the controller at the validated
- * `controller_sha` (main tip) before running any helper, so the scripts that do
- * the collecting, redacting, and publishing always come from protected main.
+ * The supported `schedule` and `repository_dispatch` events both load the
+ * protected default-branch workflow. Refusing any other Actions ref is defence
+ * in depth around that platform guarantee. The substantive downstream control
+ * remains the explicit checkout of the validated `controller_sha` before any
+ * helper script runs.
  *
  * No-ops outside Actions (`GITHUB_EVENT_NAME` unset) so local runs and unit
  * tests are unaffected.
@@ -203,8 +196,8 @@ function assertControllerRefIsMain() {
 }
 
 function main() {
-  // Runs before argument parsing: a dispatch from an unprotected branch is
-  // rejected regardless of what it asked for.
+  // Runs before argument parsing: an unsupported Actions ref is rejected
+  // regardless of what payload it supplied.
   assertControllerRefIsMain();
 
   const args = parseArgs(process.argv.slice(2));
@@ -213,8 +206,8 @@ function main() {
   // `controller_sha` pin can never describe three different commits.
   const mainTip = requireMainTip();
 
-  // `schedule` supplies no inputs and the dispatch input defaults to empty, so
-  // an absent ref means "audit the current main tip" rather than "invalid".
+  // `schedule` supplies no payload and dispatch may omit ref, so an absent ref
+  // means "audit the current main tip" rather than "invalid".
   const suppliedRef = (args.ref ?? '').trim();
   const ref = suppliedRef === '' ? mainTip : suppliedRef;
   const refSource = suppliedRef === '' ? `default (${BASE_REF})` : 'input';
@@ -253,7 +246,7 @@ function main() {
     target_ref: TARGET_REF,
     // True only when the target *is* the current main tip. Nothing is published
     // publicly on the basis of this flag; it exists so callers can tell a
-    // scheduled tip audit apart from a dispatched historical audit.
+    // scheduled tip audit apart from an operator-requested historical audit.
     is_main_tip: String(ref !== '' && ref === mainTip),
     // The commit the *trusted controller* checkout must pin to. Every job that
     // runs audit helpers checks this commit out at the repository root so the

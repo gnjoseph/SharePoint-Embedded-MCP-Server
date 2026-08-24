@@ -174,12 +174,14 @@ function main() {
   writeFileSync(systemPath, system, 'utf8');
   writeFileSync(promptPath, `${corpus.replace(/\s*$/, '')}\n\n${suffix}`, 'utf8');
 
-  process.stdout.write(
-    `build-prompt: system=${systemPath} prompt=${promptPath} files=${expected} ` +
-      `systemBytes=${Buffer.byteLength(system)} promptBytes=${Buffer.byteLength(
-        readFileSync(promptPath, 'utf8'),
-      )}\n`,
-  );
+  if (process.env.GITHUB_ACTIONS !== 'true') {
+    process.stdout.write(
+      `build-prompt: system=${systemPath} prompt=${promptPath} files=${expected} ` +
+        `systemBytes=${Buffer.byteLength(system)} promptBytes=${Buffer.byteLength(
+          readFileSync(promptPath, 'utf8'),
+        )}\n`,
+    );
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

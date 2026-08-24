@@ -2,14 +2,15 @@
 
 This repository runs a scheduled security audit
 ([`.github/workflows/security-audit.yml`](../.github/workflows/security-audit.yml)) every Monday,
-plus on demand via **Actions → Weekly security audit → Run workflow**.
+plus on demand through the fixed `security-audit` repository-dispatch event. Repository dispatch
+always loads the workflow from the default branch; there is no branch-selectable Actions UI entry.
 
 The audit has two layers:
 
 | Layer | Jobs | Gating |
 | --- | --- | --- |
 | **Deterministic** | dependency audit, secret scan, action pinning | Failures fail the run |
-| **Model-assisted** | `model-audit` (real) / `model-audit-dry-run` (synthetic) | Never gating; findings are reported privately |
+| **Model-assisted** | `model-audit` (real) / `model-audit-dry-run` (synthetic) | Failure or cancellation fails the run; disabled jobs may remain skipped |
 
 > [!IMPORTANT]
 > The model-assisted layer ships **disabled**, and it stays disabled until an administrator
@@ -30,10 +31,10 @@ The audit has two layers:
 > The only two strings the run may write to a public job summary are:
 >
 > - `Security audit: PASS`
-> - `Security audit: FAIL — details were reported privately to maintainers.`
+> - `Security audit: FAIL`
 >
-> `Security audit: PASS` means the deterministic checks passed. It is **not** a statement that
-> the repository is free of vulnerabilities, and it makes no claim about the model layer.
+> `Security audit: PASS` means the required jobs completed successfully; the model job may have
+> been disabled. It is **not** a statement that the repository is free of vulnerabilities.
 
 ## What runs
 
@@ -41,14 +42,16 @@ The audit has two layers:
 
 | Job | What it does | Notes |
 | --- | --- | --- |
-| `validate-inputs` | Normalizes and validates the manual inputs | Target must be a 40-hex SHA reachable from `main`; scope and model come from allowlists. Scheduled runs supply no ref, so the current `origin/main` tip is resolved to a full SHA and then validated by the same rules |
+| `validate-inputs` | Normalizes and validates the dispatch payload | Target must be a 40-hex SHA reachable from `main`; scope and model come from allowlists. Scheduled runs and omitted payload fields supply no ref, so the current `origin/main` tip is resolved to a full SHA and then validated by the same rules |
 | `dependency-audit` | `npm audit --audit-level=high` | The raw JSON never leaves the runner. It is reduced in-job to severity **counts only** — no package names, versions, advisory identifiers or advisory URLs — and the counts are not published either |
 | `secret-scan` | Gitleaks **CLI**, downloaded at a pinned version and SHA256-verified | Nothing is published. Rule identifiers, file paths, line numbers, commit metadata and the matched secret never leave the runner; the raw report and the scanner console output are discarded inside the job. Counts are computed for in-job gating only |
-| `action-pins` | Fails if any workflow uses a mutable action ref | Enforces 40-hex commit pinning recursively across `.github/workflows` **and** every composite `action.yml`/`action.yaml` in the repository. Pin regressions are configuration errors, not vulnerabilities, so a generic failure message is sufficient |
-| `summary` | Emits the generic public pass/fail literal | Fails the run if any deterministic job did not succeed. It renders no job names, targets, scopes or counts |
+| `action-pins` | Fails if any workflow uses a mutable action ref | Parses workflow/composite YAML and enforces 40-hex commit pinning (or a 64-hex `sha256` digest for Docker actions) recursively across `.github/workflows` **and** every composite `action.yml`/`action.yaml`, including hidden action directories. Detailed local CLI diagnostics are captured and deleted unread in CI; the workflow emits only the generic failure literal |
+| `summary` | Emits the generic public pass/fail literal | Fails the run if any deterministic job did not succeed or an enabled model job failed or was cancelled. It renders no job names, targets, scopes or counts |
 
-Dependency installation in the audit path uses `npm ci --ignore-scripts`, so no repository
-lifecycle script executes while untrusted content is being collected.
+Dependency installation and audit run from a runner-owned directory containing only
+`package.json` and `package-lock.json`. Both npm commands use empty runner-owned user/global
+configuration files, the explicit public npm registry, and `--ignore-scripts` for installation,
+so a target `.npmrc`, unrelated project content, and lifecycle scripts cannot influence the check.
 
 ### Code scanning is not part of this workflow
 
@@ -135,7 +138,9 @@ Validated findings leave the runner through exactly one channel:
 `POST /repos/{owner}/{repo}/security-advisories/reports` — the REST endpoint behind GitHub
 **Private Vulnerability Reporting**. `scripts/security-audit/submit-report.mjs` runs inside the
 same protected `model-audit` job, *after* the tool-less model process has exited and
-`validate-response.mjs` has accepted the response.
+`validate-response.mjs` has sanitized the response. If a response contains both accepted and
+rejected findings, accepted findings are submitted privately first and the model job then fails
+closed. A malformed response writes no report and makes no submission.
 
 | Property | Behaviour |
 | --- | --- |
@@ -144,9 +149,9 @@ same protected `model-audit` job, *after* the tool-less model process has exited
 | Severity | The maximum severity across the accepted findings |
 | `vulnerabilities` | Deliberately **omitted** — these are source findings, not package advisories |
 | `start_private_fork` | `false` |
-| Deduplication | Before submitting, the script pages through the repository's existing `triage` **and** `draft` reports and matches on the exact summary string. A re-run for the same SHA is a no-op |
+| Deduplication | Before submitting, the script follows GitHub's cursor `Link` headers through existing `triage`, `draft`, `published` and `closed` reports and matches the exact summary string. Every continuation must remain on `api.github.com` and the same repository advisory endpoint. A re-run for the same SHA is a no-op |
 | Visibility | Repository **maintainers only**. A report is not an advisory and is not published; maintainers triage it in the Security tab |
-| Retry | `5xx` only, at most twice, fixed 5 s apart. Every other error — `401`, `403`, `404`, `422`, network failure, malformed body — **fails the job immediately with no fallback** |
+| Retry | Idempotent `GET` requests retry `5xx` at most twice, fixed 5 s apart. A report `POST` is attempted exactly once because a `5xx` can be ambiguous after persistence; retrying could create a duplicate. Every other error **fails the job immediately with no fallback** |
 | Output | Exactly one line on stdout: `report: submitted`, `report: existing`, `report: none` or `report: failed`. No status code, response body, GHSA identifier or advisory URL is ever printed |
 
 If the private channel cannot be used — PVR not enabled, credential missing, endpoint rejecting —
@@ -222,13 +227,33 @@ findings and never prints finding detail.
 Individual stages can be run directly — see
 [`scripts/security-audit/README.md`](../scripts/security-audit/README.md).
 
+## Running it on demand
+
+An operator with permission to create repository dispatches can request an audit without selecting
+the controller branch:
+
+```bash
+gh api --method POST \
+  repos/microsoft/SharePoint-Embedded-MCP-Server/dispatches \
+  -f event_type=security-audit \
+  -F 'client_payload[ref]=<full-40-hex-main-ancestor>' \
+  -F 'client_payload[scope]=server-core' \
+  -F 'client_payload[model]=claude-opus-5' \
+  -F 'client_payload[dry_run]=true'
+```
+
+Every `client_payload` value is optional and untrusted. `validate-target.mjs` is the sole parameter
+gate: it applies the same full-SHA/reachability, allowlist, and strict-boolean checks used by the
+weekly run. Omitting `ref` audits the current `origin/main` tip. The fixed event type does not allow
+the caller to choose workflow YAML from another branch.
+
 ## Triaging results
 
-1. **A failing run tells you only that it failed.** The public summary is `Security audit: FAIL —
-   details were reported privately to maintainers.` and nothing else — no job name, no scanner
-   identity, no rule, no path, no count. That is deliberate: this repository is public, so Actions
-   logs, job summaries and artifacts are world-readable. Start triage from the job list (which job
-   is red) and reproduce locally.
+1. **A failing run tells you only that it failed.** The public summary is `Security audit: FAIL`
+   and nothing else — no claim that a private report exists, no scanner identity, rule, path or
+   count. That is deliberate: this repository is public, so Actions logs, job summaries and
+   artifacts are world-readable. Start triage from the job list (which job is red) and reproduce
+   locally.
 2. **Dependency findings reproduce locally.** Clone the repository, check out the audited commit,
    then run `npm ci --ignore-scripts && npm audit --audit-level=high`. The workflow writes the raw
    JSON report to the runner's workspace, reduces it to counts, and deletes it — the report is
@@ -245,11 +270,13 @@ Individual stages can be run directly — see
    rule identifiers or paths into an issue, a pull request or any other public surface.
 4. **Action-pin failures are configuration errors, not vulnerabilities.** Run
    `npm run security:audit:pins` locally; the output names the offending workflow and action.
-5. **Model findings arrive as a private report.** Open the repository's **Security → Advisories**
-   tab and look for `SPE automated security audit — <12hex>`. Each accepted finding carries a
-   confidence and a control anchor: they are leads, not verdicts. Confirm the code path by hand
-   before acting. A high rejection count usually means the model drifted off the corpus or
-   attempted to smuggle content — treat it as a signal about the run, not about the code.
+5. **Accepted model findings, when submission succeeds, arrive as a private report.** Open the
+   repository's **Security → Advisories** tab and look for
+   `SPE automated security audit — <12hex>`. A malformed response or failed submission can make the
+   model job fail without creating a report. Each accepted finding carries a confidence and a
+   control anchor: they are leads, not verdicts. Confirm the code path by hand before acting.
+   Response-validation diagnostics and counts are never printed by CI; reproduce a validation
+   failure locally rather than moving its diagnostics to a public tracking surface.
 6. **Report real vulnerabilities privately** per [`SECURITY.md`](../SECURITY.md), through the same
    Private Vulnerability Reporting channel the automated audit uses. Never open a public issue for
    an unfixed vulnerability, and never file one in an external tracker.
@@ -364,14 +391,14 @@ Related administrative follow-ups (independent of the model layer):
 ### Assumption: audited commits are reachable from `main`
 
 `validate-target.mjs` requires the target SHA to be an ancestor of `refs/remotes/origin/main`.
-That is the point of the check — it stops a dispatch from pointing the audit at an arbitrary
-unreviewed commit — but it interacts with the repository's merge settings.
+That is the point of the check — it stops a repository-dispatch payload from pointing the audit at
+an arbitrary unreviewed commit — but it interacts with the repository's merge settings.
 
 At the time of writing the repository allows **all three** merge methods (merge commit, squash,
 rebase). Squash and rebase merges rewrite commits, so a pull request's original head SHA is
 **not** reachable from `main` after the merge, and passing it here is rejected by design. Audit
 the resulting commit on `main` instead — that is the code that actually ships. Administrators who
-want dispatch-by-PR-head to work must standardize on merge commits; the audit intentionally does
+want auditing by a PR's original head to work must standardize on merge commits; the audit does
 not relax the reachability rule to accommodate rewritten history.
 
 Scheduled runs are unaffected: they supply no ref, so the current `origin/main` tip is resolved

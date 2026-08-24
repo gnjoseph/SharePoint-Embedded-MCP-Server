@@ -34,15 +34,16 @@ The repository's optional model-assisted security audit
   and publishes nothing.
 - Each audited commit produces at most **one aggregate report**, titled
   `SPE automated security audit — <first 12 hex of the audited commit SHA>`.
-- Submission is de-duplicated against existing reports in the `triage` and `draft` states by exact
-  title match, so re-running the audit for the same commit does not create a duplicate report.
+- Submission is de-duplicated against existing reports in the `triage`, `draft`, `published`, and
+  `closed` states by exact title match, so re-running the audit for the same commit does not create
+  a duplicate report.
 - Reports are drafted as repository security advisories in the private reporting queue and are
   therefore visible only to maintainers. They are advisory input for human triage; they are not
   published advisories and they never gate a pull request.
 
 Public workflow output for a security audit run is limited to one of two literals:
-`Security audit: PASS` or
-`Security audit: FAIL — details were reported privately to maintainers.`
+`Security audit: PASS` or `Security audit: FAIL`. A failure does not claim that a private report
+exists.
 
 The model-assisted stage is **disabled by default** and requires explicit maintainer activation,
 including PVR being enabled on the repository. See

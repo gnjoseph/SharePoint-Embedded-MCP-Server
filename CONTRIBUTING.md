@@ -66,8 +66,8 @@ What this stage does and does not do:
   job logs, workflow artifacts, job summaries, pull request annotations, code scanning / SARIF,
   public issues, Azure DevOps or IcM. There is no fallback surface: if private reporting is
   unavailable the audit fails closed and publishes nothing. The only public output of an audit run
-  is `Security audit: PASS` or
-  `Security audit: FAIL — details were reported privately to maintainers.`
+  is `Security audit: PASS` or `Security audit: FAIL`; failure does not claim that a private report
+  exists.
 - **Never triggered by contributions.** The workflow has no `pull_request` or
   `pull_request_target` trigger. Opening or updating a pull request never sends anything anywhere.
 

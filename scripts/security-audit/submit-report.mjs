@@ -16,9 +16,9 @@
  * One aggregate report is submitted per audited commit rather than one per
  * finding. The title is `<prefix><first 12 hex of the audited commit>`, which
  * makes it a stable dedup key: a re-run of the same commit finds the existing
- * report by exact title match and submits nothing. Triage and draft states are
- * both searched, and both are paginated, because a maintainer may have already
- * promoted a report to a draft advisory.
+ * report by exact title match and submits nothing. Triage, draft, published and
+ * closed states are all searched by following GitHub's validated Link cursor,
+ * because a maintainer may already have changed the report's state.
  *
  * This process prints exactly one line — `report: <result>` — where result is
  * one of submitted, existing, none or failed. Response bodies, GHSA
@@ -26,9 +26,10 @@
  * code alone discloses whether a finding exists, and an advisory URL discloses
  * where it lives.
  *
- * Transient 5xx responses are retried at most twice with a fixed delay. Every
- * other error — auth, permission, validation, network, malformed payload — is
- * terminal and fails closed.
+ * Transient 5xx responses to idempotent GET requests are retried at most twice
+ * with a fixed delay. POST is never retried: a 5xx response can be ambiguous
+ * after GitHub has persisted a report, and retrying could create a duplicate.
+ * Every other error is terminal and fails closed.
  *
  * Usage:
  *   node scripts/security-audit/submit-report.mjs \
@@ -58,7 +59,7 @@ import {
 } from './lib/constants.mjs';
 
 /** Advisory states that can already hold a report for this commit. */
-const DEDUP_STATES = ['triage', 'draft'];
+const DEDUP_STATES = ['triage', 'draft', 'published', 'closed'];
 
 /** Page size for the dedup scan. */
 const PAGE_SIZE = 100;
@@ -247,13 +248,13 @@ function sleep(ms) {
 }
 
 /**
- * Single request with a bounded retry for transient 5xx responses.
+ * Single request with a bounded retry for transient 5xx GET responses.
  *
  * Errors are deliberately opaque: the message never carries the status code,
  * the response body or the URL, because this process runs in a public log.
  *
  * @param {{ url: string, method: string, token: string, body?: unknown, fetchImpl?: typeof fetch, sleepImpl?: (ms: number) => Promise<void> }} options
- * @returns {Promise<{ ok: boolean, status: number, data: unknown }>}
+ * @returns {Promise<{ ok: boolean, status: number, data: unknown, link: string | null }>}
  */
 export async function request({
   url,
@@ -263,8 +264,9 @@ export async function request({
   fetchImpl = fetch,
   sleepImpl = sleep,
 }) {
+  const normalizedMethod = String(method).toUpperCase();
   const init = {
-    method,
+    method: normalizedMethod,
     headers: {
       accept: 'application/vnd.github+json',
       authorization: `Bearer ${token}`,
@@ -285,7 +287,11 @@ export async function request({
       throw new Error('request failed');
     }
 
-    if (response.status >= 500 && attempt < REPORT_RETRY_LIMIT) {
+    if (
+      normalizedMethod === 'GET' &&
+      response.status >= 500 &&
+      attempt < REPORT_RETRY_LIMIT
+    ) {
       await sleepImpl(REPORT_RETRY_DELAY_MS);
       continue;
     }
@@ -300,15 +306,109 @@ export async function request({
       }
     }
 
-    return { ok: response.ok, status: response.status, data };
+    return {
+      ok: response.ok,
+      status: response.status,
+      data,
+      link: response.headers?.get?.('link') ?? null,
+    };
   }
 }
 
 /**
- * True when a report with exactly this summary already exists in triage or
- * draft state. Both states are scanned page by page; an exact string match is
- * used so a maintainer-edited title never suppresses a new submission by
- * accident.
+ * Extract the single RFC 8288 `rel="next"` target from a Link header.
+ *
+ * @param {string | null} header
+ * @returns {string | null}
+ */
+function linkNextTarget(header) {
+  if (!header) return null;
+
+  const targets = [];
+  const entryPattern = /<([^>]+)>\s*((?:;[^,]*)?)(?:,|$)/gu;
+  for (const match of header.matchAll(entryPattern)) {
+    const parameters = match[2] ?? '';
+    const relMatch = parameters.match(/(?:^|;)\s*rel\s*=\s*"?([^";]+)"?/iu);
+    if (!relMatch) continue;
+
+    const relations = relMatch[1].trim().split(/\s+/u);
+    if (relations.includes('next')) targets.push(match[1]);
+  }
+
+  if (targets.length > 1) {
+    throw new Error('ambiguous advisory pagination link');
+  }
+  return targets[0] ?? null;
+}
+
+/**
+ * Validate an advisory-list continuation before following it. In production,
+ * apiBase is fixed to api.github.com. The loopback base accepted only by
+ * resolveApiBase() keeps tests hermetic while preserving the same-origin and
+ * same-repository-endpoint checks.
+ *
+ * @param {string | null} linkHeader
+ * @param {{ apiBase: string, repo: string, state: string }} options
+ * @returns {string | null}
+ */
+function advisoryNextUrl(linkHeader, { apiBase, repo, state }) {
+  const target = linkNextTarget(linkHeader);
+  if (!target) return null;
+
+  let next;
+  try {
+    next = new URL(target);
+  } catch {
+    throw new Error('invalid advisory pagination link');
+  }
+
+  const expected = new URL(`${apiBase}/repos/${repo}/security-advisories`);
+  if (
+    next.origin !== expected.origin ||
+    next.pathname !== expected.pathname ||
+    next.username ||
+    next.password ||
+    next.hash
+  ) {
+    throw new Error('unsafe advisory pagination link');
+  }
+
+  const allowedParameters = new Set(['state', 'per_page', 'after', 'before']);
+  if ([...next.searchParams.keys()].some((key) => !allowedParameters.has(key))) {
+    throw new Error('invalid advisory pagination cursor');
+  }
+
+  const states = next.searchParams.getAll('state');
+  const after = next.searchParams.getAll('after');
+  const before = next.searchParams.getAll('before');
+  if (
+    states.length !== 1 ||
+    states[0] !== state ||
+    after.length + before.length !== 1 ||
+    (after[0] ?? before[0] ?? '') === ''
+  ) {
+    throw new Error('invalid advisory pagination cursor');
+  }
+
+  const perPages = next.searchParams.getAll('per_page');
+  const perPage = perPages[0] ?? null;
+  if (
+    perPages.length > 1 ||
+    (perPage !== null &&
+      (!/^\d+$/u.test(perPage) ||
+        Number.parseInt(perPage, 10) < 1 ||
+        Number.parseInt(perPage, 10) > PAGE_SIZE))
+  ) {
+    throw new Error('invalid advisory pagination size');
+  }
+
+  return next.href;
+}
+
+/**
+ * True when a report with exactly this summary already exists in any relevant
+ * state. GitHub's validated cursor is followed; an exact string match is used
+ * so a maintainer-edited title never suppresses a new submission by accident.
  *
  * @param {{ apiBase: string, repo: string, token: string, summary: string, fetchImpl?: typeof fetch, sleepImpl?: (ms: number) => Promise<void> }} options
  * @returns {Promise<boolean>}
@@ -322,10 +422,13 @@ export async function reportExists({
   sleepImpl = sleep,
 }) {
   for (const state of DEDUP_STATES) {
+    const query = new URLSearchParams({
+      state,
+      per_page: String(PAGE_SIZE),
+    });
+    let url = `${apiBase}/repos/${repo}/security-advisories?${query}`;
+
     for (let page = 1; page <= MAX_PAGES; page += 1) {
-      const url =
-        `${apiBase}/repos/${repo}/security-advisories` +
-        `?state=${state}&per_page=${PAGE_SIZE}&page=${page}`;
       const result = await request({ url, method: 'GET', token, fetchImpl, sleepImpl });
       if (!result.ok) throw new Error('unable to list existing reports');
       if (!Array.isArray(result.data)) throw new Error('unexpected list response');
@@ -333,7 +436,21 @@ export async function reportExists({
       for (const advisory of result.data) {
         if (advisory && advisory.summary === summary) return true;
       }
-      if (result.data.length < PAGE_SIZE) break;
+
+      const next = advisoryNextUrl(result.link, { apiBase, repo, state });
+      if (!next) {
+        // At the hard cap, a completely full page without a continuation is
+        // ambiguous: GitHub has not proved that no later matching report exists.
+        // Fail closed rather than risking a duplicate POST.
+        if (page === MAX_PAGES && result.data.length === PAGE_SIZE) {
+          throw new Error('existing report pagination limit reached');
+        }
+        break;
+      }
+      if (page === MAX_PAGES) {
+        throw new Error('existing report pagination limit reached');
+      }
+      url = next;
     }
   }
   return false;

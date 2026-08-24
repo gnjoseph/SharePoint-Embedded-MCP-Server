@@ -7,18 +7,18 @@
  * therefore deliberately reduced to one of exactly two literals — no scanner
  * identity, no file path, no rule identifier, no count, no advisory URL, no
  * commit and no scope. A failing run says only that it failed; the detail lives
- * in the private vulnerability report submitted to maintainers, or (for the
- * deterministic checks) in a maintainer's local reproduction. See
- * docs/SECURITY-AUDIT.md.
+ * in the private vulnerability report submitted to maintainers when one could
+ * be created, or in a maintainer's local reproduction. See docs/SECURITY-AUDIT.md.
  *
- * `Security audit: PASS` states that the deterministic checks succeeded. It
- * makes no claim about model-detectable issues: the model layer ships disabled,
- * and when it does not run no inference is attempted at all.
+ * `Security audit: PASS` states that the required jobs completed successfully;
+ * the model layer may have been disabled. It makes no claim that the repository
+ * is vulnerability-free.
  *
  * Usage:
  *   node scripts/security-audit/summarize.mjs \
  *     --dependency-audit success --secret-scan success \
- *     --action-pins success --model skipped [--dry-run true] [--out <file>]
+ *     --action-pins success --model skipped \
+ *     [--model-dry-run success --dry-run true] [--out <file>]
  */
 
 import { appendFileSync, writeFileSync } from 'node:fs';
@@ -87,7 +87,15 @@ export function modelStatus(result, dryRun) {
 export function buildSummary(args) {
   const dryRun = args['dry-run'] === 'true';
   const status = modelStatus(args.model ?? 'skipped', dryRun);
-  const failed = REQUIRED_JOBS.some((key) => (args[key] ?? 'skipped') !== 'success');
+  const deterministicFailed = REQUIRED_JOBS.some(
+    (key) => (args[key] ?? 'skipped') !== 'success',
+  );
+  const modelResult = args.model ?? 'skipped';
+  const dryRunResult = args['model-dry-run'] ?? 'skipped';
+  const modelFailed = dryRun
+    ? dryRunResult !== 'success'
+    : !['success', 'skipped', ''].includes(modelResult);
+  const failed = deterministicFailed || modelFailed;
   const markdown = `${failed ? PUBLIC_SUMMARY_FAIL : PUBLIC_SUMMARY_PASS}\n`;
 
   return { markdown, failed, status };

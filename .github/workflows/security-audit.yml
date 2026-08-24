@@ -1,48 +1,23 @@
 name: Security audit
 
-# Deliberately scheduled + manual only.
+# Deliberately scheduled + trusted repository dispatch only.
 #
 # There is NO `pull_request` and NO `pull_request_target` trigger. The
 # model-assisted job reads repository source as untrusted input; running it on
 # fork-controlled refs would let a contributor choose the audited content and
-# steer the prompt. `security.yml` remains the per-PR security gate.
+# steer the prompt. `repository_dispatch` loads this workflow from the default
+# branch, so an operator cannot select a modified controller workflow.
+# `security.yml` remains the per-PR security gate.
 on:
   schedule:
     # Mondays, 06:17 UTC. Offset from the hour to avoid the scheduler stampede.
     - cron: '17 6 * * 1'
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: 'Full 40-character commit SHA to audit. Must be reachable from main. Defaults to the main branch tip.'
-        required: false
-        type: string
-      scope:
-        description: 'Which part of the tree the model-assisted pass reads.'
-        required: false
-        default: server-core
-        type: choice
-        options:
-          - server-core
-          - tools
-          - workflows
-          - full
-      model:
-        description: 'Model used for the advisory pass.'
-        required: false
-        default: claude-opus-5
-        type: choice
-        # Exactly one entry for the MVP: every model family carries a different
-        # provider/subprocessor chain, and this is the only chain in scope for
-        # the pending CELA and Privacy determinations. Adding a choice requires
-        # a fresh determination and a matching update to ALLOWED_MODELS in
-        # scripts/security-audit/lib/constants.mjs.
-        options:
-          - claude-opus-5
-      dry_run:
-        description: 'Exercise the schema and redaction path with a synthetic response. No credential is used, no inference is performed and nothing is reported.'
-        required: false
-        default: false
-        type: boolean
+  repository_dispatch:
+    # A repository dispatch executes only the workflow present on the default
+    # branch. The fixed event type is the trusted operator entrypoint; every
+    # client_payload value is still treated as untrusted and validated below.
+    types:
+      - security-audit
 
 # Deny by default. Every job re-declares only what it needs.
 permissions: {}
@@ -82,9 +57,8 @@ jobs:
       is_main_tip: ${{ steps.validate.outputs.is_main_tip }}
       # The validated origin/main tip. Every job that runs audit helper scripts
       # pins its *controller* checkout to this commit, so the trusted code is
-      # always the protected-main version — never the event-selected branch (a
-      # workflow_dispatch can be started from any ref) and never the target
-      # commit (an older reachable ancestor may not contain the helpers at all).
+      # always the protected-main version and never the target commit (an older
+      # reachable ancestor may not contain the helpers at all).
       controller_sha: ${{ steps.validate.outputs.controller_sha }}
       model: ${{ steps.validate.outputs.model }}
       scope: ${{ steps.validate.outputs.scope }}
@@ -93,8 +67,8 @@ jobs:
       # This job resolves `controller_sha`, so it cannot consume it. The
       # protected branch name is used instead: actions/checkout resolves it
       # server-side to the current main tip, which is the same commit the
-      # validator then reports as `controller_sha`. It can never resolve to the
-      # ref a workflow_dispatch was started from.
+      # validator then reports as `controller_sha`. The supported triggers load
+      # this workflow from the protected default branch.
       - name: Checkout controller scripts from main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -116,18 +90,16 @@ jobs:
       # reachable-from-main checks to it — a default, never a bypass.
       #
       # The script also refuses to run when GITHUB_EVENT_NAME is set and
-      # GITHUB_REF is not refs/heads/main, so a dispatch from an unprotected
-      # branch is rejected before any input is parsed. Both variables are
-      # default runner environment variables, so no `env:` entry is needed.
-      # This is defence in depth: the substantive control is that every
-      # controller checkout below pins to `controller_sha`.
+      # GITHUB_REF is not refs/heads/main. Both supported events are default-
+      # branch events; this is defence in depth around the platform guarantee.
+      # The validator below remains the sole parameter gate.
       - name: Validate target ref and options
         id: validate
         env:
-          INPUT_REF: ${{ inputs.ref }}
-          INPUT_SCOPE: ${{ inputs.scope }}
-          INPUT_MODEL: ${{ inputs.model }}
-          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          INPUT_REF: ${{ github.event.client_payload.ref }}
+          INPUT_SCOPE: ${{ github.event.client_payload.scope }}
+          INPUT_MODEL: ${{ github.event.client_payload.model }}
+          INPUT_DRY_RUN: ${{ github.event.client_payload.dry_run }}
         run: |
           set -euo pipefail
           node scripts/security-audit/validate-target.mjs \
@@ -177,11 +149,38 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
+      # Copy only the package manifests into a runner-owned directory. This
+      # prevents an audited `.npmrc` or unrelated project content from affecting
+      # either npm command. Empty runner-owned user/global config files plus an
+      # explicit public registry close the remaining npm configuration inputs.
+      - name: Prepare isolated dependency workspace
+        env:
+          AUDIT_NPM_DIR: ${{ runner.temp }}/security-audit-npm
+          NPM_USER_CONFIG: ${{ runner.temp }}/security-audit-npm/user.npmrc
+          NPM_GLOBAL_CONFIG: ${{ runner.temp }}/security-audit-npm/global.npmrc
+        run: |
+          set -euo pipefail
+          rm -rf "${AUDIT_NPM_DIR}"
+          mkdir -p "${AUDIT_NPM_DIR}"
+          cp target/package.json target/package-lock.json "${AUDIT_NPM_DIR}/"
+          : > "${NPM_USER_CONFIG}"
+          : > "${NPM_GLOBAL_CONFIG}"
+
       # `--ignore-scripts`: the audit path must never execute repository or
       # dependency lifecycle scripts from the commit under audit.
       - name: Install dependencies without lifecycle scripts
-        working-directory: target
-        run: npm ci --ignore-scripts
+        working-directory: ${{ runner.temp }}/security-audit-npm
+        env:
+          NPM_USER_CONFIG: ${{ runner.temp }}/security-audit-npm/user.npmrc
+          NPM_GLOBAL_CONFIG: ${{ runner.temp }}/security-audit-npm/global.npmrc
+        run: |
+          npm ci \
+            --ignore-scripts \
+            --no-audit \
+            --fund=false \
+            --registry=https://registry.npmjs.org/ \
+            --userconfig="${NPM_USER_CONFIG}" \
+            --globalconfig="${NPM_GLOBAL_CONFIG}"
 
       # The report is written to the controller-owned workspace root so the
       # sanitizer never reads from, or writes into, the audited tree. `--json`
@@ -190,11 +189,21 @@ jobs:
       # `continue-on-error` and re-raised by the fail gate below.
       - name: Run npm audit
         id: audit
-        working-directory: target
+        working-directory: ${{ runner.temp }}/security-audit-npm
+        env:
+          NPM_USER_CONFIG: ${{ runner.temp }}/security-audit-npm/user.npmrc
+          NPM_GLOBAL_CONFIG: ${{ runner.temp }}/security-audit-npm/global.npmrc
         run: |
           set -uo pipefail
           mkdir -p "${GITHUB_WORKSPACE}/.security-audit"
-          npm audit --audit-level=high --json > "${GITHUB_WORKSPACE}/.security-audit/npm-audit.json"
+          npm audit \
+            --package-lock-only \
+            --audit-level=high \
+            --json \
+            --registry=https://registry.npmjs.org/ \
+            --userconfig="${NPM_USER_CONFIG}" \
+            --globalconfig="${NPM_GLOBAL_CONFIG}" \
+            > "${GITHUB_WORKSPACE}/.security-audit/npm-audit.json" 2>/dev/null
         continue-on-error: true
 
       # The sanitized summary holds severity counts only. It is consumed by the
@@ -208,12 +217,20 @@ jobs:
             --out .security-audit/npm-audit-summary.json
           rm -f .security-audit/npm-audit.json
 
+      - name: Discard dependency audit workspace
+        if: ${{ always() }}
+        env:
+          AUDIT_NPM_DIR: ${{ runner.temp }}/security-audit-npm
+        run: |
+          rm -rf "${AUDIT_NPM_DIR}"
+          rm -f .security-audit/npm-audit.json .security-audit/npm-audit-summary.json
+
       # Generic failure only. Package names, versions, advisory identifiers and
       # counts stay out of the log; maintainers reproduce locally.
       - name: Fail if npm audit reported high or critical advisories
         if: steps.audit.outcome == 'failure'
         run: |
-          echo "Security audit: FAIL — details were reported privately to maintainers." >&2
+          echo "Security audit: FAIL" >&2
           exit 1
 
   # ---------------------------------------------------------------------------
@@ -323,7 +340,7 @@ jobs:
       - name: Fail if secrets were detected
         if: steps.scan.outcome == 'failure'
         run: |
-          echo "Security audit: FAIL — details were reported privately to maintainers." >&2
+          echo "Security audit: FAIL" >&2
           exit 1
 
   # ---------------------------------------------------------------------------
@@ -358,13 +375,50 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
-      # The checker itself comes from the controller checkout; only the scanned
-      # workflow and composite-action trees come from the audited commit.
-      - name: Verify action pinning
+      # The YAML-aware pin checker is a trusted controller dependency installed
+      # from the protected-main lockfile. Lifecycle scripts, npm's implicit audit,
+      # funding output, project/user config, and registry discovery are disabled.
+      - name: Install audit helper dependencies
+        env:
+          NPM_USER_CONFIG: ${{ runner.temp }}/security-audit-controller-user.npmrc
+          NPM_GLOBAL_CONFIG: ${{ runner.temp }}/security-audit-controller-global.npmrc
         run: |
+          set -euo pipefail
+          : > "${NPM_USER_CONFIG}"
+          : > "${NPM_GLOBAL_CONFIG}"
+          npm ci \
+            --ignore-scripts \
+            --no-audit \
+            --fund=false \
+            --registry=https://registry.npmjs.org/ \
+            --userconfig="${NPM_USER_CONFIG}" \
+            --globalconfig="${NPM_GLOBAL_CONFIG}"
+
+      # The checker itself comes from the controller checkout; only the scanned
+      # workflow and composite-action trees come from the audited commit. Its
+      # local diagnostics name paths, lines, actions and reasons, so workflow
+      # execution captures and deletes them unread before re-raising the status.
+      - name: Verify action pinning
+        id: pin-check
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          mkdir -p .security-audit
+          set +e
           node scripts/security-audit/check-action-pins.mjs \
             --dir target/.github/workflows \
-            --root target
+            --root target \
+            > .security-audit/action-pins-diagnostics.log 2>&1
+          status=$?
+          set -e
+          rm -f .security-audit/action-pins-diagnostics.log
+          exit "${status}"
+
+      - name: Fail if action pinning validation failed
+        if: steps.pin-check.outcome == 'failure'
+        run: |
+          echo "Security audit: FAIL" >&2
+          exit 1
 
   # ---------------------------------------------------------------------------
   # Model-assisted advisory pass (credentialed).
@@ -441,15 +495,15 @@ jobs:
       # Presence only is tested; neither value is printed.
       - name: Require credentials
         env:
-          COPILOT_PAT: ${{ secrets.COPILOT_PAT }}
-          SECURITY_ADVISORY_TOKEN: ${{ secrets.SECURITY_ADVISORY_TOKEN }}
+          HAS_COPILOT_PAT: ${{ secrets.COPILOT_PAT != '' }}
+          HAS_SECURITY_ADVISORY_TOKEN: ${{ secrets.SECURITY_ADVISORY_TOKEN != '' }}
         run: |
           set -euo pipefail
-          if [ -z "${COPILOT_PAT}" ]; then
+          if [ "${HAS_COPILOT_PAT}" != "true" ]; then
             echo "COPILOT_PAT is not set in the security-audit-private-report environment" >&2
             exit 1
           fi
-          if [ -z "${SECURITY_ADVISORY_TOKEN}" ]; then
+          if [ "${HAS_SECURITY_ADVISORY_TOKEN}" != "true" ]; then
             echo "SECURITY_ADVISORY_TOKEN is not set in the security-audit-private-report environment" >&2
             exit 1
           fi
@@ -553,14 +607,24 @@ jobs:
       # a `run:` block, because `${{ }}` substitution happens before the shell
       # sees the script and would allow command injection from model output.
       - name: Validate and redact response
+        id: validate
+        continue-on-error: true
         env:
           RESPONSE_FILE: ${{ steps.inference.outputs.response-file }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          rm -f .security-audit/model/report.json
+          rm -f .security-audit/model/validation-diagnostics.log
+          set +e
           node scripts/security-audit/validate-response.mjs \
             --response "${RESPONSE_FILE}" \
             --manifest .security-audit/model/corpus-manifest.json \
-            --out .security-audit/model/report.json
+            --out .security-audit/model/report.json \
+            > .security-audit/model/validation-diagnostics.log 2>&1
+          status=$?
+          set -e
+          rm -f .security-audit/model/validation-diagnostics.log
+          exit "${status}"
 
       # The single egress for a validated model finding: GitHub Private
       # Vulnerability Reporting. One aggregate report per audited commit, whose
@@ -574,9 +638,12 @@ jobs:
       # absent from the inference step above, so the model provider never sees a
       # token that can write to the repository's security advisories.
       #
-      # The script prints exactly one line — `report: submitted|existing|none|
-      # failed` — and never an advisory identifier, URL, status code or body.
+      # The standalone script prints one opaque result token. This workflow
+      # discards that stdout so even the token cannot reveal finding or prior-
+      # report state in a public Actions log; stderr and the exit status remain.
       - name: Submit private vulnerability report
+        id: submit
+        if: ${{ always() && hashFiles('.security-audit/model/report.json') != '' }}
         env:
           SECURITY_ADVISORY_TOKEN: ${{ secrets.SECURITY_ADVISORY_TOKEN }}
           TARGET_SHA: ${{ needs.validate-inputs.outputs.target_sha }}
@@ -585,7 +652,33 @@ jobs:
           node scripts/security-audit/submit-report.mjs \
             --report .security-audit/model/report.json \
             --sha "${TARGET_SHA}" \
-            --repo "${GITHUB_REPOSITORY}"
+            --repo "${GITHUB_REPOSITORY}" \
+            > /dev/null
+
+      # The sanitized report and raw response are runner-local only. Deleting
+      # them explicitly prevents a later step from accidentally replaying either
+      # into a log or attaching them to an artifact.
+      - name: Discard model response and report
+        if: ${{ always() }}
+        env:
+          RESPONSE_FILE: ${{ steps.inference.outputs.response-file }}
+        run: |
+          set -euo pipefail
+          rm -f .security-audit/model/report.json
+          rm -f .security-audit/model/validation-diagnostics.log
+          if [ -n "${RESPONSE_FILE:-}" ]; then
+            rm -f -- "${RESPONSE_FILE}"
+          fi
+
+      # A partial validation writes a report containing only accepted, sanitized
+      # findings, allowing the submit step above to use the sole private egress.
+      # The job must still fail after that attempt. A malformed response writes
+      # no report, skips submission, and reaches the same fixed public failure.
+      - name: Fail closed if response validation did not complete
+        if: ${{ always() && (steps.validate.outcome == 'failure' || steps.submit.outcome == 'skipped') }}
+        run: |
+          echo "Security audit: FAIL" >&2
+          exit 1
 
   # ---------------------------------------------------------------------------
   # Credential-free rehearsal of the untrusted-output path.
@@ -641,8 +734,8 @@ jobs:
   # advisory and its absence is stated explicitly rather than implied to pass.
   #
   # The rendered summary is deliberately generic — `Security audit: PASS` or
-  # `Security audit: FAIL — details were reported privately to maintainers.` —
-  # and names no scanner, path, rule, count, advisory or commit.
+  # `Security audit: FAIL` — and names no scanner, path, rule, count, advisory
+  # or commit. A failure does not claim that a private report exists.
   # ---------------------------------------------------------------------------
   summary:
     name: Summary
@@ -661,10 +754,9 @@ jobs:
     steps:
       # This job runs with `if: always()`, so validate-inputs may have failed and
       # `needs.validate-inputs.outputs.controller_sha` may be empty. An empty
-      # `ref` makes actions/checkout fall back to the event-selected ref, which
-      # is exactly the input this workflow refuses to trust, so the protected
-      # branch name is used directly: it always resolves to the main tip and can
-      # never resolve to an attacker-selected branch.
+      # `ref` makes actions/checkout fall back to the event ref. Use the protected
+      # branch name directly so this trusted summary helper always resolves to
+      # the main tip, even after input validation fails.
       - name: Checkout controller scripts from main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -682,6 +774,7 @@ jobs:
           SECRET_RESULT: ${{ needs.secret-scan.result }}
           PINS_RESULT: ${{ needs.action-pins.result }}
           MODEL_RESULT: ${{ needs.model-audit.result }}
+          MODEL_DRY_RUN_RESULT: ${{ needs.model-audit-dry-run.result }}
           DRY_RUN: ${{ needs.validate-inputs.outputs.dry_run }}
         run: |
           set -euo pipefail
@@ -690,4 +783,5 @@ jobs:
             --secret-scan "${SECRET_RESULT}" \
             --action-pins "${PINS_RESULT}" \
             --model "${MODEL_RESULT}" \
+            --model-dry-run "${MODEL_DRY_RUN_RESULT}" \
             --dry-run "${DRY_RUN:-false}"
