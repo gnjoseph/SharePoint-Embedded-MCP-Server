@@ -286,4 +286,33 @@ describe("project_provision — guided standard-billing selection (native elicit
     expect(graph.createContainerType).not.toHaveBeenCalled();
     expect(azureCli.createSyntexAccount).not.toHaveBeenCalled();
   });
+
+  it("rejects a malformed guided resource group before probing or creating anything", async () => {
+    vi.mocked(azureCli.listSubscriptions).mockResolvedValue([
+      { id: "solo-sub", name: "Solo Sub", state: "Enabled" },
+    ]);
+    vi.mocked(azureCli.listResourceGroups).mockResolvedValue([]);
+    elicitTextMock.mockResolvedValueOnce({
+      resolved: true,
+      value: " invalid resource group ",
+    });
+
+    const r = await provisionTool.handler({
+      appDisplayName: "App",
+      billingClassification: "standard",
+      region: "eastus",
+      confirmBilling: true,
+    });
+
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toBe(
+      "Error: resourceGroup must be a valid Azure resource group name",
+    );
+    expect(azureCli.resourceGroupExists).not.toHaveBeenCalled();
+    expect(azureCli.ensureSyntexProviderRegistered).not.toHaveBeenCalled();
+    expect(azureCli.getSyntexAccounts).not.toHaveBeenCalled();
+    expect(azureCli.createSyntexAccount).not.toHaveBeenCalled();
+    expect(graph.createApplication).not.toHaveBeenCalled();
+    expect(graph.createContainerType).not.toHaveBeenCalled();
+  });
 });

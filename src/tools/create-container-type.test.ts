@@ -24,7 +24,13 @@ vi.mock("../azure-cli.js", async (importActual) => ({
   // default to empty and let each test set the shape it needs.
   listSubscriptions: vi.fn(async () => []),
   listResourceGroups: vi.fn(async () => []),
+  resourceGroupExists: vi.fn(),
 }));
+
+vi.mock("../elicitation.js", async (importActual) => {
+  const actual = await importActual<typeof import("../elicitation.js")>();
+  return { ...actual, elicitText: vi.fn(actual.elicitText) };
+});
 
 const stateStore: Record<string, unknown> = {};
 vi.mock("../state.js", () => ({
@@ -37,6 +43,7 @@ vi.mock("../state.js", () => ({
 
 import * as graph from "../graph-client.js";
 import * as azureCli from "../azure-cli.js";
+import * as elicitation from "../elicitation.js";
 import { createContainerTypeTool } from "../tools/create-container-type.js";
 import { getSessionId } from "../session.js";
 
@@ -204,6 +211,28 @@ describe("container_type_create — standard billing validation", () => {
     expect(azureCli.listSubscriptions).not.toHaveBeenCalled();
     expect(azureCli.listResourceGroups).not.toHaveBeenCalled();
     expect(azureCli.ensureSyntexProviderRegistered).not.toHaveBeenCalled();
+  });
+
+  it("rejects an empty guided resource group before probing or creating anything", async () => {
+    vi.mocked(azureCli.listResourceGroups).mockResolvedValue([]);
+    vi.mocked(elicitation.elicitText).mockResolvedValueOnce({
+      resolved: true,
+      value: "   ",
+    });
+
+    const result = await createContainerTypeTool.handler({
+      displayName: "X",
+      billingClassification: "standard",
+      azureSubscriptionId: VALID_SUBSCRIPTION_ID,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe("Error: resourceGroup is required");
+    expect(azureCli.resourceGroupExists).not.toHaveBeenCalled();
+    expect(azureCli.ensureSyntexProviderRegistered).not.toHaveBeenCalled();
+    expect(graph.listContainerTypes).not.toHaveBeenCalled();
+    expect(graph.createContainerType).not.toHaveBeenCalled();
+    expect(graph.registerContainerType).not.toHaveBeenCalled();
   });
 
   it("rejects an unsupported region before creating the (non-deletable) standard CT", async () => {

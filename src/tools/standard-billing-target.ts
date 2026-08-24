@@ -169,7 +169,13 @@ export async function resolveStandardBillingTarget(input: {
         { title: "Resource group name" },
       );
       if (named.resolved) {
-        const candidate = named.value.trim();
+        const validatedEntry = validateProvidedStandardBillingTarget({
+          resourceGroup: named.value,
+        });
+        if (!validatedEntry.ok) {
+          return { resolved: false, result: validatedEntry.error };
+        }
+        const candidate = validatedEntry.resourceGroup!;
         // Verify the user-entered name exists BEFORE proceeding. The server cannot
         // create a resource group, and an unverified typo would otherwise only
         // surface much later at `createSyntexAccount` — AFTER the container type is

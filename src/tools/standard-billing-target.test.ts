@@ -39,6 +39,31 @@ beforeEach(() => {
 });
 
 describe("resolveStandardBillingTarget — resource-group existence check (PR #3 review)", () => {
+  it.each([
+    ["whitespace-only", "   ", "Error: resourceGroup is required"],
+    [
+      "malformed",
+      " invalid resource group ",
+      "Error: resourceGroup must be a valid Azure resource group name",
+    ],
+  ])(
+    "0 RGs + %s entered name → rejects before the existence probe",
+    async (_case, value, expectedError) => {
+      vi.mocked(azureCli.listResourceGroups).mockResolvedValue([]);
+      vi.mocked(elicitation.elicitText).mockResolvedValue({ resolved: true, value });
+
+      const r = await resolveStandardBillingTarget({
+        azureSubscriptionId: VALID_SUBSCRIPTION_ID,
+      });
+
+      expect(azureCli.resourceGroupExists).not.toHaveBeenCalled();
+      expect(r.resolved).toBe(false);
+      if (r.resolved) throw new Error("expected unresolved");
+      expect(r.result.isError).toBe(true);
+      expect(r.result.content[0].text).toBe(expectedError);
+    },
+  );
+
   it("0 RGs + entered name that does NOT exist → cost-free guidance, does not proceed", async () => {
     vi.mocked(azureCli.listResourceGroups).mockResolvedValue([]);
     vi.mocked(elicitation.elicitText).mockResolvedValue({ resolved: true, value: "typo-rg" });
