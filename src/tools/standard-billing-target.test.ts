@@ -32,6 +32,8 @@ import * as azureCli from "../azure-cli.js";
 import * as elicitation from "../elicitation.js";
 import { resolveStandardBillingTarget } from "../tools/standard-billing-target.js";
 
+const VALID_SUBSCRIPTION_ID = "11111111-1111-1111-1111-111111111111";
+
 beforeEach(() => {
   vi.clearAllMocks();
 });
@@ -42,10 +44,10 @@ describe("resolveStandardBillingTarget — resource-group existence check (PR #3
     vi.mocked(elicitation.elicitText).mockResolvedValue({ resolved: true, value: "typo-rg" });
     vi.mocked(azureCli.resourceGroupExists).mockResolvedValue(false);
 
-    const r = await resolveStandardBillingTarget({ azureSubscriptionId: "sub-1" });
+    const r = await resolveStandardBillingTarget({ azureSubscriptionId: VALID_SUBSCRIPTION_ID });
 
     // The entered name was probed against the chosen subscription.
-    expect(azureCli.resourceGroupExists).toHaveBeenCalledWith("typo-rg", "sub-1");
+    expect(azureCli.resourceGroupExists).toHaveBeenCalledWith("typo-rg", VALID_SUBSCRIPTION_ID);
     // Fail cost-free: unresolved, with actionable create-then-re-run guidance and
     // NOT an error envelope (agent-guided, non-blocking).
     expect(r.resolved).toBe(false);
@@ -61,13 +63,13 @@ describe("resolveStandardBillingTarget — resource-group existence check (PR #3
     vi.mocked(elicitation.elicitText).mockResolvedValue({ resolved: true, value: "real-rg" });
     vi.mocked(azureCli.resourceGroupExists).mockResolvedValue(true);
 
-    const r = await resolveStandardBillingTarget({ azureSubscriptionId: "sub-1" });
+    const r = await resolveStandardBillingTarget({ azureSubscriptionId: VALID_SUBSCRIPTION_ID });
 
-    expect(azureCli.resourceGroupExists).toHaveBeenCalledWith("real-rg", "sub-1");
+    expect(azureCli.resourceGroupExists).toHaveBeenCalledWith("real-rg", VALID_SUBSCRIPTION_ID);
     expect(r.resolved).toBe(true);
     if (!r.resolved) throw new Error("expected resolved");
     expect(r.resourceGroup).toBe("real-rg");
-    expect(r.azureSubscriptionId).toBe("sub-1");
+    expect(r.azureSubscriptionId).toBe(VALID_SUBSCRIPTION_ID);
     expect(r.notes.join(" ")).toContain("verified");
   });
 
@@ -76,9 +78,9 @@ describe("resolveStandardBillingTarget — resource-group existence check (PR #3
     vi.mocked(elicitation.elicitText).mockResolvedValue({ resolved: true, value: "maybe-rg" });
     vi.mocked(azureCli.resourceGroupExists).mockResolvedValue(undefined);
 
-    const r = await resolveStandardBillingTarget({ azureSubscriptionId: "sub-1" });
+    const r = await resolveStandardBillingTarget({ azureSubscriptionId: VALID_SUBSCRIPTION_ID });
 
-    expect(azureCli.resourceGroupExists).toHaveBeenCalledWith("maybe-rg", "sub-1");
+    expect(azureCli.resourceGroupExists).toHaveBeenCalledWith("maybe-rg", VALID_SUBSCRIPTION_ID);
     expect(r.resolved).toBe(true);
     if (!r.resolved) throw new Error("expected resolved");
     expect(r.resourceGroup).toBe("maybe-rg");
@@ -87,10 +89,10 @@ describe("resolveStandardBillingTarget — resource-group existence check (PR #3
 
   it("preserves the auto-select-singleton path — a lone listed RG is used WITHOUT probing", async () => {
     vi.mocked(azureCli.listResourceGroups).mockResolvedValue([
-      { name: "solo-rg", location: "eastus", id: "/subscriptions/sub-1/resourceGroups/solo-rg" },
+      { name: "solo-rg", location: "eastus", id: `/subscriptions/${VALID_SUBSCRIPTION_ID}/resourceGroups/solo-rg` },
     ]);
 
-    const r = await resolveStandardBillingTarget({ azureSubscriptionId: "sub-1" });
+    const r = await resolveStandardBillingTarget({ azureSubscriptionId: VALID_SUBSCRIPTION_ID });
 
     expect(elicitation.elicitText).not.toHaveBeenCalled();
     expect(azureCli.resourceGroupExists).not.toHaveBeenCalled(); // listed RGs are not re-probed
@@ -101,12 +103,12 @@ describe("resolveStandardBillingTarget — resource-group existence check (PR #3
 
   it("preserves the multi-RG elicit path — chosen listed RG is used WITHOUT probing", async () => {
     vi.mocked(azureCli.listResourceGroups).mockResolvedValue([
-      { name: "rg-a", location: "eastus", id: "/subscriptions/sub-1/resourceGroups/rg-a" },
-      { name: "rg-b", location: "eastus", id: "/subscriptions/sub-1/resourceGroups/rg-b" },
+      { name: "rg-a", location: "eastus", id: `/subscriptions/${VALID_SUBSCRIPTION_ID}/resourceGroups/rg-a` },
+      { name: "rg-b", location: "eastus", id: `/subscriptions/${VALID_SUBSCRIPTION_ID}/resourceGroups/rg-b` },
     ]);
     vi.mocked(elicitation.elicitChoice).mockResolvedValue({ resolved: true, value: "rg-b" });
 
-    const r = await resolveStandardBillingTarget({ azureSubscriptionId: "sub-1" });
+    const r = await resolveStandardBillingTarget({ azureSubscriptionId: VALID_SUBSCRIPTION_ID });
 
     expect(elicitation.elicitChoice).toHaveBeenCalled();
     expect(azureCli.resourceGroupExists).not.toHaveBeenCalled();

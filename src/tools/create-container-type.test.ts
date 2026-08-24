@@ -40,6 +40,8 @@ import * as azureCli from "../azure-cli.js";
 import { createContainerTypeTool } from "../tools/create-container-type.js";
 import { getSessionId } from "../session.js";
 
+const VALID_SUBSCRIPTION_ID = "11111111-1111-1111-1111-111111111111";
+
 beforeEach(() => {
   vi.clearAllMocks();
   for (const k of Object.keys(stateStore)) delete stateStore[k];
@@ -95,17 +97,17 @@ describe("container_type_create — standard billing validation", () => {
     // Subscription supplied → the tool lists resource groups WITHIN it and asks
     // the user to pick (agent-guided fallback keyed on `resourceGroup`).
     vi.mocked(azureCli.listResourceGroups).mockResolvedValue([
-      { name: "rg-x", location: "eastus", id: "/subscriptions/sub-1/resourceGroups/rg-x" },
-      { name: "rg-y", location: "westus", id: "/subscriptions/sub-1/resourceGroups/rg-y" },
+      { name: "rg-x", location: "eastus", id: `/subscriptions/${VALID_SUBSCRIPTION_ID}/resourceGroups/rg-x` },
+      { name: "rg-y", location: "westus", id: `/subscriptions/${VALID_SUBSCRIPTION_ID}/resourceGroups/rg-y` },
     ]);
 
     const result = await createContainerTypeTool.handler({
       displayName: "X",
       billingClassification: "standard",
-      azureSubscriptionId: "sub-1",
+      azureSubscriptionId: VALID_SUBSCRIPTION_ID,
     });
 
-    expect(azureCli.listResourceGroups).toHaveBeenCalledWith("sub-1");
+    expect(azureCli.listResourceGroups).toHaveBeenCalledWith(VALID_SUBSCRIPTION_ID);
     expect(result.content[0].text).toContain("resourceGroup=rg-x");
     expect(result.content[0].text).toContain("resourceGroup=rg-y");
     expect(graph.createContainerType).not.toHaveBeenCalled();
@@ -169,7 +171,7 @@ describe("container_type_create — standard billing validation", () => {
     const result = await createContainerTypeTool.handler({
       displayName: "X",
       billingClassification: "standard",
-      azureSubscriptionId: "sub-1",
+      azureSubscriptionId: VALID_SUBSCRIPTION_ID,
       resourceGroup: "rg-1",
     });
 
@@ -179,17 +181,36 @@ describe("container_type_create — standard billing validation", () => {
         displayName: "X",
         owningAppId: "app-1",
         billingClassification: "standard",
-        azureSubscriptionId: "sub-1",
+        azureSubscriptionId: VALID_SUBSCRIPTION_ID,
         resourceGroup: "rg-1",
       }),
     );
+  });
+
+  it("rejects an invalid explicit resource group before Graph or Azure CLI calls", async () => {
+    const result = await createContainerTypeTool.handler({
+      displayName: "X",
+      billingClassification: "standard",
+      azureSubscriptionId: VALID_SUBSCRIPTION_ID,
+      resourceGroup: "invalid resource group",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe(
+      "Error: resourceGroup must be a valid Azure resource group name",
+    );
+    expect(graph.listContainerTypes).not.toHaveBeenCalled();
+    expect(graph.createContainerType).not.toHaveBeenCalled();
+    expect(azureCli.listSubscriptions).not.toHaveBeenCalled();
+    expect(azureCli.listResourceGroups).not.toHaveBeenCalled();
+    expect(azureCli.ensureSyntexProviderRegistered).not.toHaveBeenCalled();
   });
 
   it("rejects an unsupported region before creating the (non-deletable) standard CT", async () => {
     const result = await createContainerTypeTool.handler({
       displayName: "X",
       billingClassification: "standard",
-      azureSubscriptionId: "sub-1",
+      azureSubscriptionId: VALID_SUBSCRIPTION_ID,
       resourceGroup: "rg-1",
       region: "westus2",
     });
@@ -210,7 +231,7 @@ describe("container_type_create — standard billing validation", () => {
     const result = await createContainerTypeTool.handler({
       displayName: "X",
       billingClassification: "standard",
-      azureSubscriptionId: "sub-1",
+      azureSubscriptionId: VALID_SUBSCRIPTION_ID,
       resourceGroup: "rg-1",
     });
 
@@ -257,7 +278,7 @@ describe("container_type_create — standard billing rollback", () => {
     const result = await createContainerTypeTool.handler({
       displayName: "X",
       billingClassification: "standard",
-      azureSubscriptionId: "sub-1",
+      azureSubscriptionId: VALID_SUBSCRIPTION_ID,
       resourceGroup: "rg-1",
     });
 
@@ -279,7 +300,7 @@ describe("container_type_create — standard billing rollback", () => {
     const result = await createContainerTypeTool.handler({
       displayName: "X",
       billingClassification: "standard",
-      azureSubscriptionId: "sub-1",
+      azureSubscriptionId: VALID_SUBSCRIPTION_ID,
       resourceGroup: "rg-1",
     });
 
@@ -293,12 +314,12 @@ describe("container_type_create — standard billing rollback", () => {
     const result = await createContainerTypeTool.handler({
       displayName: "X",
       billingClassification: "standard",
-      azureSubscriptionId: "sub-1",
+      azureSubscriptionId: VALID_SUBSCRIPTION_ID,
       resourceGroup: "rg-1",
     });
 
     expect(result.isError).toBeFalsy();
-    expect(azureCli.ensureSyntexProviderRegistered).toHaveBeenCalledWith("sub-1");
+    expect(azureCli.ensureSyntexProviderRegistered).toHaveBeenCalledWith(VALID_SUBSCRIPTION_ID);
     expect(graph.deleteContainerType).not.toHaveBeenCalled();
     expect(graph.registerContainerType).toHaveBeenCalled();
   });

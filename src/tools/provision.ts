@@ -44,7 +44,10 @@ import {
   type ClassifiableError,
 } from "../container-retry.js";
 import { elicitChoice, elicitText } from "../elicitation.js";
-import { resolveStandardBillingTarget } from "./standard-billing-target.js";
+import {
+  resolveStandardBillingTarget,
+  validateProvidedStandardBillingTarget,
+} from "./standard-billing-target.js";
 import { isContextConfirmedThisSession, stampContextConfirmed } from "../session.js";
 import { readState, writeState } from "../state.js";
 import type { Guid, McpTool, OwnerScope } from "../types.js";
@@ -191,6 +194,19 @@ export const provisionTool: McpTool = {
     // Declared before the try so every early-return error path AND the catch-all
     // below can surface how far provisioning got (partial-steps summary).
     const steps: string[] = [];
+
+    // Explicit standard-billing values bypass guided selection when both are
+    // present. Validate them at the tool boundary, before getSignedInIdentity
+    // invokes `az account show` and before any app/container-type creation.
+    if (billingClassification === "standard") {
+      const validated = validateProvidedStandardBillingTarget({
+        azureSubscriptionId,
+        resourceGroup,
+      });
+      if (!validated.ok) return validated.error;
+      azureSubscriptionId = validated.azureSubscriptionId;
+      resourceGroup = validated.resourceGroup;
+    }
 
     try {
       // 0. Confirm signed-in identity (bootstrap/control plane).

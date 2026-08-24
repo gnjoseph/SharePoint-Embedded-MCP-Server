@@ -35,6 +35,10 @@
 import { listResourceGroups, listSubscriptions, resourceGroupExists } from "../azure-cli.js";
 import { elicitChoice, elicitText } from "../elicitation.js";
 import type { McpToolResult } from "../types.js";
+import {
+  requireAzureResourceGroupName,
+  requireAzureSubscriptionId,
+} from "../validation.js";
 
 /**
  * Outcome of guided resolution. `resolved` carries the chosen subscription +
@@ -46,6 +50,41 @@ import type { McpToolResult } from "../types.js";
 export type BillingTargetResolution =
   | { resolved: true; azureSubscriptionId: string; resourceGroup: string; notes: string[] }
   | { resolved: false; result: McpToolResult };
+
+export type BillingTargetInputValidation =
+  | { ok: true; azureSubscriptionId?: string; resourceGroup?: string }
+  | { ok: false; error: McpToolResult };
+
+/**
+ * Validate any caller-supplied standard-billing target values without requiring
+ * both to be present. This is intentionally side-effect free so callers can run
+ * it before sign-in, Graph, or Azure CLI work; missing values remain available
+ * for guided resolution.
+ */
+export function validateProvidedStandardBillingTarget(input: {
+  azureSubscriptionId?: unknown;
+  resourceGroup?: unknown;
+}): BillingTargetInputValidation {
+  let azureSubscriptionId: string | undefined;
+  let resourceGroup: string | undefined;
+
+  if (input.azureSubscriptionId !== undefined) {
+    const parsed = requireAzureSubscriptionId(
+      input.azureSubscriptionId,
+      "azureSubscriptionId",
+    );
+    if (!parsed.ok) return { ok: false, error: parsed.error };
+    azureSubscriptionId = parsed.value;
+  }
+
+  if (input.resourceGroup !== undefined) {
+    const parsed = requireAzureResourceGroupName(input.resourceGroup);
+    if (!parsed.ok) return { ok: false, error: parsed.error };
+    resourceGroup = parsed.value;
+  }
+
+  return { ok: true, azureSubscriptionId, resourceGroup };
+}
 
 function textResult(text: string, isError = false): McpToolResult {
   return { content: [{ type: "text", text }], isError };
@@ -62,10 +101,9 @@ export async function resolveStandardBillingTarget(input: {
   resourceGroup?: string;
 }): Promise<BillingTargetResolution> {
   const notes: string[] = [];
-  // Treat empty/whitespace as missing so a blank arg triggers guidance rather
-  // than flowing an invalid value into ARM.
-  let azureSubscriptionId = input.azureSubscriptionId?.trim() || undefined;
-  let resourceGroup = input.resourceGroup?.trim() || undefined;
+  const validated = validateProvidedStandardBillingTarget(input);
+  if (!validated.ok) return { resolved: false, result: validated.error };
+  let { azureSubscriptionId, resourceGroup } = validated;
 
   // ── Subscription ──────────────────────────────────────────────────────────
   if (!azureSubscriptionId) {

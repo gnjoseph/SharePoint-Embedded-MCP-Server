@@ -51,6 +51,8 @@ import * as graph from "../graph-client.js";
 import * as azureCli from "../azure-cli.js";
 import { provisionTool } from "../tools/provision.js";
 
+const VALID_SUBSCRIPTION_ID = "11111111-1111-1111-1111-111111111111";
+
 beforeEach(() => {
   vi.clearAllMocks();
   for (const k of Object.keys(stateStore)) delete stateStore[k];
@@ -89,7 +91,7 @@ describe("project_provision — partial progress on mid-flow failure (WI-16)", (
     vi.mocked(graph.createContainerType).mockResolvedValue({ containerTypeId: "ct-1", owningAppId: "app-1", displayName: "App Container Type", billingClassification: "standard" });
     vi.mocked(azureCli.createSyntexAccount).mockRejectedValueOnce(new Error("ARM 409"));
 
-    const r = await provisionTool.handler({ appDisplayName: "App", billingClassification: "standard", azureSubscriptionId: "sub-1", resourceGroup: "rg-1", region: "eastus", confirmBilling: true });
+    const r = await provisionTool.handler({ appDisplayName: "App", billingClassification: "standard", azureSubscriptionId: VALID_SUBSCRIPTION_ID, resourceGroup: "rg-1", region: "eastus", confirmBilling: true });
 
     expect(r.isError).toBe(true);
     // Existing behaviour (rollback) is preserved …

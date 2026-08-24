@@ -91,7 +91,10 @@ vi.mock("../state.js", () => ({
 
 import * as graph from "../graph-client.js";
 import * as azureCli from "../azure-cli.js";
+import * as bootstrap from "../bootstrap.js";
 import { provisionTool } from "../tools/provision.js";
+
+const VALID_SUBSCRIPTION_ID = "11111111-1111-1111-1111-111111111111";
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -173,6 +176,33 @@ describe("project_provision — guided standard-billing selection (native elicit
     expect(elicitChoiceMock).not.toHaveBeenCalled();
     expect(graph.createApplication).not.toHaveBeenCalled();
     expect(azureCli.createSyntexAccount).not.toHaveBeenCalled();
+  });
+
+  it("rejects an invalid explicit resource group before Azure CLI, app, or CT creation", async () => {
+    const r = await provisionTool.handler({
+      appDisplayName: "App",
+      billingClassification: "standard",
+      azureSubscriptionId: VALID_SUBSCRIPTION_ID,
+      resourceGroup: "invalid resource group",
+      region: "eastus",
+      confirmBilling: true,
+    });
+
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toBe(
+      "Error: resourceGroup must be a valid Azure resource group name",
+    );
+    // Boundary validation runs before `az account show` and every other Azure
+    // helper, and before either Graph resource can be created.
+    expect(bootstrap.getSignedInIdentity).not.toHaveBeenCalled();
+    expect(azureCli.listSubscriptions).not.toHaveBeenCalled();
+    expect(azureCli.listResourceGroups).not.toHaveBeenCalled();
+    expect(azureCli.resourceGroupExists).not.toHaveBeenCalled();
+    expect(azureCli.ensureSyntexProviderRegistered).not.toHaveBeenCalled();
+    expect(azureCli.getSyntexAccounts).not.toHaveBeenCalled();
+    expect(azureCli.createSyntexAccount).not.toHaveBeenCalled();
+    expect(graph.createApplication).not.toHaveBeenCalled();
+    expect(graph.createContainerType).not.toHaveBeenCalled();
   });
 
   it("STILL requires confirmBilling after guided selection — no silent charge", async () => {
