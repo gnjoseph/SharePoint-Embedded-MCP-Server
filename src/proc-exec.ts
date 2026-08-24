@@ -58,18 +58,33 @@ export function runCommand(
   options: RunCommandOptions = {},
 ): Promise<RunCommandResult> {
   return new Promise<RunCommandResult>((resolvePromise, reject) => {
-    // shell:false is the entire point — cross-spawn resolves Windows .cmd shims
-    // itself, so we must never delegate to a shell.
-    const child = spawn(command, [...args], {
-      cwd: options.cwd,
-      env: options.env,
-      shell: false,
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
     let stdout = "";
     let stderr = "";
+
+    // shell:false is the entire point — cross-spawn resolves Windows .cmd shims
+    // itself, so we must never delegate to a shell.
+    let child: ChildProcess;
+    try {
+      child = spawn(command, [...args], {
+        cwd: options.cwd,
+        env: options.env,
+        shell: false,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (err) {
+      // Argument/options validation can throw before a ChildProcess exists.
+      // Normalize that path to the same shape as asynchronous spawn failures.
+      const e =
+        err instanceof Error
+          ? (err as RunCommandError)
+          : (new Error(String(err)) as RunCommandError);
+      e.stdout = stdout;
+      e.stderr = stderr;
+      reject(e);
+      return;
+    }
+
     let settled = false;
     let timer: NodeJS.Timeout | undefined;
 

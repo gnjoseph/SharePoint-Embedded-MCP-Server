@@ -102,6 +102,44 @@ describe("runCommand", () => {
     });
   });
 
+  it("normalizes a synchronous spawn throw with message, stack, code, and empty streams", async () => {
+    const spawnError = Object.assign(new Error("invalid spawn options"), {
+      code: "ERR_INVALID_ARG_TYPE",
+    });
+    spawnError.stack = "preserved synchronous spawn stack";
+    spawnMock.mockImplementation(() => {
+      throw spawnError;
+    });
+
+    const error = await runCommand("az", ["version"]).catch(
+      (reason: unknown) => reason as Error & {
+        stdout: string;
+        stderr: string;
+        code?: number | string;
+      },
+    );
+
+    expect(error).toBe(spawnError);
+    expect(error.message).toBe("invalid spawn options");
+    expect(error.stack).toBe("preserved synchronous spawn stack");
+    expect(error.code).toBe("ERR_INVALID_ARG_TYPE");
+    expect(error.stdout).toBe("");
+    expect(error.stderr).toBe("");
+  });
+
+  it("leaves code unset when a synchronous spawn error has no code", async () => {
+    spawnMock.mockImplementation(() => {
+      throw new Error("spawn failed before launch");
+    });
+
+    await expect(runCommand("az", ["version"])).rejects.toMatchObject({
+      message: "spawn failed before launch",
+      stdout: "",
+      stderr: "",
+    });
+    await expect(runCommand("az", ["version"])).rejects.not.toHaveProperty("code");
+  });
+
   it("kills the child and rejects with ETIMEDOUT when the timeout elapses", async () => {
     vi.useFakeTimers();
     const child = new FakeChild();
