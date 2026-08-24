@@ -35,12 +35,10 @@ newer releases, which can also be turned off. Specifically:
   aggregate traffic driven by this tool. It is a request header on calls you already make —
   not a separate data feed — and it is **on by default**; set `SPE_MCP_COLLECT_TELEMETRY=false`
   to omit it (see [Turning it off](#turning-it-off)).
-- **Update check (public npm registry — the only destination that is not a Microsoft 365 or
-  Azure Online Service, and the only destination outside the compliance boundary).** At most
-  once every 24 hours the tool reads
-  the published version list for `@microsoft/spe-mcp` from the public npm registry
-  (`https://registry.npmjs.org`, override with `SPE_NPM_REGISTRY`) so it can tell you when a
-  newer release exists (`src/update-check.ts`).
+- **Update check (public npm registry by default; configurable).** At most once every 24 hours
+  the tool reads the published version list for `@microsoft/spe-mcp` from
+  `https://registry.npmjs.org`, or from the HTTPS registry you set with `SPE_NPM_REGISTRY`, so
+  it can tell you when a newer release exists (`src/update-check.ts`).
 
   > **Boundary disclosure.** `registry.npmjs.org` is operated by **npm, Inc. (GitHub)**. It is
   > **not a Microsoft 365 or Azure Online Service**, so it is **outside the Microsoft 365 /
@@ -49,6 +47,11 @@ newer releases, which can also be turned off. Specifically:
   > Microsoft Products and Services Data Protection Addendum (DPA)**; it is governed by the
   > [npm privacy policy](https://docs.npmjs.com/policies/privacy).
 
+  > **Configured-registry disclosure.** If you set `SPE_NPM_REGISTRY`, the request goes to that
+  > endpoint instead of `registry.npmjs.org`. Its operator, contractual terms, data handling,
+  > and compliance boundary depend on your configuration; this project does not classify a
+  > configured endpoint as npm/GitHub or as inside or outside any particular boundary.
+
   **Exactly one request is made,** to the exact package path with no query string and no
   fragment:
 
@@ -56,10 +59,11 @@ newer releases, which can also be turned off. Specifically:
   GET https://registry.npmjs.org/@microsoft%2fspe-mcp
   ```
 
-  **What the third party can see.** The request is an **unauthenticated HTTP GET of
+  **What the registry operator can see.** The request is an **unauthenticated HTTP GET of
   public package metadata, sent without a user identifier** — the same lookup `npm view` performs.
   The request body and headers
-  carry no identifiers, but the connection itself necessarily discloses to npm:
+  carry no identifiers, but the connection itself necessarily discloses to the registry
+  operator (npm for the default endpoint):
 
   | Disclosed to npm | Why |
   |------------------|-----|
@@ -98,8 +102,10 @@ newer releases, which can also be turned off. Specifically:
   delete it, or remove the file by hand.
 
   **First-run notice.** Before the **first** network request in a process, the tool prints a
-  one-time notice to **stderr** naming the endpoint, the boundary, and how to turn the check
-  off. No notice is printed when the check is disabled or served from cache.
+  one-time notice to **stderr** naming the endpoint and how to turn the check off. The default
+  endpoint gets the npm/GitHub boundary disclosure; a configured endpoint is described
+  neutrally because its operator and boundary depend on your configuration. No notice is
+  printed when the check is disabled or served from cache.
 
   **Turning it off.** The check is **skipped automatically** in CI and when running from a
   source checkout, and can be disabled outright (see [Turning it off](#turning-it-off)); when
@@ -123,11 +129,14 @@ travels to each.
 > signal is the product `User-Agent` attribution token described above, which is on by default
 > and can be turned off (see [Turning it off](#turning-it-off) and the
 > [Telemetry configuration](NOTICE.md#telemetry-configuration) note). Separately from anything
-> sent to Microsoft, the default-on update check contacts the public npm registry, which is
+> sent to Microsoft, the default-on update check contacts the public npm registry by default,
+> which is
 > **not a Microsoft 365 or Azure Online Service** and is outside the M365/Azure compliance
 > boundary, the Product Terms/DPA, and the EU Data Boundary — see
 > [Update check (public npm registry)](#what-the-tool-collects-and-sends) above and
-> [NOTICE.md — Third-party services contacted](NOTICE.md#third-party-services-contacted).
+> [NOTICE.md — Third-party services contacted](NOTICE.md#third-party-services-contacted). A
+> configured registry replaces that endpoint and has configuration-dependent ownership and
+> boundary treatment as described above.
 
 ## Service-side data handling
 
@@ -155,10 +164,12 @@ carry the underlying tool's default `User-Agent` instead (e.g. the Azure CLI's o
 `az`/`azd`, or the Node runtime default for direct Graph calls), whose logging is governed by
 those services' own terms.
 
-The **update check** — the only outbound call to a service that is **not a Microsoft 365 or Azure
-Online Service**, and therefore the only call that leaves the Microsoft 365 / Azure compliance
-boundary (and the Product Terms / DPA / EUDB commitments) — is on by default in published
-installs. Any one of the following disables it completely:
+The **update check** uses the public npm registry by default — the only default outbound
+destination that is not a Microsoft 365 or Azure Online Service and therefore the only default
+call outside the Microsoft 365 / Azure compliance boundary (and the Product Terms / DPA / EUDB
+commitments). A configured registry replaces that endpoint and has configuration-dependent
+ownership and boundary treatment. The check is on by default in published installs. Any one of
+the following disables it completely:
 
 | Opt-out | Effect |
 |---------|--------|

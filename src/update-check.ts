@@ -154,23 +154,37 @@ const logger = createLogger("Update");
  * Build the one-time stderr disclosure emitted immediately BEFORE the first
  * network request of a process.
  *
- * It must name the endpoint actually contacted, say plainly that the endpoint
- * sits outside the Microsoft 365 / Azure compliance boundary, say what the
- * connection discloses, say that nothing is installed, and name the opt-out.
+ * It must name the endpoint actually contacted. The default public npm
+ * registry gets its explicit operator/compliance-boundary disclosure; an
+ * operator-supplied override is described neutrally because this process
+ * cannot know who operates it or which boundary contains it. Both variants say
+ * what the connection discloses, say that nothing is installed, and name the
+ * opt-out.
  *
  * @param registry - The resolved registry origin. Always a value that already
  *   passed {@link resolveRegistry} (HTTPS, no credentials, no query/fragment,
  *   length-capped), so it is safe to print verbatim.
  */
 export function collectionNotice(registry: string): string {
+  const destination =
+    registry === DEFAULT_REGISTRY
+      ? [
+          "The public npm registry is a third-party service operated by npm, Inc. /",
+          "GitHub OUTSIDE the Microsoft 365 / Azure compliance boundary.",
+        ]
+      : [
+          "This endpoint was supplied through SPE_NPM_REGISTRY; its operator and",
+          "compliance boundary depend on your configuration.",
+        ];
+
   return [
-    `Update check: contacting the npm registry at ${registry} to see whether a`,
+    `Update check: contacting the registry at ${registry} to see whether a`,
     `newer version of ${PACKAGE_NAME} has been published.`,
-    "The npm registry is a third-party service OUTSIDE the Microsoft 365 / Azure",
-    "compliance boundary. The request is unauthenticated and carries no user",
+    ...destination,
+    "The request is unauthenticated and carries no user",
     "identifier and no account, tenant, machine, session, or content data — but",
     "the connection itself discloses your IP address, the package name, and the",
-    "product User-Agent to that third party. The result is cached locally until",
+    "product User-Agent to the registry operator. The result is cached locally until",
     "you delete it. Nothing is downloaded, installed, or updated automatically.",
     "Turn this off with --no-update-check or SPE_MCP_UPDATE_CHECK=false.",
   ].join(" ");
@@ -450,21 +464,22 @@ function emptyTagMap(): Record<string, string> {
  * Everything here treats the input as hostile: the JSON may be any shape, keys
  * may be prototype pollution attempts, and values may be enormous or not
  * versions at all. Anything that is not a short tag name mapped to a strictly
- * valid SemVer string is dropped silently.
+ * valid SemVer string is dropped. A packument with no usable tags is rejected
+ * as unavailable rather than being mistaken for a successful current result.
  */
-function extractDistTags(raw: string): Record<string, string> {
+function extractDistTags(raw: string): Record<string, string> | null {
   const result = emptyTagMap();
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return result;
+    return null;
   }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return result;
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
 
   const tags = (parsed as Record<string, unknown>)["dist-tags"];
-  if (typeof tags !== "object" || tags === null || Array.isArray(tags)) return result;
+  if (typeof tags !== "object" || tags === null || Array.isArray(tags)) return null;
 
   for (const [name, value] of Object.entries(tags as Record<string, unknown>)) {
     if (!isSafeTagName(name)) continue;
@@ -473,7 +488,7 @@ function extractDistTags(raw: string): Record<string, string> {
     result[name] = value;
   }
 
-  return result;
+  return Object.keys(result).length > 0 ? result : null;
 }
 
 /**

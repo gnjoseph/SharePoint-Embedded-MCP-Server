@@ -15,7 +15,7 @@
 import { assertAzCli, getSignedInIdentity } from "../bootstrap.js";
 import { readState } from "../state.js";
 import type { McpTool } from "../types.js";
-import { getUpdateStatus } from "../update-check.js";
+import { DEFAULT_REGISTRY, getUpdateStatus } from "../update-check.js";
 
 /**
  * Render the server-version and update-awareness (SEC-008) rows shared by every
@@ -53,7 +53,11 @@ function versionRows(): string {
   }
   rows += `| **Last update check** | ${status.lastCheckedAt ?? "never"} |\n`;
   if (status.registry) {
-    rows += `| **Update registry** | \`${status.registry}\` (third party, outside the M365/Azure boundary) |\n`;
+    const registryDescription =
+      status.registry === DEFAULT_REGISTRY
+        ? "public npm registry; third party, outside the M365/Azure boundary"
+        : "configured registry; operator and compliance boundary depend on your configuration";
+    rows += `| **Update registry** | \`${status.registry}\` (${registryDescription}) |\n`;
   }
   if (status.cacheFile) {
     rows += `| **Update cache file** | \`${status.cacheFile}\` |\n`;

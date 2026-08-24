@@ -272,8 +272,11 @@ describe("extractDistTags", () => {
     ["dist-tags as an array", '{"dist-tags":[]}'],
     ["dist-tags as null", '{"dist-tags":null}'],
     ["dist-tags as a string", '{"dist-tags":"latest"}'],
-  ])("returns no tags for %s", (_label, raw) => {
-    expect(__testing.extractDistTags(raw)).toEqual({});
+    ["empty dist-tags", '{"dist-tags":{}}'],
+    ["prototype-only dist-tags", '{"dist-tags":{"__proto__":"9.9.9"}}'],
+    ["entirely invalid dist-tags", '{"dist-tags":{"latest":"not-semver","next":42}}'],
+  ])("rejects %s", (_label, raw) => {
+    expect(__testing.extractDistTags(raw)).toBeNull();
   });
 
   it("drops prototype-pollution keys", () => {
@@ -617,6 +620,25 @@ describe("runUpdateCheck", () => {
     expect(readCacheFile()["outcome"]).toBe("success");
   });
 
+  it("accepts mixed valid and invalid tags after filtering", async () => {
+    respondWith(
+      JSON.stringify({
+        "dist-tags": {
+          latest: PACKAGE_VERSION,
+          malformed: "not-a-version",
+          nested: { version: "9.9.9" },
+          __proto__: "9.9.9",
+        },
+      }),
+    );
+
+    await __testing.runUpdateCheck({});
+
+    expect(getUpdateStatus().state).toBe("up-to-date");
+    expect(takePendingUpdateNotice()).toBeNull();
+    expect(readCacheFile()["outcome"]).toBe("success");
+  });
+
   it("ignores older published versions", async () => {
     respondWith(packument({ latest: "0.0.1" }));
     await __testing.runUpdateCheck({});
@@ -706,13 +728,15 @@ describe("runUpdateCheck", () => {
   it.each([
     ["garbage that is not JSON", "<html>404</html>"],
     ["JSON with no dist-tags", '{"name":"x"}'],
+    ["empty dist-tags", '{"dist-tags":{}}'],
     ["dist-tags full of junk", '{"dist-tags":{"latest":"not-a-version","next":{"a":1}}}'],
     ["prototype pollution attempts", '{"dist-tags":{"__proto__":"999.0.0"}}'],
-  ])("treats %s as no update rather than an error", async (_label, body) => {
+  ])("treats %s as an unavailable registry response", async (_label, body) => {
     respondWith(body);
     await __testing.runUpdateCheck({});
-    expect(getUpdateStatus().state).toBe("up-to-date");
+    expect(getUpdateStatus().state).toBe("unavailable");
     expect(takePendingUpdateNotice()).toBeNull();
+    expect(readCacheFile()["outcome"]).toBe("failure");
   });
 
   it.each([
@@ -1069,7 +1093,8 @@ describe("privacy: first-run collection notice", () => {
   });
 
   it("names the endpoint, the boundary, the retention, and the opt-out", () => {
-    expect(COLLECTION_NOTICE).toContain("npm registry");
+    expect(COLLECTION_NOTICE).toContain("public npm registry");
+    expect(COLLECTION_NOTICE).toContain("npm, Inc. / GitHub");
     expect(COLLECTION_NOTICE).toContain("OUTSIDE the Microsoft 365 / Azure");
     expect(COLLECTION_NOTICE).toContain("IP address");
     expect(COLLECTION_NOTICE).toContain("User-Agent");
@@ -1142,15 +1167,24 @@ describe("privacy: collection notice names the configured registry", () => {
     expect(notice).toContain(DEFAULT_REGISTRY);
   });
 
-  it("names the override host, not the default, when SPE_NPM_REGISTRY is set", async () => {
+  it("describes an override neutrally without assigning its operator or boundary", async () => {
     process.env.SPE_NPM_REGISTRY = "https://npm.contoso.example";
     await __testing.runUpdateCheck({});
-    const notice = lines.find((l) => l.includes("OUTSIDE the Microsoft 365 / Azure"));
+    const notice = lines.find((l) => l.includes("https://npm.contoso.example"));
     expect(notice).toBeDefined();
     expect(notice).toContain("https://npm.contoso.example");
+    expect(notice).toContain("supplied through SPE_NPM_REGISTRY");
+    expect(notice).toContain("operator and compliance boundary depend on your configuration");
+    expect(notice).toContain("IP address");
+    expect(notice).toContain("cached locally until you delete it");
+    expect(notice).toContain("Nothing is downloaded, installed, or updated automatically");
+    expect(notice).toContain("--no-update-check");
     // Telling the user we contacted npmjs.org when we did not would be a
     // false disclosure.
     expect(notice).not.toContain(DEFAULT_REGISTRY);
+    expect(notice).not.toContain("npm, Inc.");
+    expect(notice).not.toContain("third-party service");
+    expect(notice).not.toContain("OUTSIDE the Microsoft 365 / Azure");
   });
 
   it("only ever renders a registry that already passed validation", () => {

@@ -162,4 +162,42 @@ describe("status_get: server version and update state", () => {
     // A disabled check must never advertise an update.
     expect(result.content[0].text).not.toContain("available —");
   });
+
+  it("identifies the default public npm registry boundary", async () => {
+    const statusSpy = vi.spyOn(updateCheck, "getUpdateStatus").mockReturnValue({
+      enabled: true,
+      state: "up-to-date",
+      currentVersion: PACKAGE_VERSION,
+      registry: updateCheck.DEFAULT_REGISTRY,
+    });
+    try {
+      const result = await statusTool.handler({});
+      const text = result.content[0].text;
+      expect(text).toContain(`\`${updateCheck.DEFAULT_REGISTRY}\``);
+      expect(text).toContain("public npm registry; third party, outside the M365/Azure boundary");
+    } finally {
+      statusSpy.mockRestore();
+    }
+  });
+
+  it("describes a configured registry without assigning its operator or boundary", async () => {
+    const statusSpy = vi.spyOn(updateCheck, "getUpdateStatus").mockReturnValue({
+      enabled: true,
+      state: "up-to-date",
+      currentVersion: PACKAGE_VERSION,
+      registry: "https://npm.contoso.example",
+    });
+    try {
+      const result = await statusTool.handler({});
+      const text = result.content[0].text;
+      expect(text).toContain("`https://npm.contoso.example`");
+      expect(text).toContain(
+        "configured registry; operator and compliance boundary depend on your configuration",
+      );
+      expect(text).not.toContain("third party");
+      expect(text).not.toContain("outside the M365/Azure boundary");
+    } finally {
+      statusSpy.mockRestore();
+    }
+  });
 });

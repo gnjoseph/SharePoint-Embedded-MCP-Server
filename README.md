@@ -133,7 +133,8 @@ package if you installed it globally or locally).
 ### Update notifications
 
 To make it obvious when you are running an old build, the server checks the
-public npm registry **once a day, in the background**, for a newer published
+public npm registry by default (or the HTTPS registry you set with
+`SPE_NPM_REGISTRY`) **once a day, in the background**, for a newer published
 release and — if one exists — appends a short notice to a single tool result:
 
 ```text
@@ -155,8 +156,8 @@ How it behaves:
   own dist-tag, and a newer **stable** release is mentioned separately.
 - **Quiet.** The notice is shown once per newer version, not on every call.
 - **Unauthenticated, without a user identifier.** Exactly one unauthenticated
-  `GET` of the package's public metadata —
-  `https://registry.npmjs.org/@microsoft%2fspe-mcp`, no query string,
+  `GET` of the package metadata — by default,
+  `https://registry.npmjs.org/@microsoft%2fspe-mcp` — with no query string and
   redirects rejected. No credentials, cookies, `.npmrc`, or `npm` subprocess are
   involved, and **no install GUID, machine, user, tenant, subscription, or
   session identifier** is sent. As with any HTTPS request, npm sees your IP
@@ -168,7 +169,9 @@ How it behaves:
 - **Announced.** Before the first check in a process, a one-time notice is
   printed to **stderr** naming the endpoint actually contacted (the registry from
   `SPE_NPM_REGISTRY` if you set one, otherwise `registry.npmjs.org`), the
-  boundary, and the opt-out.
+  applicable boundary information, and the opt-out. Configured registries are
+  described neutrally because their operator and compliance boundary depend on
+  your configuration.
 - **Cached locally.** The result is stored owner-only at
   `<data dir>/update-check.json` and **kept until you delete it**;
   `spe-mcp logout` and `spe-mcp auth --reset` remove it, and `status_get` prints
@@ -178,8 +181,10 @@ How it behaves:
 > It is **not a Microsoft 365 or Azure Online Service**, so it is not covered by
 > the Microsoft Product Terms, the Microsoft Products and Services Data
 > Protection Addendum (DPA), or the EU Data Boundary. It is the **only** endpoint
-> this server contacts that is **outside the Microsoft 365 / Azure compliance
-> boundary**. Disable the update check to remove it entirely.
+> this server contacts by default that is **outside the Microsoft 365 / Azure
+> compliance boundary**. If you configure another registry, its operator,
+> policies, and compliance boundary depend on your configuration. Disable the
+> update check to remove registry egress entirely.
 
 > **Known limitation.** Node's built-in `fetch` does not honour `HTTP_PROXY` /
 > `HTTPS_PROXY` / `NO_PROXY`, so this request cannot be routed through an egress
@@ -686,9 +691,9 @@ details see [PRIVACY.md](PRIVACY.md) and [docs/DATA-FLOW.md](docs/DATA-FLOW.md);
 handling of data you send to its online services is described in the
 [Microsoft Privacy Statement](https://privacy.microsoft.com/privacystatement).
 
-The one destination that is **not a Microsoft 365 or Azure Online Service** is the public npm
-registry (`https://registry.npmjs.org`, operated by npm, Inc./GitHub), contacted at most once a
-day by the [update check](#update-notifications) to read the published version list for
+The one destination contacted by default that is **not a Microsoft 365 or Azure Online Service**
+is the public npm registry (`https://registry.npmjs.org`, operated by npm, Inc./GitHub), contacted
+at most once a day by the [update check](#update-notifications) to read the published version list for
 `@microsoft/spe-mcp`. ⚠️ Because it is not a Microsoft Online Service, it is **not covered by the
 Microsoft Product Terms, the Microsoft Products and Services Data Protection Addendum (DPA), or
 the EU Data Boundary**, and it is **outside the Microsoft 365 / Azure compliance
@@ -711,6 +716,9 @@ checkouts. The cached result lives at `<data dir>/update-check.json`, is retaine
 delete it, and is removed by `spe-mcp logout` / `spe-mcp auth --reset`. npm's own handling of
 registry requests is governed by the
 [npm privacy policy](https://docs.npmjs.com/policies/privacy).
+If `SPE_NPM_REGISTRY` is set, the request goes to that configured endpoint instead. Its operator,
+policies, and compliance boundary depend on your configuration; the server does not attribute it
+to npm/GitHub or classify it as inside or outside a particular boundary.
 
 **Data collection (standard Microsoft notice).** The software may collect information about
 you and your use of the software and send it to Microsoft; Microsoft may use this information
@@ -719,13 +727,13 @@ consent to these practices (full text in [NOTICE.md](NOTICE.md#data-collection))
 build opens no usage-analytics channel** — the only Microsoft-bound signal is the product
 `User-Agent` attribution token described above, which you can turn off with
 `SPE_MCP_COLLECT_TELEMETRY=false`. Separately from anything sent to Microsoft, the default-on
-[update check](#update-notifications) contacts the **public npm registry**
+[update check](#update-notifications) contacts the **public npm registry by default**
 (`registry.npmjs.org`, operated by npm, Inc./GitHub). That endpoint is **not a Microsoft 365 or
 Azure Online Service**: it sits **outside the Microsoft 365 / Azure compliance boundary** and is
 not covered by the Microsoft Product Terms, the Microsoft Products and Services Data Protection
 Addendum (DPA), or the EU Data Boundary. See the npm registry disclosure above and
 [NOTICE.md — Third-party services contacted](NOTICE.md#third-party-services-contacted) for what
-is and is not disclosed, and how to turn it off.
+is and is not disclosed, how configured registries are handled, and how to turn it off.
 
 **Telemetry configuration.** Attribution is gated by the `SPE_MCP_COLLECT_TELEMETRY` environment
 variable and is **on by default**. The only telemetry emitted is the static product

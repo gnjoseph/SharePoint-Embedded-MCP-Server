@@ -61,6 +61,10 @@ and Microsoft Entra ID), this build contacts **one non-Microsoft service by defa
   covered by the Microsoft Product Terms, the Microsoft Products and Services Data Protection
   Addendum (DPA), or the EU Data Boundary. Data handling is governed by the applicable
   **GitHub/npm privacy statements**, not by your Microsoft agreements.
+- **Configured registry.** If you set `SPE_NPM_REGISTRY`, the update check contacts that endpoint
+  instead of the public npm registry. Its operator, terms, data handling, and compliance boundary
+  depend on your configuration; the server's notice identifies it neutrally rather than
+  attributing it to npm/GitHub or assigning it to a boundary.
 - **Nothing is downloaded or installed.** The check reads version metadata only. This build
   never downloads, installs, executes, or self-updates anything. Acting on a notice is a human
   decision.

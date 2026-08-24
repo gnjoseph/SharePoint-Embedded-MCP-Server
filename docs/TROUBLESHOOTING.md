@@ -116,12 +116,14 @@ Common situations:
   In proxy-only environments, disable the check with `SPE_MCP_UPDATE_CHECK=false`.
 - **Internal/mirror registry.** Set `SPE_NPM_REGISTRY` to your mirror. It must be an `https:`
   URL with no embedded credentials, query string, or fragment; anything else is ignored and
-  the check is disabled for that run. Redirects and cross-host responses are rejected.
+  the check is disabled for that run. Redirects and cross-host responses are rejected. The
+  notice and `status_get` identify a configured registry neutrally; its operator and compliance
+  boundary depend on your configuration.
 - **A one-time stderr notice appeared at startup.** Before the first registry request, the
-  server prints a single collection notice to **stderr** naming the endpoint
-  (`registry.npmjs.org`, npm, Inc./GitHub — **outside the Microsoft 365 / Azure compliance
-  boundary**) and the opt-out. It is informational; stdout is never written to. Set any opt-out
-  above to suppress it entirely.
+  server prints a single collection notice to **stderr** naming the endpoint and the opt-out.
+  For the default `registry.npmjs.org` endpoint it names npm, Inc./GitHub and the boundary; for
+  a configured registry it does not guess the operator or boundary. It is informational; stdout
+  is never written to. Set any opt-out above to suppress it entirely.
 - **Delete the cached update state.** The cache lives at `<data dir>/update-check.json` (path
   shown by `status_get`), contains **no identifier**, and is retained until removed. Delete it
   with `spe-mcp logout`, `spe-mcp auth --reset`, or by removing the file manually. Deleting it
