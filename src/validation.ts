@@ -56,9 +56,8 @@ export function requireString(
 /**
  * Strict allowlist patterns for identifiers that are passed as arguments to the
  * Azure CLI. Even though process spawning is shell-free (see `./proc-exec.ts`),
- * validating these values before they become CLI arguments is defence in depth:
- * it blocks argument-injection (a leading `-`/`--` being read as a CLI flag) and
- * keeps obviously malformed input from reaching Azure.
+ * validating these values before they become CLI arguments is defence in depth
+ * and keeps malformed input from reaching Azure.
  */
 
 /** Canonical Azure subscription ID form: a lowercase/uppercase GUID. */
@@ -66,11 +65,11 @@ const AZURE_SUBSCRIPTION_ID_RE =
   /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
 /**
- * Azure resource-group naming rules: 1–90 chars of letters, digits, `_`, `.`,
- * `(`, `)`, `-`; may not start with `-` (which would be read as a CLI flag) and
- * may not end with `.`. The first-char class deliberately omits `-`.
+ * Azure resource-group naming rules: 1–90 chars of Unicode letters, decimal
+ * digits, `_`, `.`, `(`, `)`, `-`; may not end with `.`. Azure permits a leading
+ * hyphen, so CLI call sites must bind such names to their option unambiguously.
  */
-const AZURE_RESOURCE_GROUP_RE = /^[A-Za-z0-9_.()][A-Za-z0-9_.()-]{0,89}$/;
+const AZURE_RESOURCE_GROUP_RE = /^[\p{L}\p{Nd}_.()-]{1,90}$/u;
 
 /** True when `value` is a syntactically valid Azure subscription ID (GUID). */
 export function isAzureSubscriptionId(value: unknown): value is string {

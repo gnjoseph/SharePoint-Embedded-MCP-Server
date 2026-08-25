@@ -98,6 +98,22 @@ const INJECTION_PAYLOADS = [
   "-g",
 ];
 
+const INVALID_RESOURCE_GROUP_NAMES = [
+  "rg &",
+  "rg |",
+  "rg ;",
+  "rg``",
+  "rg$()",
+  "rg >",
+  "rg %%",
+  "rg !!",
+  "r\ng",
+  "rg/name",
+  "endsWithDot.",
+  "has space",
+  `${"a".repeat(91)}`,
+];
+
 describe("isAzureSubscriptionId", () => {
   it("accepts a canonical GUID", () => {
     expect(isAzureSubscriptionId(VALID_SUBSCRIPTION_ID)).toBe(true);
@@ -112,21 +128,22 @@ describe("isAzureSubscriptionId", () => {
 });
 
 describe("isAzureResourceGroupName", () => {
-  it.each(["rg1", "my_group", "a", VALID_RESOURCE_GROUP, "group-1"])(
+  it.each([
+    "rg1",
+    "my_group",
+    "a",
+    VALID_RESOURCE_GROUP,
+    "group-1",
+    "-leading-hyphen",
+    "Équipe-42",
+    "研发组٤٢",
+  ])(
     "accepts a valid resource-group name (%p)",
     (value) => {
       expect(isAzureResourceGroupName(value)).toBe(true);
     },
   );
-
-  it.each([
-    ...INJECTION_PAYLOADS,
-    "-startsWithHyphen",
-    "endsWithDot.",
-    "has space",
-    "",
-    `${"a".repeat(91)}`,
-  ])("rejects invalid / injection input (%p)", (value) => {
+  it.each([...INVALID_RESOURCE_GROUP_NAMES, ""])("rejects invalid input (%p)", (value) => {
     expect(isAzureResourceGroupName(value)).toBe(false);
   });
 });
@@ -157,21 +174,27 @@ describe("requireAzureSubscriptionId", () => {
 });
 
 describe("requireAzureResourceGroupName", () => {
-  it("accepts and returns a trimmed name", () => {
-    const r = requireAzureResourceGroupName("  rg-1  ");
-    expect(r.ok).toBe(true);
-    if (r.ok) expect(r.value).toBe("rg-1");
-  });
+  it.each(["rg-1", "-leading-hyphen", "Équipe-42"])(
+    "accepts and returns a trimmed valid name (%p)",
+    (value) => {
+      const r = requireAzureResourceGroupName(`  ${value}  `);
+      expect(r.ok).toBe(true);
+      if (r.ok) expect(r.value).toBe(value);
+    },
+  );
 
-  it.each(INJECTION_PAYLOADS)("rejects injection payload (%p) with a name message", (value) => {
-    const r = requireAzureResourceGroupName(value);
-    expect(r.ok).toBe(false);
-    if (!r.ok) {
-      expect(r.error.content[0].text).toBe(
-        "Error: resourceGroup must be a valid Azure resource group name",
-      );
-    }
-  });
+  it.each(INVALID_RESOURCE_GROUP_NAMES)(
+    "rejects an invalid name (%p) with a name message",
+    (value) => {
+      const r = requireAzureResourceGroupName(value);
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error.content[0].text).toBe(
+          "Error: resourceGroup must be a valid Azure resource group name",
+        );
+      }
+    },
+  );
 });
 
 describe("assertAzureSubscriptionId", () => {
@@ -185,11 +208,14 @@ describe("assertAzureSubscriptionId", () => {
 });
 
 describe("assertAzureResourceGroupName", () => {
-  it("does not throw for a valid name", () => {
-    expect(() => assertAzureResourceGroupName("rg-1")).not.toThrow();
-  });
+  it.each(["rg-1", "-leading-hyphen", "研发组٤٢"])(
+    "does not throw for a valid name (%p)",
+    (value) => {
+      expect(() => assertAzureResourceGroupName(value)).not.toThrow();
+    },
+  );
 
-  it.each(INJECTION_PAYLOADS)("throws a generic error for injection payload (%p)", (value) => {
+  it.each(INVALID_RESOURCE_GROUP_NAMES)("throws a generic error for invalid input (%p)", (value) => {
     expect(() => assertAzureResourceGroupName(value)).toThrow(
       "Invalid Azure resource group name",
     );

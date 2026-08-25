@@ -151,9 +151,12 @@ export async function resourceGroupExists(
   try {
     assertAzureResourceGroupName(name);
     assertAzureSubscriptionId(subscriptionId);
+    // Azure permits resource-group names that begin with a hyphen. Bind those
+    // values with `--name=<value>` so the CLI cannot parse the name as an option.
+    const nameArgs = name.startsWith("-") ? [`--name=${name}`] : ["--name", name];
     await runCommand(
       "az",
-      ["group", "show", "--name", name, "--subscription", subscriptionId, "--output", "json"],
+      ["group", "show", ...nameArgs, "--subscription", subscriptionId, "--output", "json"],
       { timeout: AZ_TIMEOUT_MS },
     );
     return true;

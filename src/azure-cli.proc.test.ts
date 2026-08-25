@@ -33,6 +33,8 @@ const run = vi.mocked(runCommand);
 // "legal but shell-sensitive" argument.
 const VALID_SUBSCRIPTION_ID = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
 const VALID_RESOURCE_GROUP = "rg-spe-demo_01.(prod)";
+const LEADING_HYPHEN_RESOURCE_GROUP = "-rg-leading";
+const UNICODE_RESOURCE_GROUP = "Équipe-研发٤٢";
 
 // Subscription ids are validated as strict GUIDs, so ANY non-GUID string is
 // rejected — including plain words and shell metacharacter payloads.
@@ -47,15 +49,14 @@ const MALFORMED_SUBSCRIPTION_IDS = [
   "sub ;",
 ];
 
-// Resource-group names accept letters/digits/`_.()-`, so a plain word like
-// "not-a-guid" is VALID and must NOT appear here — only names that fail the
-// allowlist (whitespace, shell metacharacters, path traversal, flag-lookalikes).
+// Resource-group names accept Unicode letters/decimal digits/`_.()-`, so a
+// plain word like "not-a-guid" is VALID and must NOT appear here — only names
+// that fail the allowlist (whitespace, shell metacharacters, path traversal).
 const MALFORMED_RESOURCE_GROUP_NAMES = [
   "rg &",
   "rg |",
   "rg $()",
   "``",
-  "--query",
   "a b",
   "rg/../",
   "rg ;",
@@ -160,6 +161,61 @@ describe("azure-cli process seam — discrete argv, no shell", () => {
     ]);
     // The `.()`-bearing name stays a single argv element.
     expect(args[3]).toBe(VALID_RESOURCE_GROUP);
+    expect(opts).not.toHaveProperty("shell");
+  });
+
+  it("binds a leading-hyphen resource-group name to --name in one argv element", async () => {
+    run.mockResolvedValue({ stdout: "{}", stderr: "" });
+
+    const exists = await resourceGroupExists(
+      LEADING_HYPHEN_RESOURCE_GROUP,
+      VALID_SUBSCRIPTION_ID,
+    );
+
+    expect(exists).toBe(true);
+    expect(run).toHaveBeenCalledTimes(1);
+    const [cmd, args, opts] = run.mock.calls[0] as unknown as [
+      string,
+      string[],
+      Record<string, unknown>,
+    ];
+    expect(cmd).toBe("az");
+    expect(args).toEqual([
+      "group",
+      "show",
+      `--name=${LEADING_HYPHEN_RESOURCE_GROUP}`,
+      "--subscription",
+      VALID_SUBSCRIPTION_ID,
+      "--output",
+      "json",
+    ]);
+    expect(opts).not.toHaveProperty("shell");
+  });
+
+  it("passes a Unicode resource-group name as one discrete argv element", async () => {
+    run.mockResolvedValue({ stdout: "{}", stderr: "" });
+
+    const exists = await resourceGroupExists(UNICODE_RESOURCE_GROUP, VALID_SUBSCRIPTION_ID);
+
+    expect(exists).toBe(true);
+    expect(run).toHaveBeenCalledTimes(1);
+    const [cmd, args, opts] = run.mock.calls[0] as unknown as [
+      string,
+      string[],
+      Record<string, unknown>,
+    ];
+    expect(cmd).toBe("az");
+    expect(args).toEqual([
+      "group",
+      "show",
+      "--name",
+      UNICODE_RESOURCE_GROUP,
+      "--subscription",
+      VALID_SUBSCRIPTION_ID,
+      "--output",
+      "json",
+    ]);
+    expect(args[3]).toBe(UNICODE_RESOURCE_GROUP);
     expect(opts).not.toHaveProperty("shell");
   });
 });
