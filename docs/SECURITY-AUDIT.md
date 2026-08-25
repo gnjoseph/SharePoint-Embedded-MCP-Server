@@ -122,7 +122,7 @@ disclose unfixed vulnerabilities, so it is not offered in any form, for any targ
 blocked prerequisites, the scaffold is designed to send a **bounded, allowlisted corpus** to a
 model and validate every finding before anything is retained:
 
-- Corpus caps: 40 files, 96 KiB per file, 512 KiB total (`scripts/security-audit/lib/constants.mjs`).
+- Corpus caps: 128 files, 96 KiB per file, 1 MiB total (`scripts/security-audit/lib/constants.mjs`).
 - Instruction surfaces (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.github/instructions/`,
   `.github/agents/`, `.copilot/`, `Skills/*/SKILL.md`, …) are denied from the corpus outright, so
   agent-directed text can never be re-presented to the auditing model as repository content.
@@ -221,7 +221,7 @@ in CI.
 
 | File | Contents |
 | --- | --- |
-| `corpus-manifest.json` | Files collected, byte/line counts, skipped files, the run nonce |
+| `corpus-manifest.json` | Complete eligible file inventory, byte/line counts, and the run nonce |
 | `system.txt` | Rendered auditor preamble (vocabulary injected from `constants.mjs`) |
 | `prompt.txt` | Nonce-fenced corpus followed by the trusted output-contract suffix |
 | `model-report.json` | Accepted findings and rejected finding indexes with reason codes |

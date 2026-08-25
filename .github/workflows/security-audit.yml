@@ -304,7 +304,14 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p .security-audit
+          # Gitleaks otherwise auto-loads configuration, ignore fingerprints,
+          # and inline allow comments from the scan target. Remove target-owned
+          # policy files and force the protected controller policy explicitly.
+          rm -rf -- target/.gitleaks.toml target/.gitleaksignore
           ./gitleaks git target \
+            --config scripts/security-audit/gitleaks-controller.toml \
+            --gitleaks-ignore-path scripts/security-audit/gitleaks-controller-ignore \
+            --ignore-gitleaks-allow \
             --report-format json \
             --report-path .security-audit/gitleaks.json \
             --redact \

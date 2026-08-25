@@ -57,16 +57,35 @@ function parseArgs(argv) {
  * @param {unknown} raw Parsed `npm audit --json` output.
  */
 export function sanitizeNpmAudit(raw) {
-  const metadata = raw?.metadata?.vulnerabilities ?? {};
+  if (
+    raw === null ||
+    typeof raw !== 'object' ||
+    Array.isArray(raw) ||
+    raw.metadata === null ||
+    typeof raw.metadata !== 'object' ||
+    Array.isArray(raw.metadata) ||
+    raw.metadata.vulnerabilities === null ||
+    typeof raw.metadata.vulnerabilities !== 'object' ||
+    Array.isArray(raw.metadata.vulnerabilities)
+  ) {
+    throw new TypeError('invalid npm audit report');
+  }
+  const metadata = raw.metadata.vulnerabilities;
+  const buckets = ['critical', 'high', 'moderate', 'low', 'info'];
+  for (const bucket of buckets) {
+    if (!Number.isSafeInteger(metadata[bucket]) || metadata[bucket] < 0) {
+      throw new TypeError('invalid npm audit report');
+    }
+  }
 
   return {
     kind: 'npm-audit',
     counts: {
-      critical: Number(metadata.critical ?? 0),
-      high: Number(metadata.high ?? 0),
-      moderate: Number(metadata.moderate ?? 0),
-      low: Number(metadata.low ?? 0),
-      info: Number(metadata.info ?? 0),
+      critical: metadata.critical,
+      high: metadata.high,
+      moderate: metadata.moderate,
+      low: metadata.low,
+      info: metadata.info,
     },
   };
 }
@@ -90,7 +109,10 @@ export function sanitizeNpmAudit(raw) {
  * @param {unknown} raw Parsed Gitleaks JSON report.
  */
 export function sanitizeGitleaks(raw) {
-  const entries = Array.isArray(raw) ? raw : [];
+  if (!Array.isArray(raw)) {
+    throw new TypeError('invalid gitleaks report');
+  }
+  const entries = raw;
   const rules = new Set();
   const files = new Set();
 
@@ -128,10 +150,15 @@ function main() {
   }
 
   let summary;
-  if (kind === 'npm-audit') summary = sanitizeNpmAudit(raw ?? {});
-  else if (kind === 'gitleaks') summary = sanitizeGitleaks(raw ?? []);
-  else {
-    process.stderr.write(`security-audit: unknown kind ${JSON.stringify(kind)}\n`);
+  try {
+    if (kind === 'npm-audit') summary = sanitizeNpmAudit(raw);
+    else if (kind === 'gitleaks') summary = sanitizeGitleaks(raw);
+    else {
+      process.stderr.write(`security-audit: unknown kind ${JSON.stringify(kind)}\n`);
+      process.exit(1);
+    }
+  } catch {
+    process.stderr.write('security-audit: invalid scanner report\n');
     process.exit(1);
   }
 

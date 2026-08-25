@@ -6,9 +6,9 @@
  *  - Only files under the scope's directory prefixes are considered.
  *  - Only allowlisted extensions are read; deny patterns remove tests, build
  *    output and vendored code.
- *  - Hard caps on file count, per-file bytes and total bytes. Oversized files are
- *    skipped rather than truncated, so the model never reasons about a partial
- *    file and reports a line number that does not exist upstream.
+ *  - Hard caps on file count, per-file bytes and total bytes. Any eligible file
+ *    that cannot be collected in full aborts the run, so a successful audit can
+ *    never represent a partial eligible corpus.
  *  - Every file body is fenced with a PER-RUN CRYPTOGRAPHIC NONCE. A static fence
  *    is forgeable — this repository's own `lib/constants.mjs` contains the fence
  *    sentinel — so the nonce is generated fresh for every run and cannot appear
@@ -54,6 +54,7 @@ import {
   neutralizeDelimiters,
   SCOPES,
 } from './lib/constants.mjs';
+import { gitExecutable } from './lib/git-executable.mjs';
 
 /**
  * @param {string[]} argv
@@ -99,7 +100,7 @@ const GIT_SYMLINK_MODE = '120000';
 function listTrackedFiles(repoRoot) {
   // `-s` prepends "<mode> <object> <stage>\t" to every record so symlink blobs
   // (mode 120000) can be rejected without following them.
-  const stdout = execFileSync('git', ['ls-files', '-s', '-z'], {
+  const stdout = execFileSync(gitExecutable(), ['ls-files', '-s', '-z'], {
     cwd: repoRoot,
     encoding: 'utf8',
     maxBuffer: 32 * 1024 * 1024,
@@ -196,7 +197,6 @@ function main() {
   /** @type {Record<string, { bytes: number, lines: number }>} */
   const manifest = {};
   const chunks = [];
-  const skipped = [];
   let totalBytes = 0;
   let fileCount = 0;
   let neutralizedTotal = 0;
@@ -206,12 +206,15 @@ function main() {
   const nonce = generateCorpusNonce();
   const delimiters = corpusDelimiters(nonce);
 
-  for (const { file } of candidates) {
-    if (fileCount >= CORPUS_LIMITS.maxFiles) {
-      skipped.push({ file, reason: 'max-files' });
-      continue;
-    }
+  if (candidates.length > CORPUS_LIMITS.maxFiles) {
+    fail(
+      `scope ${scope} exceeds the ${CORPUS_LIMITS.maxFiles}-file corpus limit`,
+    );
+  }
 
+  /** @type {Array<{ file: string, absolute: string, size: number }>} */
+  const prepared = [];
+  for (const { file } of candidates) {
     const absolute = path.join(repoRoot, file);
 
     // lstat, never stat: stat follows links and would report the *target*, so a
@@ -220,8 +223,7 @@ function main() {
     try {
       stats = lstatSync(absolute);
     } catch {
-      skipped.push({ file, reason: 'unreadable' });
-      continue;
+      fail(`refusing to collect ${file}: tracked file is unreadable`);
     }
 
     // Fail closed rather than skip. Reaching here means git reported a
@@ -231,8 +233,7 @@ function main() {
       fail(`refusing to read symlink ${file}`);
     }
     if (!stats.isFile()) {
-      skipped.push({ file, reason: 'not-a-file' });
-      continue;
+      fail(`refusing to collect ${file}: tracked path is not a regular file`);
     }
 
     // Catches a symlinked *parent* directory, which the index mode check above
@@ -243,15 +244,29 @@ function main() {
     const size = stats.size;
 
     if (size > CORPUS_LIMITS.maxFileBytes) {
-      skipped.push({ file, reason: 'max-file-bytes' });
-      continue;
+      fail(
+        `refusing to collect ${file}: file exceeds the ${CORPUS_LIMITS.maxFileBytes}-byte limit`,
+      );
     }
     if (totalBytes + size > CORPUS_LIMITS.maxTotalBytes) {
-      skipped.push({ file, reason: 'max-total-bytes' });
-      continue;
+      fail(
+        `scope ${scope} exceeds the ${CORPUS_LIMITS.maxTotalBytes}-byte corpus limit`,
+      );
     }
+    totalBytes += size;
+    prepared.push({ file, absolute, size });
+  }
 
-    const rawBody = readFileSync(absolute, 'utf8');
+  for (const { file, absolute, size } of prepared) {
+    let rawBody;
+    try {
+      rawBody = readFileSync(absolute, 'utf8');
+    } catch {
+      fail(`refusing to collect ${file}: tracked file could not be read`);
+    }
+    if (Buffer.byteLength(rawBody, 'utf8') !== size) {
+      fail(`refusing to collect ${file}: tracked file changed during collection`);
+    }
 
     // Defence in depth: a body must never be able to emit anything that looks
     // like a fence. The nonce makes forgery infeasible; neutralization makes it
@@ -264,7 +279,6 @@ function main() {
     const lines = body.split('\n').length;
 
     manifest[file] = { bytes: size, lines };
-    totalBytes += size;
     fileCount += 1;
 
     chunks.push(
@@ -305,7 +319,6 @@ function main() {
         totalBytes,
         neutralized: neutralizedTotal,
         files: manifest,
-        skipped,
       },
       null,
       2,
@@ -315,7 +328,7 @@ function main() {
 
   if (process.env.GITHUB_ACTIONS !== 'true') {
     process.stdout.write(
-      `security-audit: corpus scope=${scope} files=${fileCount} bytes=${totalBytes} skipped=${skipped.length} neutralized=${neutralizedTotal}\n`,
+      `security-audit: corpus scope=${scope} files=${fileCount} bytes=${totalBytes} neutralized=${neutralizedTotal}\n`,
     );
   }
 

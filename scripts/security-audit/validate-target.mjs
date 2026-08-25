@@ -33,6 +33,7 @@ import { execFileSync } from 'node:child_process';
 import { appendFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { ALLOWED_MODELS, DEFAULT_MODEL, DEFAULT_SCOPE, SCOPES } from './lib/constants.mjs';
+import { gitExecutable } from './lib/git-executable.mjs';
 
 const BASE_REF = 'refs/remotes/origin/main';
 /** The only ref the audit ever targets. */
@@ -93,13 +94,15 @@ function parseBoolean(value, name) {
 /** @param {string} sha */
 function assertReachableFromMain(sha) {
   try {
-    execFileSync('git', ['cat-file', '-e', `${sha}^{commit}`], { stdio: 'ignore' });
+    execFileSync(gitExecutable(), ['cat-file', '-e', `${sha}^{commit}`], { stdio: 'ignore' });
   } catch {
     fail(`ref ${sha} does not resolve to a commit in this repository`);
   }
 
   try {
-    execFileSync('git', ['merge-base', '--is-ancestor', sha, BASE_REF], { stdio: 'ignore' });
+    execFileSync(gitExecutable(), ['merge-base', '--is-ancestor', sha, BASE_REF], {
+      stdio: 'ignore',
+    });
   } catch {
     fail(
       `ref ${sha} is not an ancestor of ${BASE_REF}. ` +
@@ -157,7 +160,7 @@ function requireMainTip() {
  */
 function tryResolveMainTip() {
   try {
-    return execFileSync('git', ['rev-parse', `${BASE_REF}^{commit}`], {
+    return execFileSync(gitExecutable(), ['rev-parse', `${BASE_REF}^{commit}`], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();

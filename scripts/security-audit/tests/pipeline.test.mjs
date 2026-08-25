@@ -24,6 +24,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import {
+  ALLOWED_EXTENSIONS,
   CATEGORIES,
   CONFIDENCES,
   CORPUS_DENY_PATTERNS,
@@ -33,6 +34,7 @@ import {
   MAX_FINDINGS,
   PUBLIC_SUMMARY_FAIL,
   PUBLIC_SUMMARY_PASS,
+  SCOPES,
   SEVERITIES,
   corpusDelimiters,
   generateCorpusNonce,
@@ -43,7 +45,12 @@ import { findRejectReasons, redact } from '../lib/redaction.mjs';
 import { validateFindings, extractJson } from '../validate-response.mjs';
 import { FULL_SHA } from '../validate-target.mjs';
 import { renderTemplate, templateValues } from '../build-prompt.mjs';
-import { checkLocalActions, checkWorkflowSource, collectFiles } from '../check-action-pins.mjs';
+import {
+  checkDockerfileSource,
+  checkLocalActions,
+  checkWorkflowSource,
+  collectFiles,
+} from '../check-action-pins.mjs';
 import { sanitizeNpmAudit, sanitizeGitleaks } from '../sanitize-findings.mjs';
 import { modelStatus, buildSummary } from '../summarize.mjs';
 
@@ -133,6 +140,7 @@ function tempGitRepo(prefix) {
       env: { ...process.env, PATH: childPath(), Path: childPath() },
     });
   git('init', '--quiet');
+  git('config', 'core.autocrlf', 'false');
   git('config', 'user.email', 'audit@example.invalid');
   git('config', 'user.name', 'audit');
   return { dir, git };
@@ -305,6 +313,109 @@ test('corpus collection enforces the hard file and byte caps', () => {
   for (const entry of Object.values(manifest.files)) {
     assert.ok(entry.bytes <= CORPUS_LIMITS.maxFileBytes);
   }
+  assert.equal(
+    Object.hasOwn(manifest, 'skipped'),
+    false,
+    'a successful corpus may not represent skipped eligible files',
+  );
+});
+
+test('the full corpus contains every independently enumerated eligible tracked file', () => {
+  const out = tempDir('spe-corpus-complete-');
+  const result = runScript('collect-corpus.mjs', ['--scope', 'full', '--out', out]);
+  assert.equal(result.status, 0, result.stderr);
+
+  const tracked = execFileSync('git', ['ls-files', '-z'], {
+    cwd: REPO_ROOT,
+    encoding: 'utf8',
+    env: { ...process.env, PATH: childPath(), Path: childPath() },
+  })
+    .split('\0')
+    .filter(Boolean);
+  const expected = tracked
+    .filter((file) => SCOPES.full.some((prefix) => file.startsWith(prefix)))
+    .filter((file) => ALLOWED_EXTENSIONS.includes(path.extname(file)))
+    .filter((file) => !CORPUS_DENY_PATTERNS.some((pattern) => pattern.test(file)))
+    .sort();
+
+  const manifest = JSON.parse(readFileSync(path.join(out, 'corpus-manifest.json'), 'utf8'));
+  assert.deepEqual(Object.keys(manifest.files), expected);
+  assert.equal(manifest.fileCount, expected.length);
+});
+
+test('corpus collection fails before output when any hard limit would omit an eligible file', () => {
+  const cases = [
+    {
+      name: 'file-count',
+      populate(dir) {
+        for (let index = 0; index <= CORPUS_LIMITS.maxFiles; index += 1) {
+          writeFileSync(path.join(dir, 'src', `file-${index}.ts`), 'export {};\n', 'utf8');
+        }
+      },
+    },
+    {
+      name: 'single-file-bytes',
+      populate(dir) {
+        writeFileSync(
+          path.join(dir, 'src', 'oversized.ts'),
+          'x'.repeat(CORPUS_LIMITS.maxFileBytes + 1),
+          'utf8',
+        );
+      },
+    },
+    {
+      name: 'total-bytes',
+      populate(dir) {
+        const fileBytes = CORPUS_LIMITS.maxFileBytes;
+        const fileCount = Math.floor(CORPUS_LIMITS.maxTotalBytes / fileBytes) + 1;
+        for (let index = 0; index < fileCount; index += 1) {
+          writeFileSync(path.join(dir, 'src', `part-${index}.ts`), 'x'.repeat(fileBytes), 'utf8');
+        }
+      },
+    },
+  ];
+
+  for (const scenario of cases) {
+    const { dir, git } = tempGitRepo(`spe-corpus-${scenario.name}-`);
+    mkdirSync(path.join(dir, 'src'), { recursive: true });
+    scenario.populate(dir);
+    git('add', 'src');
+
+    const out = tempDir(`spe-corpus-${scenario.name}-out-`);
+    const result = runScript('collect-corpus.mjs', [
+      '--scope',
+      'server-core',
+      '--out',
+      out,
+      '--repo-root',
+      dir,
+    ]);
+    assert.notEqual(result.status, 0, `${scenario.name} must fail closed`);
+    assert.equal(existsSync(path.join(out, 'corpus.txt')), false);
+    assert.equal(existsSync(path.join(out, 'corpus-manifest.json')), false);
+  }
+});
+
+test('corpus collection fails before output when an eligible tracked file is missing', () => {
+  const { dir, git } = tempGitRepo('spe-corpus-missing-');
+  const source = path.join(dir, 'src', 'missing.ts');
+  mkdirSync(path.dirname(source), { recursive: true });
+  writeFileSync(source, 'export const present = true;\n', 'utf8');
+  git('add', 'src/missing.ts');
+  rmSync(source);
+
+  const out = tempDir('spe-corpus-missing-out-');
+  const result = runScript('collect-corpus.mjs', [
+    '--scope',
+    'server-core',
+    '--out',
+    out,
+    '--repo-root',
+    dir,
+  ]);
+  assert.notEqual(result.status, 0);
+  assert.equal(existsSync(path.join(out, 'corpus.txt')), false);
+  assert.equal(existsSync(path.join(out, 'corpus-manifest.json')), false);
 });
 
 test('every corpus file is fenced by per-run nonce delimiters', () => {
@@ -900,6 +1011,22 @@ test('npm audit reports are reduced to counts', () => {
   ]);
 });
 
+test('scanner sanitizers reject malformed successful-output shapes', () => {
+  for (const raw of [null, {}, { metadata: {} }, { metadata: { vulnerabilities: { high: 1 } } }]) {
+    assert.throws(() => sanitizeNpmAudit(raw), /invalid npm audit report/);
+  }
+  assert.throws(
+    () =>
+      sanitizeNpmAudit({
+        metadata: {
+          vulnerabilities: { info: 0, low: 0, moderate: 0, high: -1, critical: 0 },
+        },
+      }),
+    /invalid npm audit report/,
+  );
+  assert.throws(() => sanitizeGitleaks({}), /invalid gitleaks report/);
+});
+
 test('gitleaks reports never carry secret material', () => {
   const sanitized = sanitizeGitleaks([
     {
@@ -1166,6 +1293,58 @@ test('the offline dry run produces a validated report without credentials', () =
   }
 });
 
+test('local audit helpers find the default Windows Git install even when PATH omits git', (context) => {
+  if (process.platform !== 'win32') {
+    context.skip('Windows-specific fallback');
+  }
+
+  const defaultGit = 'C:\\Program Files\\Git\\cmd\\git.exe';
+  if (!existsSync(defaultGit)) {
+    context.skip('default Git for Windows install not present');
+  }
+
+  const strippedPath = process.env.SystemRoot
+    ? path.join(process.env.SystemRoot, 'System32')
+    : 'C:\\Windows\\System32';
+
+  const validate = spawnSync(
+    process.execPath,
+    [path.join(SCRIPT_DIR, 'validate-target.mjs'), '--scope', 'server-core'],
+    {
+      cwd: REPO_ROOT,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        GITHUB_OUTPUT: '',
+        GITHUB_ACTIONS: 'false',
+        PATH: strippedPath,
+        Path: strippedPath,
+      },
+    },
+  );
+  assert.equal(validate.status, 0, validate.stderr);
+  assert.match(validate.stdout, /target_sha=[0-9a-f]{40}\b/);
+
+  const out = tempDir('spe-dryrun-windows-git-');
+  const dryRun = spawnSync(
+    process.execPath,
+    [path.join(SCRIPT_DIR, 'dry-run.mjs'), '--scope', 'server-core', '--out', out],
+    {
+      cwd: REPO_ROOT,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        GITHUB_OUTPUT: '',
+        GITHUB_ACTIONS: 'false',
+        PATH: strippedPath,
+        Path: strippedPath,
+      },
+    },
+  );
+  assert.equal(dryRun.status, 0, dryRun.stderr);
+  assert.match(dryRun.stdout, /DRY_RUN/);
+});
+
 // The dry run is the one path a contributor is invited to run locally, so it is
 // also the path most likely to print a finding onto a terminal that is later
 // pasted into a public issue. Its stdout is a single generic line.
@@ -1384,7 +1563,111 @@ test('hidden local Docker actions are scanned while repository Dockerfiles remai
     ['runs:', '  using: docker', '  image: Dockerfile', ''].join('\n'),
     'utf8',
   );
+  writeFileSync(
+    path.join(nested, 'Dockerfile'),
+    `FROM alpine@sha256:${'c'.repeat(64)}\n`,
+    'utf8',
+  );
   assert.deepEqual(checkLocalActions(root), []);
+});
+
+test('local Dockerfiles require immutable frontend and external base images', () => {
+  const floating = checkDockerfileSource(
+    ['# syntax=docker/dockerfile:1', 'FROM node:24 AS build', 'FROM build AS final', ''].join('\n'),
+    'Dockerfile',
+  );
+  assert.equal(floating.length, 2, JSON.stringify(floating));
+  assert.deepEqual(
+    floating.map((entry) => entry.reason),
+    ['not-digest-pinned', 'not-digest-pinned'],
+  );
+
+  const pinned = checkDockerfileSource(
+    [
+      `# syntax=docker/dockerfile@sha256:${'a'.repeat(64)}`,
+      `FROM node@sha256:${'b'.repeat(64)} AS build`,
+      'FROM build AS packaged',
+      'FROM scratch',
+      '',
+    ].join('\n'),
+    'Dockerfile',
+  );
+  assert.deepEqual(pinned, []);
+
+  const dynamic = checkDockerfileSource('FROM ${BASE_IMAGE}\n', 'Dockerfile');
+  assert.equal(dynamic.length, 1);
+  assert.equal(dynamic[0].reason, 'not-digest-pinned');
+  const dynamicRegistry = checkDockerfileSource(
+    `FROM \${REGISTRY}/node@sha256:${'d'.repeat(64)}\n`,
+    'Dockerfile',
+  );
+  assert.equal(dynamicRegistry.length, 1);
+  assert.equal(dynamicRegistry[0].reason, 'not-digest-pinned');
+});
+
+test('local Dockerfile references fail closed when missing, escaping, or malformed', () => {
+  for (const [name, image, setup, pattern] of [
+    ['missing', 'Dockerfile', () => {}, /could not be read/],
+    [
+      'escaping',
+      '../../Dockerfile',
+      () => {},
+      /escapes the scan root/,
+    ],
+  ]) {
+    const root = tempDir(`spe-docker-${name}-`);
+    const nested = path.join(root, 'action');
+    mkdirSync(nested, { recursive: true });
+    setup(nested);
+    writeFileSync(
+      path.join(nested, 'action.yml'),
+      ['runs:', '  using: docker', `  image: ${image}`, ''].join('\n'),
+      'utf8',
+    );
+    assert.throws(() => checkLocalActions(root), pattern);
+  }
+
+  assert.throws(
+    () => checkDockerfileSource('FROM --platform linux node\n', 'Dockerfile'),
+    /unsupported Dockerfile FROM option/,
+  );
+  assert.throws(
+    () => checkDockerfileSource('FROM node \\', 'Dockerfile'),
+    /unterminated Dockerfile line continuation/,
+  );
+  assert.throws(
+    () =>
+      checkDockerfileSource(
+        [
+          `FROM node@sha256:${'e'.repeat(64)} AS build`,
+          'RUN <<EOF',
+          'FROM scratch AS injected',
+          'EOF',
+          'FROM injected',
+          '',
+        ].join('\n'),
+        'Dockerfile',
+      ),
+    /heredocs are not supported/,
+  );
+});
+
+test('local Dockerfile references never follow symlinks', (context) => {
+  const root = tempDir('spe-docker-symlink-');
+  const nested = path.join(root, 'action');
+  const outside = path.join(root, 'outside.Dockerfile');
+  mkdirSync(nested, { recursive: true });
+  writeFileSync(outside, 'FROM scratch\n', 'utf8');
+  if (!trySymlink(outside, path.join(nested, 'Dockerfile'))) {
+    context.skip('platform does not allow unprivileged symlink creation');
+    return;
+  }
+  writeFileSync(
+    path.join(nested, 'action.yml'),
+    ['runs:', '  using: docker', '  image: Dockerfile', ''].join('\n'),
+    'utf8',
+  );
+  assert.throws(() => checkLocalActions(root), /symlink/);
 });
 
 test('only explicit generated and dependency directories are skipped', () => {

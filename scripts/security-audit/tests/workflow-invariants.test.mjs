@@ -34,6 +34,35 @@ function readWorkflow(file) {
 const audit = readWorkflow(AUDIT_WORKFLOW);
 const security = readWorkflow(SECURITY_WORKFLOW);
 
+test('pull-request security gates load only from the protected base branch', () => {
+  const triggers = Object.keys(security.doc.on);
+  assert.equal(triggers.includes('pull_request'), false);
+  assert.equal(triggers.includes('pull_request_target'), true);
+
+  for (const [name, job] of Object.entries(security.doc.jobs)) {
+    const checkouts = checkoutSteps(job);
+    assert.equal(checkouts.length, 2, `${name}: controller and target checkouts are required`);
+    const [controller, target] = checkouts;
+    assert.equal(controller.with.ref, '${{ github.sha }}');
+    assert.equal(controller.with.path, undefined);
+    assert.equal(controller.with['persist-credentials'], 'false');
+    assert.equal(target.with.path, 'target');
+    assert.match(
+      target.with.repository,
+      /pull_request\.head\.repo\.full_name \|\| github\.repository/,
+    );
+    assert.match(target.with.ref, /github\.event\.pull_request\.head\.sha \|\| github\.sha/);
+    assert.equal(target.with['persist-credentials'], 'false');
+    assert.ok(job.steps.indexOf(controller) < job.steps.indexOf(target));
+  }
+
+  assert.equal(
+    /(?:node|bash|sh)\s+target\//.test(security.code),
+    false,
+    'no executable may be loaded from the audited checkout',
+  );
+});
+
 test('audit workflow has no pull request triggers', () => {
   const triggers = Object.keys(audit.doc.on);
   assert.deepEqual(triggers.sort(), ['repository_dispatch', 'schedule']);
@@ -384,7 +413,7 @@ test('no helper script is ever executed from the target checkout', () => {
 test('dependency commands use runner-owned workspaces and npm configuration', () => {
   for (const [label, workflow, jobName, packagePrefix] of [
     ['weekly audit', audit, 'dependency-audit', 'target/'],
-    ['pull-request gate', security, 'audit', ''],
+    ['pull-request gate', security, 'audit', 'target/'],
   ]) {
     const job = workflow.doc.jobs[jobName];
     const prepare = (job.steps ?? []).find((step) =>
@@ -630,7 +659,7 @@ test('the legacy no-op gitleaks gate is gone from the security workflow', () => 
   );
   assert.equal(/gitleaks\/gitleaks-action/.test(code), false);
   assert.match(code, /sha256sum --check --strict/);
-  assert.match(code, /exit "\$\{status\}"/);
+  assert.match(code, /case "\$\{status\}" in/);
 });
 
 // The model job ships repository source to an external provider. Running it
@@ -693,22 +722,67 @@ test('the secret-scan failure message names no rule, path or count', () => {
   assert.equal(/gitleaks-summary|RuleID|jq /.test(gate.run), false);
 });
 
-test('both pull-request security gates use the truthful generic failure literal', () => {
-  for (const [jobName, stepId] of [
-    ['audit', 'audit'],
-    ['secrets', 'scan'],
+test('pull-request gates expose no finding-dependent result channel', () => {
+  const npmSteps = security.doc.jobs.audit.steps;
+  const npmAudit = npmSteps.find((step) => /^\s*npm audit\b/m.test(step.run ?? ''));
+  assert.ok(npmAudit, 'the protected npm audit step must exist');
+  assert.match(npmAudit.run, /\[ "\$\{status\}" -ne 0 \] && \[ "\$\{status\}" -ne 1 \]/);
+  assert.match(npmAudit.run, /exit 0\s*$/);
+  assert.equal(npmAudit['continue-on-error'], undefined);
+
+  const secretSteps = security.doc.jobs.secrets.steps;
+  const secretScan = secretSteps.find((step) => /^\s*\.\/gitleaks git\b/m.test(step.run ?? ''));
+  assert.ok(secretScan, 'the protected secret scan step must exist');
+  assert.match(secretScan.run, /case "\$\{status\}" in/);
+  assert.match(secretScan.run, /0\|2\) exit 0/);
+  assert.match(secretScan.run, /\*\) exit 1/);
+  assert.equal(secretScan['continue-on-error'], undefined);
+
+  for (const [jobName, steps] of [
+    ['audit', npmSteps],
+    ['secrets', secretSteps],
   ]) {
-    const gate = security.doc.jobs[jobName].steps.find((step) =>
-      new RegExp(`steps\\.${stepId}\\.outcome == 'failure'`).test(step.if ?? ''),
+    assert.equal(
+      steps.some((step) => /steps\.(?:audit|scan)\.(?:outcome|outputs)/.test(step.if ?? '')),
+      false,
+      `${jobName}: no separate step may reveal a finding-dependent result`,
     );
-    assert.ok(gate, `${jobName}: failure gate must exist`);
-    assert.equal(gate.run.trim(), 'echo "Security audit: FAIL" >&2\nexit 1');
   }
   assert.equal(
     /details were reported privately to maintainers/i.test(security.code),
     false,
     'deterministic checks must not imply that a private report exists',
   );
+});
+
+test('gitleaks policy and suppression inputs come only from the protected controller', () => {
+  const config = path.join(SCRIPT_DIR, 'gitleaks-controller.toml');
+  const ignore = path.join(SCRIPT_DIR, 'gitleaks-controller-ignore');
+  assert.equal(existsSync(config), true);
+  assert.equal(existsSync(ignore), true);
+  assert.match(readFileSync(config, 'utf8'), /useDefault\s*=\s*true/);
+  assert.match(readFileSync(config, 'utf8'), /^minVersion\s*=\s*"8\.30\.1"$/m);
+
+  for (const [name, workflow, target] of [
+    ['security-audit.yml', audit, 'target'],
+    ['security.yml', security, 'target'],
+  ]) {
+    const scans = Object.values(workflow.doc.jobs)
+      .flatMap((job) => job.steps ?? [])
+      .filter((step) => /^\s*\.\/gitleaks\s+git\b/m.test(step.run ?? ''));
+    assert.ok(scans.length > 0, `${name}: expected a gitleaks scan`);
+    for (const scan of scans) {
+      assert.match(scan.run, new RegExp(`gitleaks git ${target}\\b`));
+      assert.match(scan.run, /--config scripts\/security-audit\/gitleaks-controller\.toml/);
+      assert.match(
+        scan.run,
+        /--gitleaks-ignore-path scripts\/security-audit\/gitleaks-controller-ignore/,
+      );
+      assert.match(scan.run, /--ignore-gitleaks-allow/);
+      assert.match(scan.run, /rm -rf -- target\/\.gitleaks\.toml target\/\.gitleaksignore/);
+      assert.equal(/--config\s+target\//.test(scan.run), false);
+    }
+  }
 });
 
 test('the action-pin job captures detailed CLI diagnostics and emits only generic failure', () => {
@@ -879,11 +953,19 @@ test('gitleaks console output is discarded and never replayed', () => {
         /rm -f \.security-audit\/gitleaks-console\.log/,
         `${name}: the console log must be deleted unread`,
       );
-      assert.match(
-        step.run,
-        /exit "\$\{status\}"/,
-        `${name}: the scanner exit code must still be re-raised`,
-      );
+      if (name === 'security-audit.yml') {
+        assert.match(
+          step.run,
+          /exit "\$\{status\}"/,
+          `${name}: the private audit must still re-raise the scanner exit code`,
+        );
+      } else {
+        assert.match(
+          step.run,
+          /0\|2\) exit 0/,
+          `${name}: public results must not distinguish findings from a clean scan`,
+        );
+      }
     }
 
     for (const step of steps) {

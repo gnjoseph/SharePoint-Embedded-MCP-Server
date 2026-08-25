@@ -1,15 +1,18 @@
 #!/usr/bin/env node
 /**
  * Verifies that every external action reference is immutable and carries a
- * human-readable version comment. This covers both `uses:` values and external
- * `runs.image: docker://...` values in local Docker action metadata.
+ * human-readable version comment. This covers `uses:` values, external
+ * `runs.image: docker://...` values, and every external base/frontend image
+ * used by a Dockerfile-backed local action.
  *
  * A floating tag (`@v4`) is mutable: whoever controls the tag controls what runs
  * inside the workflow, including in the job that holds the advisory credential
  * used to file a private vulnerability report.
  * Local (`./…`) `uses:` references are out of scope, but the referenced local
  * action metadata is scanned separately. Docker references must use an
- * immutable `sha256` digest.
+ * immutable `sha256` digest. A local action that names a Dockerfile causes that
+ * exact file to be parsed; dynamic, missing, escaping, or ambiguous image
+ * references fail closed.
  *
  * The check parses YAML before inspecting executable references. Unsupported
  * or ambiguous constructs fail closed rather than being ignored.
@@ -25,8 +28,8 @@
  *   node scripts/security-audit/check-action-pins.mjs [--dir .github/workflows] [--root .]
  */
 
-import { readdirSync, readFileSync, realpathSync } from 'node:fs';
-import { isAbsolute, join, relative } from 'node:path';
+import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
   LineCounter,
@@ -39,7 +42,13 @@ import {
 } from 'yaml';
 
 const SHA_RE = /^[0-9a-f]{40}$/;
-const DOCKER_DIGEST_RE = /^docker:\/\/[^\s]+@sha256:[0-9a-fA-F]{64}$/;
+const STATIC_IMAGE_PREFIX = '[A-Za-z0-9][A-Za-z0-9._:/-]*';
+const DOCKER_DIGEST_RE = new RegExp(
+  `^docker://${STATIC_IMAGE_PREFIX}@sha256:[0-9a-fA-F]{64}$`,
+);
+const CONTAINER_IMAGE_DIGEST_RE = new RegExp(
+  `^${STATIC_IMAGE_PREFIX}@sha256:[0-9a-fA-F]{64}$`,
+);
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'coverage', '.security-audit']);
 const ACTION_METADATA_NAMES = new Set(['action.yml', 'action.yaml']);
 
@@ -217,7 +226,7 @@ export function extractUses(text, file) {
 }
 
 /**
- * Returns the external registry image declared by a local Docker action.
+ * Returns the image declared by a local Docker action.
  *
  * Repository Dockerfiles are local code and therefore do not use the
  * `docker://` registry-reference form. External images do, and must pass the
@@ -225,16 +234,16 @@ export function extractUses(text, file) {
  *
  * @param {ReturnType<typeof parsePolicySource>} parsed
  * @param {string} file
- * @returns {Array<{ file: string, line: number, uses: string, comment: string }>}
+ * @returns {{ file: string, line: number, uses: string, comment: string } | null}
  */
-function extractLocalDockerImages(parsed, file) {
+function extractLocalDockerImage(parsed, file) {
   const root = parsed.document.contents;
-  if (!isMap(root)) return [];
+  if (!isMap(root)) return null;
 
   const runsPair = root.items.find(
     (pair) => isPair(pair) && isScalar(pair.key) && pair.key.value === 'runs',
   );
-  if (!runsPair) return [];
+  if (!runsPair) return null;
   if (!isMap(runsPair.value)) {
     throw new Error(`${file}: runs must be a YAML mapping`);
   }
@@ -242,7 +251,7 @@ function extractLocalDockerImages(parsed, file) {
   const usingPair = runsPair.value.items.find(
     (pair) => isPair(pair) && isScalar(pair.key) && pair.key.value === 'using',
   );
-  if (!usingPair) return [];
+  if (!usingPair) return null;
   const using = stringPairRecord(
     usingPair,
     'runs.using',
@@ -250,7 +259,7 @@ function extractLocalDockerImages(parsed, file) {
     parsed.lineCounter,
     parsed.lines,
   );
-  if (using.value.toLowerCase() !== 'docker') return [];
+  if (using.value.toLowerCase() !== 'docker') return null;
 
   const imagePair = runsPair.value.items.find(
     (pair) => isPair(pair) && isScalar(pair.key) && pair.key.value === 'image',
@@ -265,14 +274,180 @@ function extractLocalDockerImages(parsed, file) {
     parsed.lineCounter,
     parsed.lines,
   );
-  if (!image.value.startsWith('docker://')) return [];
-
-  return [{
+  return {
     file,
     line: image.line,
     uses: image.value,
     comment: image.comment,
-  }];
+  };
+}
+
+/**
+ * Parses a Dockerfile conservatively and checks every external frontend and
+ * `FROM` image. Local stage aliases and `scratch` are not registry references.
+ *
+ * @param {string} text
+ * @param {string} file
+ * @returns {Array<{ file: string, line: number, uses: string, reason: string }>}
+ */
+export function checkDockerfileSource(text, file) {
+  /** @type {Array<{ file: string, line: number, uses: string, reason: string }>} */
+  const violations = [];
+  /** @type {Array<{ line: number, value: string }>} */
+  const instructions = [];
+  const stageAliases = new Set();
+  const lines = text.split(/\r?\n/);
+  let pending = '';
+  let pendingLine = 0;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const raw = lines[index];
+    const line = index + 1;
+
+    if (pending === '' && /^\s*#\s*syntax\b/i.test(raw)) {
+      const directive = /^\s*#\s*syntax\s*=\s*(\S+)\s*$/i.exec(raw);
+      if (!directive) {
+        throw new Error(`${file}:${line}: unsupported Dockerfile syntax directive`);
+      }
+      const image = directive[1];
+      if (!CONTAINER_IMAGE_DIGEST_RE.test(image)) {
+        violations.push({ file, line, uses: image, reason: 'not-digest-pinned' });
+      }
+      continue;
+    }
+
+    if (pending === '' && /^\s*#\s*escape\b/i.test(raw)) {
+      const directive = /^\s*#\s*escape\s*=\s*(\S+)\s*$/i.exec(raw);
+      if (!directive || directive[1] !== '\\') {
+        throw new Error(`${file}:${line}: unsupported Dockerfile escape directive`);
+      }
+      continue;
+    }
+
+    if (/^\s*(?:#.*)?$/.test(raw)) {
+      if (pending !== '') {
+        throw new Error(`${file}:${line}: comments inside continued instructions are not supported`);
+      }
+      continue;
+    }
+
+    const trimmed = raw.trimEnd();
+    const continues = /\\$/.test(trimmed);
+    const fragment = continues ? trimmed.slice(0, -1) : trimmed;
+    if (pending === '') pendingLine = line;
+    pending += `${fragment.trim()} `;
+    if (continues) continue;
+
+    instructions.push({ line: pendingLine, value: pending.trim() });
+    pending = '';
+    pendingLine = 0;
+  }
+
+  if (pending !== '') {
+    throw new Error(`${file}:${pendingLine}: unterminated Dockerfile line continuation`);
+  }
+
+  for (const instruction of instructions) {
+    // Dockerfile heredocs introduce an embedded language whose body may contain
+    // text that looks like a top-level FROM instruction. Until this parser tracks
+    // heredoc delimiters explicitly, accepting one could let body text create a
+    // fake stage alias that masks a later floating external image.
+    if (/<<-?\s*['"]?[A-Za-z0-9_.-]+/.test(instruction.value)) {
+      throw new Error(`${file}:${instruction.line}: Dockerfile heredocs are not supported`);
+    }
+
+    const from = /^FROM\s+(.+)$/i.exec(instruction.value);
+    if (!from) continue;
+
+    const tokens = from[1].trim().split(/\s+/);
+    while (tokens[0]?.startsWith('--')) {
+      const option = tokens.shift();
+      if (!/^--[A-Za-z][A-Za-z0-9-]*=\S+$/.test(option)) {
+        throw new Error(`${file}:${instruction.line}: unsupported Dockerfile FROM option`);
+      }
+    }
+    const image = tokens.shift();
+    if (!image) {
+      throw new Error(`${file}:${instruction.line}: Dockerfile FROM image is missing`);
+    }
+
+    let alias = '';
+    if (tokens.length > 0) {
+      if (
+        tokens.length !== 2 ||
+        tokens[0].toLowerCase() !== 'as' ||
+        !/^[A-Za-z0-9_.-]+$/.test(tokens[1])
+      ) {
+        throw new Error(`${file}:${instruction.line}: unsupported Dockerfile FROM syntax`);
+      }
+      alias = tokens[1].toLowerCase();
+    }
+
+    const normalized = image.toLowerCase();
+    const isLocalStage = stageAliases.has(normalized);
+    if (
+      normalized !== 'scratch' &&
+      !isLocalStage &&
+      !CONTAINER_IMAGE_DIGEST_RE.test(image)
+    ) {
+      violations.push({
+        file,
+        line: instruction.line,
+        uses: image,
+        reason: 'not-digest-pinned',
+      });
+    }
+
+    if (alias !== '') stageAliases.add(alias);
+  }
+
+  return violations;
+}
+
+/**
+ * Resolves and checks a Dockerfile referenced by local action metadata.
+ *
+ * @param {{ file: string, line: number, uses: string }} image
+ * @param {string} rootReal
+ * @returns {Array<{ file: string, line: number, uses: string, reason: string }>}
+ */
+function checkReferencedDockerfile(image, rootReal) {
+  const reference = image.uses;
+  if (
+    reference === '' ||
+    reference.trim() !== reference ||
+    reference.includes('\\') ||
+    reference.includes('\0') ||
+    reference.includes('$') ||
+    isAbsolute(reference)
+  ) {
+    throw new Error(`${image.file}:${image.line}: unprovable local Dockerfile reference`);
+  }
+
+  const absolute = resolve(dirname(image.file), reference);
+  const lexical = relative(rootReal, absolute);
+  if (lexical !== '' && (lexical.startsWith('..') || isAbsolute(lexical))) {
+    throw new Error(`${image.file}:${image.line}: local Dockerfile escapes the scan root`);
+  }
+
+  let stats;
+  try {
+    stats = lstatSync(absolute);
+  } catch {
+    throw new Error(`${image.file}:${image.line}: local Dockerfile could not be read`);
+  }
+  if (stats.isSymbolicLink()) {
+    throw new Error(`${image.file}:${image.line}: local Dockerfile must not be a symlink`);
+  }
+  if (!stats.isFile()) {
+    throw new Error(`${image.file}:${image.line}: local Dockerfile is not a regular file`);
+  }
+  assertWithinRoot(rootReal, absolute);
+
+  return checkDockerfileSource(
+    readFileSync(absolute, 'utf8'),
+    absolute.split('\\').join('/'),
+  );
 }
 
 /**
@@ -328,18 +503,32 @@ export function checkWorkflowSource(text, file) {
 }
 
 /**
- * Checks both nested `uses:` values and `runs.image` metadata in a local action.
+ * Checks nested `uses:` values and `runs.image` metadata in a local action.
+ * Dockerfile-backed actions require `rootReal` so their external images cannot
+ * hide behind an uninspected local path.
  *
  * @param {string} text
  * @param {string} file
+ * @param {string} [rootReal]
  * @returns {Array<{ file: string, line: number, uses: string, reason: string }>}
  */
-export function checkLocalActionSource(text, file) {
+export function checkLocalActionSource(text, file, rootReal) {
   const parsed = parsePolicySource(text, file);
-  return checkReferences([
+  const image = extractLocalDockerImage(parsed, file);
+  const references = [
     ...parsed.references,
-    ...extractLocalDockerImages(parsed, file),
-  ]);
+    ...(image?.uses.startsWith('docker://') ? [image] : []),
+  ];
+  const violations = checkReferences(references);
+
+  if (image && !image.uses.startsWith('docker://')) {
+    if (!rootReal) {
+      throw new Error(`${file}:${image.line}: local Dockerfile requires filesystem context`);
+    }
+    violations.push(...checkReferencedDockerfile(image, rootReal));
+  }
+
+  return violations;
 }
 
 /**
@@ -457,8 +646,10 @@ export function checkWorkflowDirectory(dir) {
  */
 export function checkLocalActions(root) {
   const files = collectFiles(root, (name) => ACTION_METADATA_NAMES.has(name));
+  const rootReal = realpathSync.native(root);
 
-  return files.flatMap((file) => checkLocalActionSource(readFileSync(file, 'utf8'), file));
+  return files.flatMap((file) =>
+    checkLocalActionSource(readFileSync(file, 'utf8'), file, rootReal));
 }
 
 function main() {
@@ -475,6 +666,7 @@ function main() {
       dir,
       (name) => name.endsWith('.yml') || name.endsWith('.yaml'),
     );
+    const rootReal = realpathSync.native(root);
     const localActionFiles = checkLocalActionPaths(root, workflowFiles);
     const localActionSet = new Set(localActionFiles);
     const workflowOnlyFiles = workflowFiles.filter((file) => !localActionSet.has(file));
@@ -483,7 +675,7 @@ function main() {
       ...workflowOnlyFiles.flatMap((file) =>
         checkWorkflowSource(readFileSync(file, 'utf8'), file)),
       ...localActionFiles.flatMap((file) =>
-        checkLocalActionSource(readFileSync(file, 'utf8'), file)),
+        checkLocalActionSource(readFileSync(file, 'utf8'), file, rootReal)),
     ];
   } catch (error) {
     process.stderr.write(`security-audit: unable to read ${dir}: ${error.message}\n`);

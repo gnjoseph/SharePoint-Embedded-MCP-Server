@@ -21,12 +21,12 @@ want — the working tree is both controller and target.
 | Script | Purpose | Exit codes |
 | --- | --- | --- |
 | `validate-target.mjs` | Validates repository-dispatch payload values: 40-hex SHA reachable from `main`, allowlisted scope/model, strict boolean dry-run. An empty/absent ref (scheduled runs or omitted payload) resolves to the `origin/main` tip and is then held to the same rules. Also publishes `target_ref` and `is_main_tip` for provenance | `0` ok, `1` rejected |
-| `collect-corpus.mjs` | Collects the allowlisted, capped corpus from `--repo-root`, wraps each file in per-run nonce fences, and writes a manifest with repository-relative keys | `0` ok, `1` error |
+| `collect-corpus.mjs` | Collects the complete allowlisted corpus from `--repo-root` within hard caps, wraps each file in per-run nonce fences, and writes a manifest with repository-relative keys. Any eligible omitted or unreadable file fails the run | `0` ok, `1` error |
 | `build-prompt.mjs` | Renders `system.txt` (preamble) and `prompt.txt` (corpus + trusted suffix) from the manifest nonce | `0` ok, `1` error |
 | `validate-response.mjs` | Parses, schema-checks, rejects, and redacts the model response. A partial rejection writes only accepted findings to the sanitized report before failing, so CI can attempt the sole private egress | `0` ok, `1` malformed/no report, `3` rejected (sanitized report written; fail closed) |
 | `submit-report.mjs` | Submits the validated report as **one** private vulnerability report per audited SHA, de-duplicated by title. Prints only `report: submitted\|existing\|none\|failed` | `0` ok, `1` failed (fail closed) |
 | `sanitize-findings.mjs` | Reduces `npm audit` / gitleaks reports to counts only — no paths, rules, advisory URLs, GHSA or CVE identifiers | `0` ok, `1` error |
-| `check-action-pins.mjs` | Parses workflow/composite YAML and fails if an action lacks a 40-hex commit pin (or a Docker action lacks a 64-hex `sha256` digest) and a version comment | `0` clean, `1` violations/parse failure |
+| `check-action-pins.mjs` | Parses workflow/local-action YAML and referenced local-action Dockerfiles. External actions require a 40-hex commit pin plus version comment; external Docker metadata, base images, and frontend images require a 64-hex `sha256` digest | `0` clean, `1` violations/parse failure |
 | `summarize.mjs` | Emits the public pass/fail literal and decides pass/fail | `0` pass, `1` a deterministic or enabled model job failed/cancelled |
 | `dry-run.mjs` | Offline end-to-end run against a synthetic response, honouring `--repo-root` | `0` ok, non-zero on failure |
 

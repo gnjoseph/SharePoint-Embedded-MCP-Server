@@ -20,11 +20,11 @@ export const CONTROL_LEGEND_PATH = 'docs/SECURITY-CONTROLS.md';
  */
 export const CORPUS_LIMITS = Object.freeze({
   /** Maximum number of files sent to the model. */
-  maxFiles: 40,
-  /** Maximum bytes for any single file. Larger files are skipped, not clipped. */
+  maxFiles: 128,
+  /** Maximum bytes for any single file. Larger files fail collection. */
   maxFileBytes: 96 * 1024,
   /** Maximum total bytes across the whole corpus. */
-  maxTotalBytes: 512 * 1024,
+  maxTotalBytes: 1024 * 1024,
 });
 
 /**
