@@ -2,11 +2,17 @@
 // Licensed under the MIT license.
 
 import { EventEmitter } from "node:events";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runCommand, spawnProcess } from "./proc-exec.js";
 
-const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }));
+const { resolveExecutablePathMock, spawnMock } = vi.hoisted(() => ({
+  resolveExecutablePathMock: vi.fn(),
+  spawnMock: vi.fn(),
+}));
 vi.mock("cross-spawn", () => ({ default: spawnMock }));
+vi.mock("./executable-resolver.js", () => ({
+  resolveExecutablePath: resolveExecutablePathMock,
+}));
 
 /** Minimal ChildProcess stand-in: EventEmitter with stdout/stderr streams + kill. */
 class FakeChild extends EventEmitter {
@@ -15,7 +21,14 @@ class FakeChild extends EventEmitter {
   kill = vi.fn();
 }
 
+beforeEach(() => {
+  resolveExecutablePathMock.mockImplementation(
+    (command: string) => `C:\\Program Files\\Trusted\\${command}.cmd`,
+  );
+});
+
 afterEach(() => {
+  resolveExecutablePathMock.mockReset();
   spawnMock.mockReset();
   vi.useRealTimers();
 });
@@ -44,11 +57,32 @@ describe("runCommand", () => {
 
     expect(spawnMock).toHaveBeenCalledTimes(1);
     const [command, args, opts] = spawnMock.mock.calls[0];
-    expect(command).toBe("az");
+    expect(command).toBe(String.raw`C:\Program Files\Trusted\az.cmd`);
     expect(args).toEqual(["account", "show"]);
+    expect(resolveExecutablePathMock).toHaveBeenCalledWith("az", {
+      cwd: "/tmp",
+      env: undefined,
+    });
     expect(opts.shell).toBe(false);
     expect(opts.windowsHide).toBe(true);
     expect(opts.cwd).toBe("/tmp");
+  });
+
+  it("rejects a working-directory executable resolution error before spawning", async () => {
+    resolveExecutablePathMock.mockImplementation(() => {
+      throw Object.assign(new Error("untrusted executable resolution"), {
+        code: "ERR_UNTRUSTED_EXECUTABLE",
+      });
+    });
+
+    await expect(
+      runCommand("az", ["version"], { cwd: "/project" }),
+    ).rejects.toMatchObject({
+      code: "ERR_UNTRUSTED_EXECUTABLE",
+      stdout: "",
+      stderr: "",
+    });
+    expect(spawnMock).not.toHaveBeenCalled();
   });
 
   it("passes a punctuation-heavy argument through as one discrete argv element (never a shell string)", async () => {
@@ -166,7 +200,7 @@ describe("spawnProcess", () => {
 
     expect(result).toBe(child);
     const [command, args, opts] = spawnMock.mock.calls[0];
-    expect(command).toBe("npm");
+    expect(command).toBe(String.raw`C:\Program Files\Trusted\npm.cmd`);
     expect(args).toEqual(["run", "dev"]);
     expect(opts.detached).toBe(true);
     expect(opts.shell).toBe(false);

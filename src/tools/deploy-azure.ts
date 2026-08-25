@@ -21,6 +21,7 @@ import { bootstrapTokenProvider } from "../bootstrap.js";
 import { addSpaRedirectUris } from "../graph-client.js";
 import { readState } from "../state.js";
 import { runCommand } from "../proc-exec.js";
+import { ExecutableResolutionError } from "../executable-resolver.js";
 import type { McpTool } from "../types.js";
 
 interface DeployArgs {
@@ -214,7 +215,13 @@ export const deployAzureTool: McpTool = {
           env: childEnv,
         });
         subscriptionId = stdout.trim() || undefined;
-      } catch {
+      } catch (error) {
+        if (error instanceof ExecutableResolutionError) {
+          return {
+            content: [{ type: "text" as const, text: `Error: ${error.message}` }],
+            isError: true,
+          };
+        }
         /* leave undefined — azd may still resolve it from its own environment */
       }
     }

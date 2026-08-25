@@ -7,12 +7,12 @@
  * Every `az` / `azd` / dev-server invocation in this codebase goes through this
  * module so process spawning is centralised on ONE hardened seam:
  *
- *  - We NEVER pass `shell: true`. On Windows, `az`/`azd`/`npm`/`func` are `.cmd`
- *    batch shims; letting a shell resolve them routes arguments through
- *    `cmd.exe`, so any user-influenced argument becomes a metacharacter /
- *    command-injection vector. `cross-spawn` resolves `.cmd`/`.bat` shims via
- *    `PATHEXT` itself and passes arguments to the child process literally — no
- *    shell, no metacharacter interpretation.
+ *  - We NEVER pass `shell: true` or compose a command string. `cross-spawn`
+ *    handles Windows `.cmd`/`.bat` shims while escaping each discrete argv
+ *    element; callers cannot opt into general shell-string interpretation.
+ *  - Before applying a caller-selected working directory, we resolve the tool
+ *    from absolute host PATH entries and pass its verified absolute path. This
+ *    prevents Windows lookup from preferring a same-named project-local shim.
  *  - Centralising here also gives tests a single module to mock
  *    (`vi.mock("../proc-exec.js", …)`) instead of stubbing `node:child_process`.
  *
@@ -22,7 +22,9 @@
  */
 
 import type { ChildProcess, SpawnOptions } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import spawn from "cross-spawn";
+import { resolveExecutablePath } from "./executable-resolver.js";
 
 export interface RunCommandOptions {
   cwd?: string;
@@ -48,9 +50,8 @@ export interface RunCommandError extends Error {
 }
 
 /**
- * Run a command to completion and buffer its output. Never uses a shell; on
- * Windows, `cross-spawn` resolves `.cmd`/`.bat` shims without `cmd.exe`, so
- * arguments are passed to the child literally.
+ * Run a command to completion and buffer its output. Never enables shell mode;
+ * each argument remains a discrete argv element.
  */
 export function runCommand(
   command: string,
@@ -61,11 +62,14 @@ export function runCommand(
     let stdout = "";
     let stderr = "";
 
-    // shell:false is the entire point — cross-spawn resolves Windows .cmd shims
-    // itself, so we must never delegate to a shell.
+    // shell:false is the entire point: callers provide discrete argv elements,
+    // never a shell command string.
     let child: ChildProcess;
     try {
-      child = spawn(command, [...args], {
+      const executable = options.cwd !== undefined
+        ? resolveExecutablePath(command, { cwd: options.cwd, env: options.env })
+        : command;
+      child = spawn(executable, [...args], {
         cwd: options.cwd,
         env: options.env,
         shell: false,
@@ -163,5 +167,14 @@ export function spawnProcess(
   args: readonly string[] = [],
   options: SpawnOptions = {},
 ): ChildProcess {
-  return spawn(command, [...args], { ...options, shell: false });
+  const cwd =
+    typeof options.cwd === "string"
+      ? options.cwd
+      : options.cwd
+        ? fileURLToPath(options.cwd)
+        : undefined;
+  const executable = cwd !== undefined
+    ? resolveExecutablePath(command, { cwd, env: options.env })
+    : command;
+  return spawn(executable, [...args], { ...options, shell: false });
 }

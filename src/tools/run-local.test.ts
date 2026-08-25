@@ -17,7 +17,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { EventEmitter } from "node:events";
 
 let files: Record<string, string> = {};
-let spawnBehavior: "spawn" | "error" | "exit-nonzero" = "spawn";
+let spawnBehavior: "spawn" | "error" | "exit-nonzero" | "throw" = "spawn";
 const spawnError = "spawn npm ENOENT";
 
 vi.mock("node:fs", () => ({
@@ -31,6 +31,11 @@ vi.mock("node:fs", () => ({
 
 vi.mock("../proc-exec.js", () => ({
   spawnProcess: vi.fn(() => {
+    if (spawnBehavior === "throw") {
+      throw Object.assign(new Error("untrusted executable resolution"), {
+        code: "ERR_UNTRUSTED_EXECUTABLE",
+      });
+    }
     const child = new EventEmitter() as EventEmitter & { unref: () => void };
     child.unref = () => {};
     queueMicrotask(() => {
@@ -162,6 +167,16 @@ describe("project_run_local — start-outcome reflection", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("failed to start");
+  });
+
+  it("surfaces a synchronous executable-resolution failure", async () => {
+    files = { "Program.cs": "// app" };
+    spawnBehavior = "throw";
+
+    const result = await runLocalTool.handler({ projectDir: "/proj" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("untrusted executable resolution");
   });
 });
 

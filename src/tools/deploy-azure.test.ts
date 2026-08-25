@@ -44,6 +44,7 @@ vi.mock("../bootstrap.js", () => ({
 }));
 
 import { runCommand } from "../proc-exec.js";
+import { ExecutableResolutionError } from "../executable-resolver.js";
 import { deployAzureTool } from "../tools/deploy-azure.js";
 
 /** Build a rejected-launcher error carrying the same `.stdout`/`.stderr`/`.code` shape runCommand attaches. */
@@ -183,6 +184,26 @@ describe("project_deploy", () => {
     const r = await deployAzureTool.handler({ projectDir: "/proj", location: "eastus" });
     expect(r.isError).toBe(true);
     expect(r.content[0].text).toContain("Azure Developer CLI (`azd`) is not installed");
+  });
+
+  it("surfaces executable resolution failures from the Azure CLI fallback", async () => {
+    runImpl = async () => {
+      throw new ExecutableResolutionError(
+        "Refusing untrusted executable resolution.",
+        "ERR_UNTRUSTED_EXECUTABLE",
+      );
+    };
+
+    const r = await deployAzureTool.handler({
+      projectDir: "/proj",
+      location: "eastus",
+    });
+
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain(
+      "Refusing untrusted executable resolution.",
+    );
+    expect(runCommand).toHaveBeenCalledTimes(1);
   });
 
   it("auto-registers the deployed origin as a SPA redirect URI on the owning app", async () => {

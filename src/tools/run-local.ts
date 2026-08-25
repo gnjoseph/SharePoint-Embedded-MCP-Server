@@ -98,10 +98,11 @@ interface SpawnOutcome {
 function startDetached(command: string, args: string[], cwd: string): Promise<SpawnOutcome> {
   return new Promise((resolveOutcome) => {
     let settled = false;
+    let grace: NodeJS.Timeout | undefined;
     const finish = (outcome: SpawnOutcome): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(grace);
+      if (grace) clearTimeout(grace);
       resolveOutcome(outcome);
     };
 
@@ -118,7 +119,7 @@ function startDetached(command: string, args: string[], cwd: string): Promise<Sp
     }
 
     const detachedChild = child;
-    const grace = setTimeout(() => {
+    grace = setTimeout(() => {
       // Survived the grace window with no error or early non-zero exit — treat
       // as launched and detach so it outlives this process.
       try {
