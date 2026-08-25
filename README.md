@@ -547,10 +547,12 @@ Microsoft takes security seriously. If you believe you have found a security
 vulnerability, please report it privately as described in [SECURITY.md](SECURITY.md) —
 **do not** file a public GitHub issue.
 
-This repository runs a scheduled weekly security audit (dependency audit, secret scanning,
-and action-pin enforcement, plus an optional model-assisted review layer). See
-[docs/SECURITY-AUDIT.md](docs/SECURITY-AUDIT.md) for how to run it, how to triage results,
-and the administrative steps required to enable the model-assisted layer.
+This repository includes security-audit workflow scaffolding and credential-free local checks.
+The model-assisted path is hard-disabled and is **not activation-ready**: its proposed runtime
+package is not yet approved or reproducible from the public npm registry, so no lockfile is
+committed and repository variables cannot enable it. This PR makes no claim that a production
+weekly audit is active. See [docs/SECURITY-AUDIT.md](docs/SECURITY-AUDIT.md) for the implemented
+deterministic controls, safe local validation, and the prerequisites that remain open.
 
 ## Important notices
 

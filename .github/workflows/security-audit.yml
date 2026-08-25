@@ -395,7 +395,7 @@ jobs:
             --globalconfig="${NPM_GLOBAL_CONFIG}"
 
       # The checker itself comes from the controller checkout; only the scanned
-      # workflow and composite-action trees come from the audited commit. Its
+      # workflow and local-action trees come from the audited commit. Its
       # local diagnostics name paths, lines, actions and reasons, so workflow
       # execution captures and deletes them unread before re-raising the status.
       - name: Verify action pinning
@@ -421,13 +421,14 @@ jobs:
           exit 1
 
   # ---------------------------------------------------------------------------
-  # Model-assisted advisory pass (credentialed).
+  # Model-assisted advisory pass (credentialed, disabled scaffold).
   #
-  # Gated on TWO repository variables: `SECURITY_AUDIT_AI_ENABLED` enables the
-  # model layer, and `SECURITY_AUDIT_PRIVATE_REPORTING_ENABLED` asserts that
-  # GitHub Private Vulnerability Reporting is switched on for this repository
-  # and that the protected `security-audit-private-report` environment holds a
-  # working advisory credential. Both must be `true`.
+  # This job is intentionally hard-disabled by the leading `false &&` guard.
+  # The proposed Copilot CLI version is not available from the public npm
+  # registry, its package/license approvals remain open, and no reproducible
+  # lockfile is committed. Repository variables alone therefore cannot activate
+  # the model path. Enabling it requires a reviewed code change that selects an
+  # approved, publicly reproducible dependency and commits its verified lockfile.
   #
   # The `secrets` context is not readable from a job-level `if`, but `vars` is —
   # and gating on the variables means the `security-audit-private-report`
@@ -445,8 +446,8 @@ jobs:
   # process has exited and the response has been validated and redacted, because
   # findings must not cross a job boundary through artifacts or job outputs.
   #
-  # Until the variables and the environment exist this job is skipped and the
-  # summary reports `AI NOT_CONFIGURED`. It never reports a pass.
+  # The deterministic jobs and synthetic dry run do not use this dependency and
+  # remain separately testable. See docs/SECURITY-AUDIT.md.
   # ---------------------------------------------------------------------------
   model-audit:
     name: Model-assisted review
@@ -458,7 +459,7 @@ jobs:
     needs:
       - validate-inputs
       - secret-scan
-    if: ${{ vars.SECURITY_AUDIT_AI_ENABLED == 'true' && vars.SECURITY_AUDIT_PRIVATE_REPORTING_ENABLED == 'true' && needs.validate-inputs.outputs.dry_run != 'true' }}
+    if: ${{ false && vars.SECURITY_AUDIT_AI_ENABLED == 'true' && vars.SECURITY_AUDIT_PRIVATE_REPORTING_ENABLED == 'true' && needs.validate-inputs.outputs.dry_run != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: security-audit-private-report
@@ -534,6 +535,36 @@ jobs:
           done
           echo "Debug logging is off; continuing."
 
+      # Dormant supply-chain gate for the disabled scaffold. The current proposed
+      # version cannot be resolved from registry.npmjs.org and has no approved
+      # lockfile, so the job-level `false &&` guard above must remain in place.
+      # If a later reviewed change removes that guard, this step still fails
+      # before repository source is assembled unless an approved public-registry
+      # lockfile has been committed.
+      - name: Install approved Copilot CLI runtime
+        env:
+          NPM_USER_CONFIG: ${{ runner.temp }}/security-audit-copilot-user.npmrc
+          NPM_GLOBAL_CONFIG: ${{ runner.temp }}/security-audit-copilot-global.npmrc
+        run: |
+          set -euo pipefail
+          if [ ! -f tools/copilot-cli/package-lock.json ]; then
+            echo "Security audit: FAIL" >&2
+            exit 1
+          fi
+          : > "${NPM_USER_CONFIG}"
+          : > "${NPM_GLOBAL_CONFIG}"
+          (
+            cd tools/copilot-cli
+            npm ci \
+              --ignore-scripts \
+              --no-audit \
+              --fund=false \
+              --registry=https://registry.npmjs.org/ \
+              --userconfig="${NPM_USER_CONFIG}" \
+              --globalconfig="${NPM_GLOBAL_CONFIG}"
+          )
+          test -x tools/copilot-cli/node_modules/.bin/copilot
+
       # Collects an allowlisted, size-capped corpus. Every file body is wrapped
       # in per-run, nonce-bearing untrusted-content delimiters so instructions
       # embedded in repository source are presented as data, not as directives.
@@ -566,28 +597,6 @@ jobs:
           node scripts/security-audit/build-prompt.mjs \
             --corpus .security-audit/model \
             --out .security-audit/model
-
-      # actions/ai-inference v3 shells out to the GitHub Copilot CLI, which must
-      # already be present on the runner. `npm install -g <pkg>@<version>` pins
-      # only the top-level package: transitive versions are resolved at install
-      # time, so the bytes executed here would be decided by the registry rather
-      # than by this repository. The CLI is therefore installed from the
-      # committed manifest + lockfile in tools/copilot-cli, which comes from the
-      # trusted controller checkout at the workspace root, never from target/.
-      # `--ignore-scripts` is safe: @github/copilot declares no `scripts` field,
-      # so nothing legitimate is skipped and install-time code cannot run.
-      # The lockfile is an activation prerequisite (see tools/copilot-cli/README.md);
-      # if it is missing this step fails closed rather than falling back to a
-      # floating install.
-      - name: Install Copilot CLI
-        run: |
-          set -euo pipefail
-          if [ ! -f tools/copilot-cli/package-lock.json ]; then
-            echo "::error::tools/copilot-cli/package-lock.json is missing. Generate it on a host with direct registry.npmjs.org access (see tools/copilot-cli/README.md) before enabling the model-assisted audit."
-            exit 1
-          fi
-          ( cd tools/copilot-cli && npm ci --ignore-scripts )
-          test -x tools/copilot-cli/node_modules/.bin/copilot
 
       # `copilot-allow-tools` is deliberately unset: the action passes no
       # `--allow-tool` flags when it is empty, so the model runs tool-less with
@@ -639,8 +648,8 @@ jobs:
       # token that can write to the repository's security advisories.
       #
       # The standalone script prints one opaque result token. This workflow
-      # discards that stdout so even the token cannot reveal finding or prior-
-      # report state in a public Actions log; stderr and the exit status remain.
+      # discards both output streams so neither can reveal finding or prior-
+      # report state in a public Actions log; the exit status remains.
       - name: Submit private vulnerability report
         id: submit
         if: ${{ always() && hashFiles('.security-audit/model/report.json') != '' }}
@@ -653,7 +662,7 @@ jobs:
             --report .security-audit/model/report.json \
             --sha "${TARGET_SHA}" \
             --repo "${GITHUB_REPOSITORY}" \
-            > /dev/null
+            > /dev/null 2>&1
 
       # The sanitized report and raw response are runner-local only. Deleting
       # them explicitly prevents a later step from accidentally replaying either

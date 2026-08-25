@@ -40,13 +40,15 @@ comments.
 
 ## Optional model-assisted security analysis
 
-**This feature is disabled by default.** It is documented here so contributors know what *could*
-happen to code they contribute, if maintainers ever enable it.
+**This feature is disabled by default.** In this PR it is also hard-disabled in code and is not
+activation-ready. It is documented here so contributors know what a future, separately reviewed
+version could do.
 
-The repository contains a scheduled weekly security-audit workflow. It has an optional stage that,
-when a maintainer explicitly enables it, may send a bounded selection of **already-public,
-git-tracked source files from `main`** to **GitHub Copilot**, which relays them to a **third-party
-model provider** for advisory security analysis.
+The repository contains security-audit workflow scaffolding with a declared weekly schedule; this
+PR makes no claim that a production schedule is active. Its credentialed model stage cannot run.
+A future approved implementation may send a bounded selection of **already-public,
+git-tracked source files from `main`** to **GitHub Copilot**, which relays them to a
+**third-party model provider** for advisory security analysis.
 
 What this stage does and does not do:
 
@@ -71,11 +73,12 @@ What this stage does and does not do:
 - **Never triggered by contributions.** The workflow has no `pull_request` or
   `pull_request_target` trigger. Opening or updating a pull request never sends anything anywhere.
 
-Activation is gated on more than a single switch: a maintainer must enable Private Vulnerability
-Reporting on the repository, provision a protected environment and credential for submission, and
-set two separate opt-in repository variables. Any one of those being absent leaves the stage off.
+Repository variables and secrets cannot activate the current scaffold: its job condition begins
+with a literal `false &&`, and its proposed runtime is neither approved nor reproducible from the
+public npm registry. A future activation requires a reviewed code change plus Private Vulnerability
+Reporting, a protected environment, managed credentials and all legal/privacy approvals.
 
-The full design, boundaries and activation prerequisites are documented in
+The full design, boundaries and blocked prerequisites are documented in
 [docs/SECURITY-AUDIT.md](docs/SECURITY-AUDIT.md).
 
 If you have concerns about this feature as it relates to your contribution, please open a GitHub

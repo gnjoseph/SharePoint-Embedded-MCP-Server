@@ -5,78 +5,62 @@ This directory exists for one reason: `.github/workflows/security-audit.yml` run
 talk to a model directly. It shells out to the **GitHub Copilot CLI**, which must
 already be installed on the runner.
 
-The workflow therefore installs the CLI itself. It does **not** use
-`npm install -g @github/copilot@<version>`, because a global install resolves
-transitive dependencies at install time: the exact bytes executed on the runner
-are decided by whatever the registry serves that day. That is not acceptable for
-a job that is handed repository source code and a credential.
-
-Instead the CLI is installed with `npm ci --ignore-scripts` from the manifest and
-lockfile in this directory, which installs exactly the tree recorded in
-`package-lock.json` and fails if the manifest and lockfile disagree.
+The credentialed model job is currently **hard-disabled scaffolding**. Its job
+condition begins with a literal `false &&`, so repository variables and secrets
+cannot make it run. The dormant install step deliberately refuses global or
+floating installation and would require `npm ci --ignore-scripts` from an
+approved manifest and committed lockfile before any repository source is
+assembled.
 
 ## Contents
 
 | File | Purpose |
 | --- | --- |
-| `package.json` | Exact version pin. `private: true`, never published. |
-| `package-lock.json` | **Not committed yet — see below.** Integrity-checked dependency tree. |
+| `package.json` | Proposed exact version. `private: true`, never published; not an approval record. |
+| `package-lock.json` | Intentionally absent while the proposed runtime is unapproved and unavailable from the public registry. |
 
 `tools/` is not listed in the root `package.json` `files` array, so nothing here
 is included in the published `@microsoft/spe-mcp` tarball.
 
-## Pinned version and licensing
+## Proposed version and unresolved approval
 
-| Package | Version | License |
+| Package | Proposed version | Status |
 | --- | --- | --- |
-| `@github/copilot` | `1.0.80-1` (exact, no range) | `SEE LICENSE IN LICENSE.md` (GitHub Copilot CLI terms; review before activation) |
-| `detect-libc` | `2.1.2` (only transitive runtime dependency; declared `^2.1.2`) | Apache-2.0 |
-| `@github/copilot-<platform>` | `1.0.80-1` (exact) | Ships with `@github/copilot` as `optionalDependencies`; one per platform |
+| `@github/copilot` | `1.0.80-1` (exact, no range) | Not available from `https://registry.npmjs.org/`; license is `SEE LICENSE IN LICENSE.md`; package/license/CELA/Privacy approval remains open |
 
-`@github/copilot@1.0.80-1` declares **no** `scripts` field, so `--ignore-scripts`
-does not skip anything the package needs. It is used to guarantee that installing
-the CLI cannot execute arbitrary install-time code on the runner.
+The corporate npm configuration can resolve this version from an internal feed.
+That does **not** make it reproducible on a public GitHub-hosted runner, and an
+internal-feed URL must not be committed into this public repository.
 
-Because `@github/copilot` is not permissively licensed, activation of the
-model-assisted audit requires the licensing/CELA sign-off described in
-[`docs/SECURITY-AUDIT.md`](../../docs/SECURITY-AUDIT.md).
+Because the package is not permissively licensed, a future runtime selection also
+requires the licensing/CELA/Privacy sign-off described in
+[`docs/SECURITY-AUDIT.md`](../../docs/SECURITY-AUDIT.md). This file records a
+proposal, not approval.
 
-## Activation prerequisite: generate the lockfile
+## Why there is no lockfile
 
-`package-lock.json` is intentionally **absent from this branch**. It must be
-generated once, by a maintainer, on a host that reaches `registry.npmjs.org`
-directly:
+`package-lock.json` is intentionally absent. A direct, credential-free query to
+`registry.npmjs.org` cannot resolve the proposed version. Generating the lockfile
+with the machine's default corporate npm configuration would instead record an
+internal feed that GitHub-hosted runners cannot access.
 
-```bash
-cd tools/copilot-cli
-npm install --package-lock-only --ignore-scripts
-git add package-lock.json
-```
+Do not generate a lockfile from the internal feed, and do not downgrade or replace
+the proposed package merely to make installation pass. A future reviewed change
+must first select an approved, compatible version that is directly available from
+the public registry. It must then generate and verify the lockfile using empty
+user/global npm configuration and the explicit public registry. Until that code
+change lands, the literal `false &&` guard in `security-audit.yml` must remain.
 
-Then verify before committing:
+## Future runtime update
 
-- every `resolved` URL points at `https://registry.npmjs.org/`, not at a mirror,
-  proxy or internal feed; and
-- every `integrity` value is `sha512-…`, not `sha1-…`.
-
-A lockfile generated behind a registry proxy fails both checks: proxies rewrite
-`resolved` to internal hostnames and commonly strip `dist.integrity`, leaving npm
-to fall back to the weak SHA-1 `shasum`. Committing such a lockfile would look
-like supply-chain pinning while pinning nothing verifiable, so this branch does
-not ship one.
-
-Until the lockfile is committed, the `Install Copilot CLI` step **fails closed**
-with an actionable error rather than falling back to a floating install. This is
-safe: the model-assisted job is disabled by default (`vars.SECURITY_AUDIT_AI_ENABLED`),
-is gated on a protected environment, and is never a required status check, so the
-deterministic scanners are unaffected.
-
-## Updating the pin
-
-1. Bump the exact version in `package.json`.
-2. Regenerate `package-lock.json` using the command above and re-run the two
-   verification checks.
-3. Re-review the upstream license and release notes.
+1. Obtain package/license/CELA/Privacy approval for the selected runtime.
+2. Confirm compatibility with the pinned `actions/ai-inference` revision.
+3. Pin the exact version in `package.json`.
+4. Generate `package-lock.json` against `https://registry.npmjs.org/` with empty
+   user/global npm configuration.
+5. Verify every `resolved` URL uses that public registry and every integrity value
+   is `sha512-…`; run a clean `npm ci --ignore-scripts`.
+6. Remove the job-level hard-disable only in the same reviewed change.
 
 Dependabot watches this directory (`.github/dependabot.yml`), so version bumps
 surface as pull requests once the lockfile exists.

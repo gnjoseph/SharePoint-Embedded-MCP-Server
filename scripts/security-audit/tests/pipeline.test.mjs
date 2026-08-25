@@ -43,7 +43,7 @@ import { findRejectReasons, redact } from '../lib/redaction.mjs';
 import { validateFindings, extractJson } from '../validate-response.mjs';
 import { FULL_SHA } from '../validate-target.mjs';
 import { renderTemplate, templateValues } from '../build-prompt.mjs';
-import { checkCompositeActions, checkWorkflowSource, collectFiles } from '../check-action-pins.mjs';
+import { checkLocalActions, checkWorkflowSource, collectFiles } from '../check-action-pins.mjs';
 import { sanitizeNpmAudit, sanitizeGitleaks } from '../sanitize-findings.mjs';
 import { modelStatus, buildSummary } from '../summarize.mjs';
 
@@ -561,6 +561,9 @@ test('reject patterns catch credentials, identifiers and weaponized payloads', (
     [token, 'github-token'],
     ['11111111-2222-3333-4444-555555555555', 'guid'],
     ['/home/runner/work/repo/src/index.ts', 'absolute-path'],
+    ['/tmp', 'single-segment-posix-path'],
+    ['/opt', 'single-segment-posix-path'],
+    ['/srv', 'single-segment-posix-path'],
     ['/tmp/audit/output.json', 'generic-posix-path'],
     ['/opt/security/tool', 'generic-posix-path'],
     ['/srv/service/config', 'generic-posix-path'],
@@ -809,6 +812,13 @@ test('a partially rejected response preserves only accepted findings before fail
   assert.equal(existsSync(reportPath), true);
 
   const report = JSON.parse(readFileSync(reportPath, 'utf8'));
+  assert.deepEqual(Object.keys(report).sort(), [
+    'findings',
+    'generatedAt',
+    'rejected',
+    'schemaVersion',
+    'scope',
+  ]);
   assert.equal(report.findings.length, 1, 'accepted findings remain eligible for private submission');
   assert.equal(report.findings[0].file, 'src/index.ts');
   assert.equal(report.rejected.length, 1);
@@ -939,7 +949,7 @@ test('the sanitized gitleaks summary publishes counts without locations', () => 
   assert.equal(/\.ts/.test(text), false, 'file paths must not leak');
 });
 
-test('sanitizer success is local-only in Actions without changing files or failures', () => {
+test('sanitizer success is quiet everywhere without changing files or failures', () => {
   const out = tempDir('spe-sanitizer-actions-');
   const input = path.join(out, 'audit.json');
   const localOutput = path.join(out, 'local.json');
@@ -969,7 +979,7 @@ test('sanitizer success is local-only in Actions without changing files or failu
     localOutput,
   ]);
   assert.equal(local.status, 0, local.stderr);
-  assert.match(local.stdout, /sanitized npm-audit summary/);
+  assert.equal(local.stdout, '');
   assert.equal(existsSync(localOutput), true);
 
   const actions = runScript(
@@ -1265,7 +1275,7 @@ test('the rendered vocabulary is injected from constants and cannot drift', () =
 });
 
 // ---------------------------------------------------------------------------
-// Action pinning covers composite actions, not just workflow files
+// Action pinning covers all local actions, not just workflow files
 // ---------------------------------------------------------------------------
 
 test('an unpinned composite action is flagged wherever it lives', () => {
@@ -1278,7 +1288,7 @@ test('an unpinned composite action is flagged wherever it lives', () => {
     'utf8',
   );
 
-  const violations = checkCompositeActions(root);
+  const violations = checkLocalActions(root);
   assert.equal(violations.length, 1, JSON.stringify(violations));
   assert.equal(violations[0].uses, 'actions/checkout@v5');
   assert.equal(violations[0].reason, 'not-sha-pinned');
@@ -1295,9 +1305,86 @@ test('hidden composite-action directories are scanned by default', () => {
     'utf8',
   );
 
-  const violations = checkCompositeActions(root);
+  const violations = checkLocalActions(root);
   assert.equal(violations.length, 1, JSON.stringify(violations));
   assert.match(violations[0].file, /\.actions\/helper\/action\.yml$/);
+});
+
+test('local Docker action metadata rejects floating external images', () => {
+  const root = tempDir('spe-docker-action-');
+  const nested = path.join(root, 'actions', 'containerized');
+  mkdirSync(nested, { recursive: true });
+  writeFileSync(
+    path.join(nested, 'action.yml'),
+    [
+      'name: Containerized helper',
+      'runs:',
+      '  using: docker',
+      '  image: docker://ghcr.io/example/helper:v1 # v1',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+
+  const violations = checkLocalActions(root);
+  assert.equal(violations.length, 1, JSON.stringify(violations));
+  assert.equal(violations[0].uses, 'docker://ghcr.io/example/helper:v1');
+  assert.equal(violations[0].reason, 'not-digest-pinned');
+  assert.match(violations[0].file, /actions\/containerized\/action\.yml$/);
+});
+
+test('digest-pinned local Docker action metadata requires and accepts a version comment', () => {
+  const root = tempDir('spe-pinned-docker-action-');
+  const nested = path.join(root, 'actions', 'containerized');
+  const metadata = path.join(nested, 'action.yaml');
+  const image = `docker://ghcr.io/example/helper@sha256:${'a'.repeat(64)}`;
+  mkdirSync(nested, { recursive: true });
+  writeFileSync(
+    metadata,
+    ['name: Containerized helper', 'runs:', '  using: docker', `  image: ${image}`, ''].join('\n'),
+    'utf8',
+  );
+
+  const undocumented = checkLocalActions(root);
+  assert.equal(undocumented.length, 1, JSON.stringify(undocumented));
+  assert.equal(undocumented[0].reason, 'missing-version-comment');
+
+  writeFileSync(
+    metadata,
+    [
+      'name: Containerized helper',
+      'runs:',
+      '  using: docker',
+      `  image: ${image} # v1`,
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+  assert.deepEqual(checkLocalActions(root), []);
+});
+
+test('hidden local Docker actions are scanned while repository Dockerfiles remain local', () => {
+  const root = tempDir('spe-hidden-docker-action-');
+  const nested = path.join(root, '.actions', 'containerized');
+  const metadata = path.join(nested, 'action.yml');
+  mkdirSync(nested, { recursive: true });
+  writeFileSync(
+    metadata,
+    ['runs:', '  using: docker', '  image: docker://alpine:latest # v3', ''].join('\n'),
+    'utf8',
+  );
+
+  const violations = checkLocalActions(root);
+  assert.equal(violations.length, 1, JSON.stringify(violations));
+  assert.equal(violations[0].reason, 'not-digest-pinned');
+  assert.match(violations[0].file, /\.actions\/containerized\/action\.yml$/);
+
+  writeFileSync(
+    metadata,
+    ['runs:', '  using: docker', '  image: Dockerfile', ''].join('\n'),
+    'utf8',
+  );
+  assert.deepEqual(checkLocalActions(root), []);
 });
 
 test('only explicit generated and dependency directories are skipped', () => {
@@ -1311,7 +1398,7 @@ test('only explicit generated and dependency directories are skipped', () => {
       'utf8',
     );
   }
-  assert.deepEqual(checkCompositeActions(root), []);
+  assert.deepEqual(checkLocalActions(root), []);
 });
 
 test('a pinned reference with a version comment is accepted', () => {
@@ -1430,6 +1517,68 @@ test('the pin-check CLI is silent on Actions success and preserves failure seman
   assert.notEqual(failure.status, 0);
   assert.equal(failure.stdout, '');
   assert.match(failure.stderr, /not-sha-pinned/);
+
+  writeFileSync(
+    workflow,
+    `steps:\n  - uses: actions/checkout@${'e'.repeat(40)} # v1\n`,
+    'utf8',
+  );
+  const hidden = path.join(root, '.actions', 'dockerized');
+  mkdirSync(hidden, { recursive: true });
+  writeFileSync(
+    path.join(hidden, 'action.yml'),
+    ['runs:', '  using: docker', '  image: docker://alpine:latest # v3', ''].join('\n'),
+    'utf8',
+  );
+  const dockerFailure = runScript(
+    'check-action-pins.mjs',
+    ['--dir', workflows, '--root', root],
+    { GITHUB_ACTIONS: 'true' },
+  );
+  assert.notEqual(dockerFailure.status, 0);
+  assert.equal(dockerFailure.stdout, '');
+  assert.match(dockerFailure.stderr, /not-digest-pinned/);
+});
+
+test('the pin-check CLI applies local-action checks inside the workflow tree', () => {
+  const root = tempDir('spe-pins-workflow-action-');
+  const workflows = path.join(root, '.github', 'workflows');
+  const nested = path.join(workflows, '.hidden-action');
+  const metadata = path.join(nested, 'action.yml');
+  mkdirSync(nested, { recursive: true });
+  writeFileSync(
+    metadata,
+    ['runs:', '  using: docker', '  image: docker://alpine:latest # v3', ''].join('\n'),
+    'utf8',
+  );
+
+  const failure = runScript(
+    'check-action-pins.mjs',
+    ['--dir', workflows, '--root', root],
+    { GITHUB_ACTIONS: 'true' },
+  );
+  assert.notEqual(failure.status, 0);
+  assert.equal(failure.stdout, '');
+  assert.match(failure.stderr, /not-digest-pinned/);
+
+  writeFileSync(
+    metadata,
+    [
+      'runs:',
+      '  using: docker',
+      `  image: docker://alpine@sha256:${'a'.repeat(64)} # v3`,
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+  const success = runScript(
+    'check-action-pins.mjs',
+    ['--dir', workflows, '--root', root],
+    { GITHUB_ACTIONS: 'true' },
+  );
+  assert.equal(success.status, 0, success.stderr);
+  assert.equal(success.stdout, '');
+  assert.equal(success.stderr, '');
 });
 
 
@@ -1454,7 +1603,7 @@ test('the action-pin scan refuses to follow a symlinked workflow file', (t) => {
   }
 
   assert.throws(() => collectFiles(workflows, (name) => name.endsWith('.yml')), /symlink/i);
-  assert.throws(() => checkCompositeActions(root), /symlink/i);
+  assert.throws(() => checkLocalActions(root), /symlink/i);
 });
 
 test('the action-pin scan refuses a symlinked directory and cannot loop', (t) => {

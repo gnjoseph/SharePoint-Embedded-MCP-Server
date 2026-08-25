@@ -64,6 +64,7 @@ been disabled. It makes no claim that the repository is vulnerability-free.
   findings are source-level, not package-level.
 - Stdout is exactly one line: `report: submitted`, `report: existing`, `report: none` or
   `report: failed`. Response bodies, status codes, GHSA identifiers and URLs are never printed.
+  The public workflow suppresses both output streams and uses only the process exit status.
 - Idempotent `GET` requests retry `5xx` at most twice with a fixed 5s delay. Report `POST` requests
   are attempted exactly once because an ambiguous persisted POST must not create duplicates.
   Every error fails closed.

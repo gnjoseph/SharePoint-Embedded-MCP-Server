@@ -257,10 +257,6 @@ function main() {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
     scope: manifest.scope ?? null,
-    corpusFiles: manifest.fileCount ?? null,
-    acceptedCount: result.accepted.length,
-    rejectedCount: result.rejected.length,
-    redactionCount: result.redactions.length,
     rejected: result.rejected,
     findings: result.accepted,
   };

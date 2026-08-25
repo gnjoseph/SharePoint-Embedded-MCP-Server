@@ -1,23 +1,26 @@
-# Weekly repository security audit
+# Repository security audit scaffolding
 
-This repository runs a scheduled security audit
-([`.github/workflows/security-audit.yml`](../.github/workflows/security-audit.yml)) every Monday,
-plus on demand through the fixed `security-audit` repository-dispatch event. Repository dispatch
-always loads the workflow from the default branch; there is no branch-selectable Actions UI entry.
+This repository defines a security-audit workflow
+([`.github/workflows/security-audit.yml`](../.github/workflows/security-audit.yml)) with a Monday
+schedule and a fixed `security-audit` repository-dispatch event. This PR does **not** claim that
+the workflow is deployed or operating on a production schedule. Repository dispatch always loads
+the workflow from the default branch; there is no branch-selectable Actions UI entry.
 
 The audit has two layers:
 
 | Layer | Jobs | Gating |
 | --- | --- | --- |
 | **Deterministic** | dependency audit, secret scan, action pinning | Failures fail the run |
-| **Model-assisted** | `model-audit` (real) / `model-audit-dry-run` (synthetic) | Failure or cancellation fails the run; disabled jobs may remain skipped |
+| **Model-assisted scaffold** | `model-audit` (hard-disabled) / `model-audit-dry-run` (synthetic) | The real job cannot be activated by repository variables; the credential-free synthetic path is testable |
 
 > [!IMPORTANT]
-> The model-assisted layer ships **disabled**, and it stays disabled until an administrator
-> completes the [activation checklist](#activating-the-model-assisted-layer) — which includes
-> enabling **private vulnerability reporting** on the repository and provisioning a protected
-> advisory credential. There is no partially-enabled mode: if any prerequisite is missing the
-> job fails closed rather than running without a private reporting channel.
+> The model-assisted layer is **non-activatable scaffolding**, not an activation-ready feature.
+> Its job expression begins with `false &&`, so repository variables and secrets cannot start it.
+> The proposed Copilot CLI version is unavailable from `registry.npmjs.org`, no reproducible
+> lockfile is committed, and package/license/CELA/Privacy approvals remain open. A future reviewed
+> code change must resolve every item under
+> [Blocked prerequisites](#model-assisted-scaffold-blocked-prerequisites) before removing that
+> hard-disable.
 
 > [!CAUTION]
 > **Disclosure policy — absolute.** Nothing this workflow discovers is ever published. No
@@ -45,7 +48,7 @@ The audit has two layers:
 | `validate-inputs` | Normalizes and validates the dispatch payload | Target must be a 40-hex SHA reachable from `main`; scope and model come from allowlists. Scheduled runs and omitted payload fields supply no ref, so the current `origin/main` tip is resolved to a full SHA and then validated by the same rules |
 | `dependency-audit` | `npm audit --audit-level=high` | The raw JSON never leaves the runner. It is reduced in-job to severity **counts only** — no package names, versions, advisory identifiers or advisory URLs — and the counts are not published either |
 | `secret-scan` | Gitleaks **CLI**, downloaded at a pinned version and SHA256-verified | Nothing is published. Rule identifiers, file paths, line numbers, commit metadata and the matched secret never leave the runner; the raw report and the scanner console output are discarded inside the job. Counts are computed for in-job gating only |
-| `action-pins` | Fails if any workflow uses a mutable action ref | Parses workflow/composite YAML and enforces 40-hex commit pinning (or a 64-hex `sha256` digest for Docker actions) recursively across `.github/workflows` **and** every composite `action.yml`/`action.yaml`, including hidden action directories. Detailed local CLI diagnostics are captured and deleted unread in CI; the workflow emits only the generic failure literal |
+| `action-pins` | Fails if any workflow or local action uses a mutable external ref | Parses workflow/local-action YAML and enforces 40-hex commit pinning for `uses:` values and a 64-hex `sha256` digest for Docker references, including external `runs.image` values in local Docker actions. It scans `.github/workflows` and every `action.yml`/`action.yaml`, including hidden action directories. Detailed local CLI diagnostics are captured and deleted unread in CI; the workflow emits only the generic failure literal |
 | `summary` | Emits the generic public pass/fail literal | Fails the run if any deterministic job did not succeed or an enabled model job failed or was cancelled. It renders no job names, targets, scopes or counts |
 
 Dependency installation and audit run from a runner-owned directory containing only
@@ -83,7 +86,8 @@ existed. The audit therefore never runs code from the commit it is auditing:
 
 Every helper is invoked from the controller checkout and pointed at the target explicitly
 (`collect-corpus.mjs --repo-root target`, `check-action-pins.mjs --dir target/.github/workflows
---root target`, `npm ci`/`npm audit` under `working-directory: target`, `gitleaks git target`).
+--root target`, target package manifests copied into a runner-owned npm directory, and
+`gitleaks git target`).
 Tests assert that no `node scripts/security-audit/...` invocation ever resolves out of `target/`.
 
 > **Ordering constraint.** `actions/checkout` runs `git clean -ffdx` in its destination, so a
@@ -112,10 +116,11 @@ with the upload path it protected.
 Findings are never published as a downloadable artifact. On a public repository that would
 disclose unfixed vulnerabilities, so it is not offered in any form, for any target.
 
-### Model-assisted job
+### Model-assisted job scaffold
 
-`model-audit` sends a **bounded, allowlisted corpus** to a model and validates every finding
-before anything is retained:
+`model-audit` is hard-disabled in this PR. If a future reviewed activation change satisfies the
+blocked prerequisites, the scaffold is designed to send a **bounded, allowlisted corpus** to a
+model and validate every finding before anything is retained:
 
 - Corpus caps: 40 files, 96 KiB per file, 512 KiB total (`scripts/security-audit/lib/constants.mjs`).
 - Instruction surfaces (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.github/instructions/`,
@@ -134,7 +139,8 @@ before anything is retained:
 
 ### Private vulnerability reporting
 
-Validated findings leave the runner through exactly one channel:
+After a future approved activation, validated findings are designed to leave the runner through
+exactly one channel:
 `POST /repos/{owner}/{repo}/security-advisories/reports` — the REST endpoint behind GitHub
 **Private Vulnerability Reporting**. `scripts/security-audit/submit-report.mjs` runs inside the
 same protected `model-audit` job, *after* the tool-less model process has exited and
@@ -152,7 +158,7 @@ closed. A malformed response writes no report and makes no submission.
 | Deduplication | Before submitting, the script follows GitHub's cursor `Link` headers through existing `triage`, `draft`, `published` and `closed` reports and matches the exact summary string. Every continuation must remain on `api.github.com` and the same repository advisory endpoint. A re-run for the same SHA is a no-op |
 | Visibility | Repository **maintainers only**. A report is not an advisory and is not published; maintainers triage it in the Security tab |
 | Retry | Idempotent `GET` requests retry `5xx` at most twice, fixed 5 s apart. A report `POST` is attempted exactly once because a `5xx` can be ambiguous after persistence; retrying could create a duplicate. Every other error **fails the job immediately with no fallback** |
-| Output | Exactly one line on stdout: `report: submitted`, `report: existing`, `report: none` or `report: failed`. No status code, response body, GHSA identifier or advisory URL is ever printed |
+| Output | The standalone CLI writes exactly one result token to stdout and no private metadata. The public workflow suppresses both output streams and propagates only the process exit status |
 
 If the private channel cannot be used — PVR not enabled, credential missing, endpoint rejecting —
 the run **fails**. Findings are not written anywhere else, not retried through another surface,
@@ -218,7 +224,7 @@ in CI.
 | `corpus-manifest.json` | Files collected, byte/line counts, skipped files, the run nonce |
 | `system.txt` | Rendered auditor preamble (vocabulary injected from `constants.mjs`) |
 | `prompt.txt` | Nonce-fenced corpus followed by the trusted output-contract suffix |
-| `model-report.json` | Accepted findings, rejected findings with reasons, redaction count |
+| `model-report.json` | Accepted findings and rejected finding indexes with reason codes |
 
 The dry run validates that `model-report.json` matches the schema `submit-report.mjs` consumes,
 then reports success generically. It never contacts GitHub, never builds a report body from real
@@ -227,10 +233,11 @@ findings and never prints finding detail.
 Individual stages can be run directly — see
 [`scripts/security-audit/README.md`](../scripts/security-audit/README.md).
 
-## Running it on demand
+## Running the deterministic or synthetic path on demand
 
-An operator with permission to create repository dispatches can request an audit without selecting
-the controller branch:
+Once the workflow is present on the default branch, an operator with permission to create
+repository dispatches can request the deterministic jobs and credential-free synthetic dry run
+without selecting the controller branch:
 
 ```bash
 gh api --method POST \
@@ -244,8 +251,9 @@ gh api --method POST \
 
 Every `client_payload` value is optional and untrusted. `validate-target.mjs` is the sole parameter
 gate: it applies the same full-SHA/reachability, allowlist, and strict-boolean checks used by the
-weekly run. Omitting `ref` audits the current `origin/main` tip. The fixed event type does not allow
-the caller to choose workflow YAML from another branch.
+schedule-declared path. Omitting `ref` audits the current `origin/main` tip. The fixed event type does not allow
+the caller to choose workflow YAML from another branch. The real model job remains skipped
+regardless of repository-variable values while the hard-disable is present.
 
 ## Triaging results
 
@@ -270,7 +278,8 @@ the caller to choose workflow YAML from another branch.
    rule identifiers or paths into an issue, a pull request or any other public surface.
 4. **Action-pin failures are configuration errors, not vulnerabilities.** Run
    `npm run security:audit:pins` locally; the output names the offending workflow and action.
-5. **Accepted model findings, when submission succeeds, arrive as a private report.** Open the
+5. **After a future approved activation, accepted model findings arrive only as a private
+   report.** Open the
    repository's **Security → Advisories** tab and look for
    `SPE automated security audit — <12hex>`. A malformed response or failed submission can make the
    model job fail without creating a report. Each accepted finding carries a confidence and a
@@ -281,63 +290,50 @@ the caller to choose workflow YAML from another branch.
    Private Vulnerability Reporting channel the automated audit uses. Never open a public issue for
    an unfixed vulnerability, and never file one in an external tracker.
 
-## Activating the model-assisted layer
+## Model-assisted scaffold: blocked prerequisites
 
-The model layer ships **disabled**. Nothing in this repository stores, references or reuses a
-credential, and the deterministic jobs are fully functional without one. Activation requires
-repository-administrator rights and is deliberately **not** automated.
+This section is **not an activation procedure**. The credentialed model job is hard-disabled by a
+literal `false &&` in its job condition. Repository administrators cannot enable it with variables,
+secrets or environment configuration. Nothing in this repository stores, references or reuses a
+credential, and the deterministic and synthetic paths do not depend on the proposed model runtime.
 
-**Approval gate.** The model layer sends repository source to a third-party inference provider.
-Obtain **CELA and Privacy sign-off before setting `SECURITY_AUDIT_AI_ENABLED`**. Enabling the
-variable is the act that authorizes egress; every other step below is inert without it.
+The runtime currently recorded in `tools/copilot-cli/package.json` is a proposal only:
 
-**Two switches, both required.** The job runs only when `SECURITY_AUDIT_AI_ENABLED` **and**
-`SECURITY_AUDIT_PRIVATE_REPORTING_ENABLED` are both `true`. The second variable exists so that
-the model layer can never run before the private reporting channel is available: without a place
-to send findings privately, the only remaining options would be to publish them or to discard
-them, and both are unacceptable. There is no partially-enabled mode.
+- `@github/copilot@1.0.80-1` is not available from `https://registry.npmjs.org/`;
+- the corporate registry resolves it through an internal feed, which a public GitHub-hosted runner
+  cannot use and which must not be committed into a public lockfile;
+- `tools/copilot-cli/package-lock.json` is therefore intentionally absent; and
+- package licensing plus CELA and Privacy determinations remain open.
 
-Steps, in order:
+Do **not** generate or commit a lockfile from an internal mirror, and do not replace the package
+version merely to make installation pass. Either action would silently choose an unapproved
+runtime or make the public workflow dependent on an unavailable private feed.
 
-1. **Generate and commit the Copilot CLI lockfile.** The install step fails closed when
-   `tools/copilot-cli/package-lock.json` is absent. Generate it on a network with direct access
-   to `registry.npmjs.org` and verify the `resolved` and `integrity` fields before committing —
-   see [`tools/copilot-cli/README.md`](../tools/copilot-cli/README.md).
-2. **Enable Private Vulnerability Reporting on the repository** (Settings → Code security →
-   Private vulnerability reporting). This is a hard prerequisite: the submission endpoint returns
-   an error while it is off, and the job fails closed rather than falling back to any other
-   surface.
-3. **Create and protect the `security-audit-private-report` environment**: required reviewers,
-   plus a deployment-branch rule limited to `main`.
-4. **Provision a team-owned managed service account, then add a least-scope `COPILOT_PAT`
-   environment secret** (Copilot Requests only — no `repo`, no `workflow`, no `write:*`).
-   GitHub has no "team alias" credential: a personal access token is always bound to a GitHub
-   *account*, so the token must be issued from a **managed service (machine) account owned by the
-   team**, never from an individual maintainer's account. This is the only supported credential
-   path; see the governance requirements below.
-5. **Add the `SECURITY_ADVISORY_TOKEN` environment secret to the same environment.** The workflow
-   `GITHUB_TOKEN` **cannot** be granted the `repository-advisories` permission — GitHub Actions
-   does not expose it — so a separate credential is unavoidable. Use, in order of preference:
-   - a **short-lived GitHub App installation token** for an App installed on this repository only,
-     with *Repository security advisories: write*, minted per run; or
-   - a **fine-grained personal access token** scoped to this single repository with *Repository
-     security advisories: write* and no other permission, issued from the same team-managed
-     service account and governed by the same rules as `COPILOT_PAT`.
+A future activation requires a separate reviewed change. Before that change may remove the
+literal hard-disable, it must provide evidence for all of the following:
 
-   The token is exposed to the submission step only. It is not present in the environment of the
-   corpus, prompt, install or inference steps, so the model process never sees a credential that
-   can write to the repository.
-6. **Set the repository variables `SECURITY_AUDIT_AI_ENABLED` and
-   `SECURITY_AUDIT_PRIVATE_REPORTING_ENABLED` to `true`.** The job stays skipped until both
-   variables exist, so the protected environment is never implicitly created.
-7. **Validate the model id** is accepted by the provider before the first real run. The allowlist
-   holds exactly **one** model for the MVP (`claude-opus-5`), so the provider and subprocessor
-   chain is fixed and reviewable. Adding a second model widens that chain and requires its own
-   CELA/Privacy determination — it is not a configuration change. `claude-opus-5` is an allowlist
-   entry that has not been exercised end to end.
+1. **Approved, publicly reproducible runtime.** Select a Copilot CLI version approved for this use,
+   available directly from `registry.npmjs.org`, and compatible with the pinned
+   `actions/ai-inference` revision. Generate the lockfile with the existing npm client and verify
+   every `resolved` URL and `sha512-…` integrity value. A clean `npm ci --ignore-scripts` must pass
+   with empty user/global npm configuration and the public registry explicitly selected.
+2. **CELA and Privacy sign-off.** The model layer sends repository source to a third-party
+   inference provider. Every determination below must be recorded before egress is authorized.
+3. **Private reporting channel.** Enable GitHub Private Vulnerability Reporting and prove that the
+   submission credential can create a private report without any public fallback.
+4. **Protected environment and managed credentials.** Create
+   `security-audit-private-report` with required reviewers and a `main` deployment rule. Provision
+   the team-owned credentials described below; individual-maintainer credentials are not
+   acceptable.
+5. **Provider/model compatibility.** Validate the allowlisted model and subprocessor chain without
+   publishing prompts, responses, findings, counts or submission outcomes.
+6. **Code-reviewed enablement.** Only after items 1–5 are approved may a code change remove the
+   literal hard-disable. The existing `SECURITY_AUDIT_AI_ENABLED` and
+   `SECURITY_AUDIT_PRIVATE_REPORTING_ENABLED` variables remain defence-in-depth gates; they are not
+   an activation mechanism while `false &&` remains.
 
-A missing credential, a disabled reporting channel or a rejected submission **fails the job**. No
-step degrades to a pass, and no step writes the findings anywhere else.
+After activation, a missing credential, disabled reporting channel or rejected submission must
+fail the job. No step may degrade to a pass or write findings anywhere else.
 
 ### `COPILOT_PAT` governance requirements
 
@@ -353,14 +349,14 @@ disabled — the deterministic jobs are unaffected.
 | Expiry | Set an **explicit expiry**. Tokens configured with "no expiration" are disqualifying. |
 | Rotation | Rotate on a fixed cadence no longer than the organization's standard for CI credentials, and immediately on any suspected exposure. |
 | Offboarding | Add the token to the team's **offboarding checklist**. Revoke and reissue whenever a named owner changes role or leaves, and whenever the service account changes hands. |
-| Cost centre | Copilot premium requests are metered and billed against the service account's entitlement. Record the **cost centre** that absorbs them before enabling; a weekly run over the full corpus is not free. |
+| Cost centre | Copilot premium requests are metered and billed against the service account's entitlement. Record the **cost centre** that would absorb them before a future enablement; repeated full-corpus runs are not free. |
 | Debug logs | The `model-audit` job **fails closed** before any corpus is collected when `ACTIONS_STEP_DEBUG` or `ACTIONS_RUNNER_DEBUG` is set, or when the run was started with "Enable debug logging". Debug logging can flush prompt and response content into logs that are world-readable on a public repository, so the job refuses to run rather than relying on an operator instruction. Disable debug logging and re-run. |
 
 There is **no** alternative credential mechanism implemented. If a different provider or an
 OIDC-based flow is adopted later, it must be implemented and reviewed on its own merits — do not
 assume it is available.
 
-### Activation determinations (to be completed by CELA/Privacy)
+### Future activation determinations (to be completed by CELA/Privacy)
 
 Nothing in this table is answered, agreed or approved. These are **open questions** that CELA and
 Privacy must determine and record before `SECURITY_AUDIT_AI_ENABLED` is set. This repository makes
@@ -376,13 +372,14 @@ no claim about any of them; the rows exist so that activation cannot proceed on 
 | Contributor disclosure sufficiency | Is the disclosure in [`../CONTRIBUTING.md`](../CONTRIBUTING.md) sufficient notice to external contributors? | ☐ Not determined |
 | Export/third-party review | Are there export-control or third-party-review obligations triggered by sending this source to the provider? | ☐ Not determined |
 
-If any row is unresolved, leave the layer disabled. The deterministic jobs are unaffected and
-continue to run on schedule.
+If any row is unresolved, the literal hard-disable must remain. The deterministic jobs and
+credential-free synthetic path are independent of this blocked scaffold.
 
 Related administrative follow-ups (independent of the model layer):
 
 - Enable **Private Vulnerability Reporting** on the repository. This is a hard prerequisite for
-  the model-assisted layer (see step 2 above) and is also the channel external researchers use.
+  any future model-assisted layer (see item 3 above) and is also the channel external researchers
+  use.
 - Enable **native secret scanning** and **push protection** on the repository.
 - Add the deterministic jobs as **required status checks** in the organization ruleset.
   Do **not** make the model job a required check. It is advisory, non-deterministic, and its

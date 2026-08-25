@@ -4,7 +4,7 @@
 // corresponds to a way the workflow could be turned into an attack primitive if
 // it were edited carelessly.
 import { strict as assert } from 'node:assert';
-import { readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 
@@ -171,6 +171,11 @@ test('model output is never interpolated into a shell command', () => {
 
 test('the model job is gated, environment-protected and tool-less', () => {
   const job = audit.doc.jobs['model-audit'];
+  assert.match(
+    job.if,
+    /\bfalse\s*&&/,
+    'repository variables alone must not activate the unapproved model scaffold',
+  );
   assert.match(job.if, /vars\.SECURITY_AUDIT_AI_ENABLED == 'true'/);
   // Private reporting is the only egress for model findings, so the job cannot
   // start unless private reporting is switched on as well. Two independent repo
@@ -470,8 +475,7 @@ test('the model job submits a private report attributed to the audited commit', 
     submit.env.SECURITY_ADVISORY_TOKEN,
     /secrets\.SECURITY_ADVISORY_TOKEN/,
   );
-  assert.match(submit.run, /> \/dev\/null/);
-  assert.equal(/2>\s*\/dev\/null/.test(submit.run), false, 'submission stderr must remain available');
+  assert.match(submit.run, /> \/dev\/null 2>&1/);
 });
 
 test('partial validation submits accepted findings privately before the job fails closed', () => {
@@ -738,22 +742,47 @@ test('the action-pin job captures detailed CLI diagnostics and emits only generi
   assert.equal(/path|line|action|reason|private|report/i.test(gate.run), false);
 });
 
-// `npm install -g <pkg>@<version>` still resolves ranged transitive
-// dependencies at install time, so the installed tree is not reproducible.
-// The tool is installed from a committed manifest instead, and the job fails
-// closed when the accompanying lockfile has not been provisioned.
-test('the Copilot CLI is installed reproducibly from a committed manifest', () => {
+// The proposed CLI package is not approved or reproducible from the public npm
+// registry, so repository configuration alone must not activate this scaffold.
+// A future code review must select the approved version, commit its lockfile and
+// remove the hard-disable. The dormant install remains fail-closed and isolated.
+test('the Copilot CLI scaffold is hard-disabled pending an approved public lockfile', () => {
   const code = audit.code;
+  const job = audit.doc.jobs['model-audit'];
+  const lockfile = path.join(REPO_ROOT, 'tools', 'copilot-cli', 'package-lock.json');
   assert.equal(
     /npm install -g/.test(code),
     false,
     'a global ranged install is not reproducible',
   );
-  assert.match(code, /npm ci --ignore-scripts/);
+  assert.equal(existsSync(lockfile), false, 'an unapproved lockfile must not be committed');
+  assert.match(job.if, /\bfalse\s*&&/);
+  assert.match(code, /npm ci[\s\\]*--ignore-scripts/);
   assert.match(code, /if \[ ! -f tools\/copilot-cli\/package-lock\.json \]/);
+  assert.match(code, /--registry=https:\/\/registry\.npmjs\.org\//);
+  assert.match(code, /--userconfig="\$\{NPM_USER_CONFIG\}"/);
+  assert.match(code, /--globalconfig="\$\{NPM_GLOBAL_CONFIG\}"/);
   assert.match(code, /exit 1/);
 
-  const inference = audit.doc.jobs['model-audit'].steps.find(
+  const installIndex = job.steps.findIndex(
+    (step) => step.name === 'Install approved Copilot CLI runtime',
+  );
+  const debugIndex = job.steps.findIndex((step) => step.name === 'Refuse to run under debug logging');
+  const corpusIndex = job.steps.findIndex((step) => /collect-corpus\.mjs/.test(step.run ?? ''));
+  assert.ok(installIndex >= 0, 'the dormant install guard must remain explicit');
+  assert.ok(debugIndex < installIndex, 'the debug guard must precede dependency installation');
+  assert.ok(installIndex < corpusIndex, 'the dependency gate must precede source assembly');
+  assert.equal(
+    job.steps[installIndex].run.includes('tools/copilot-cli/package-lock.json'),
+    true,
+  );
+  assert.equal(
+    job.steps[installIndex].run.includes('echo "Security audit: FAIL" >&2'),
+    true,
+    'the dormant gate must emit only the generic public failure literal',
+  );
+
+  const inference = job.steps.find(
     (step) => typeof step.uses === 'string' && step.uses.startsWith('actions/ai-inference@'),
   );
   assert.ok(inference, 'the model job runs the inference action');
@@ -808,7 +837,7 @@ test('the model job refuses to run under debug logging, before any corpus exists
   for (const [label, pattern] of [
     ['corpus collection', /collect-corpus\.mjs/],
     ['prompt assembly', /build-prompt\.mjs/],
-    ['Copilot CLI install', /npm ci --ignore-scripts/],
+    ['Copilot CLI install', /npm ci[\s\\]*--ignore-scripts/],
     ['inference', /^actions\/ai-inference@/],
   ]) {
     const index = laterStep(pattern);
@@ -883,6 +912,11 @@ test('gitleaks console output is discarded and never replayed', () => {
 
 const AUDIT_DOC = readFileSync(path.join(REPO_ROOT, 'docs', 'SECURITY-AUDIT.md'), 'utf8');
 const CONTRIBUTING_DOC = readFileSync(path.join(REPO_ROOT, 'CONTRIBUTING.md'), 'utf8');
+const ROOT_README = readFileSync(path.join(REPO_ROOT, 'README.md'), 'utf8');
+const COPILOT_CLI_DOC = readFileSync(
+  path.join(REPO_ROOT, 'tools', 'copilot-cli', 'README.md'),
+  'utf8',
+);
 
 test('credential governance requires a team-owned managed service account', () => {
   // GitHub cannot issue a token to a "team alias" -- a PAT always belongs to an
@@ -910,8 +944,8 @@ test('credential governance requires a team-owned managed service account', () =
   assert.match(AUDIT_DOC, /offboarding checklist/i, 'offboarding must be an explicit obligation');
 });
 
-test('activation determinations are recorded as open, never as approved', () => {
-  const heading = '### Activation determinations (to be completed by CELA/Privacy)';
+test('future activation determinations are recorded as open, never as approved', () => {
+  const heading = '### Future activation determinations (to be completed by CELA/Privacy)';
   const start = AUDIT_DOC.indexOf(heading);
   assert.notEqual(start, -1, 'the activation determinations table must exist');
 
@@ -931,6 +965,23 @@ test('activation determinations are recorded as open, never as approved', () => 
     AUDIT_DOC,
     /\bapproved by (CELA|Privacy)\b/i,
     'the docs must not claim CELA or Privacy approval',
+  );
+});
+
+test('documentation makes no activation-ready or production-schedule claim', () => {
+  assert.match(ROOT_README, /not activation-ready/i);
+  assert.match(ROOT_README, /no claim that a production\s+weekly audit is active/i);
+  assert.match(AUDIT_DOC, /does \*\*not\*\* claim that\s+the workflow is deployed or operating/i);
+  assert.match(CONTRIBUTING_DOC, /no claim that a production\s+schedule is active/i);
+  assert.match(COPILOT_CLI_DOC, /hard-disabled scaffolding/i);
+
+  assert.doesNotMatch(ROOT_README, /runs a scheduled weekly security audit/i);
+  assert.doesNotMatch(AUDIT_DOC, /^## Activating the model-assisted layer$/m);
+  assert.doesNotMatch(CONTRIBUTING_DOC, /when a maintainer explicitly enables it/i);
+  assert.doesNotMatch(
+    COPILOT_CLI_DOC,
+    /npm install --package-lock-only/,
+    'the blocked scaffold must not present a lockfile-generation activation recipe',
   );
 });
 
@@ -1009,7 +1060,7 @@ test('the model layer remains disabled: nothing in the repository enables it', (
   }
 
   assert.ok(
-    AUDIT_DOC.includes('The model layer ships **disabled**'),
-    'the docs must continue to state that the model layer ships disabled',
+    AUDIT_DOC.includes('The model-assisted layer is **non-activatable scaffolding**'),
+    'the docs must state that the model layer cannot be activated',
   );
 });
