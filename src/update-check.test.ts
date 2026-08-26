@@ -439,6 +439,14 @@ describe("cache", () => {
     expect(__testing.readCache()?.notifiedFor).toEqual(["1.0.0"]);
   });
 
+  it("retains the complete suppression history for the cache lifetime", () => {
+    const notifiedFor = Array.from({ length: 20 }, (_, index) => `stable:${index + 1}.0.0`);
+    expect(__testing.writeCache({ ...base, notifiedFor })).toBe(true);
+
+    expect(__testing.readCache()?.notifiedFor).toEqual(notifiedFor);
+    expect(readCacheFile()["notifiedFor"]).toEqual(notifiedFor);
+  });
+
   it("treats a recent success as fresh", () => {
     expect(__testing.isCacheFresh(base, DEFAULT_REGISTRY, base.checkedAt + 1_000)).toBe(true);
   });
@@ -687,6 +695,34 @@ describe("runUpdateCheck", () => {
     },
   );
 
+  it.runIf(CHANNEL === "alpha")(
+    "coalesces equal alpha and latest GA targets in favor of stable",
+    async () => {
+      const ga = `${CURRENT.major + 1}.0.0`;
+      respondWith(packument({ alpha: ga, latest: ga }));
+
+      await __testing.runUpdateCheck({});
+
+      expect(getUpdateStatus().updateAvailable).toMatchObject({
+        latest: ga,
+        target: "stable",
+        channel: "alpha",
+        packageSpec: `${PACKAGE_NAME}@latest`,
+      });
+      expect(getUpdateStatus().updateAvailable?.stable).toBeUndefined();
+
+      const notice = takePendingUpdateNotice();
+      expect(notice?.updateAvailable).toMatchObject({
+        latest: ga,
+        target: "stable",
+        packageSpec: `${PACKAGE_NAME}@latest`,
+      });
+      expect(notice?.text).not.toContain("(alpha channel)");
+      expect(notice?.text).toContain(`${PACKAGE_NAME}@latest`);
+      expect(readCacheFile()["notifiedFor"]).toEqual([`stable:${ga}`]);
+    },
+  );
+
   it("never labels a prerelease value from the latest tag as stable", async () => {
     const prereleaseLatest = `${CURRENT.major + 2}.0.0-rc.1`;
     respondWith(
@@ -815,11 +851,22 @@ describe("runUpdateCheck", () => {
     finishFetch?.(new Response(packument(tagsFixture()), { status: 200 }));
     await first;
     expect(readCacheFile()["outcome"]).toBe("success");
-    expect(existsSync(__testing.getRefreshLockFile())).toBe(false);
+    expect(__testing.listRefreshLocks()).toEqual([]);
   });
 
   it("fails closed without egress while another process holds an active refresh lock", async () => {
-    writeFileSync(__testing.getRefreshLockFile(), "other-process", "utf8");
+    const lock = `${__testing.getRefreshLockPrefix()}active`;
+    writeFileSync(
+      lock,
+      JSON.stringify({
+        pid: process.pid,
+        createdAt: Date.now(),
+        id: "active",
+        state: "ready",
+        ticket: 1,
+      }),
+      "utf8",
+    );
     respondWith(packument(tagsFixture()));
 
     await __testing.runUpdateCheck({});
@@ -827,15 +874,25 @@ describe("runUpdateCheck", () => {
     expect(fetchMock).not.toHaveBeenCalled();
     expect(cacheExists()).toBe(false);
     expect(getUpdateStatus().state).toBe("unavailable");
-    expect(readFileSync(__testing.getRefreshLockFile(), "utf8")).toBe("other-process");
+    expect(existsSync(lock)).toBe(true);
   });
 
   it("reclaims an abandoned stale refresh lock and completes one request", async () => {
-    const lock = __testing.getRefreshLockFile();
+    const lock = `${__testing.getRefreshLockPrefix()}stale`;
     const createdAt = Date.now() - REFRESH_LOCK_STALE_MS - 1_000;
     const deadPid = 999_999_991;
     mockExitedProcess(deadPid);
-    writeFileSync(lock, JSON.stringify({ pid: deadPid, createdAt }), "utf8");
+    writeFileSync(
+      lock,
+      JSON.stringify({
+        pid: deadPid,
+        createdAt,
+        id: "stale",
+        state: "ready",
+        ticket: 1,
+      }),
+      "utf8",
+    );
     const staleTime = new Date(createdAt);
     utimesSync(lock, staleTime, staleTime);
     respondWith(packument(tagsFixture()));
@@ -848,7 +905,7 @@ describe("runUpdateCheck", () => {
   });
 
   it("fails closed on stale malformed lock metadata", async () => {
-    const lock = __testing.getRefreshLockFile();
+    const lock = `${__testing.getRefreshLockPrefix()}malformed`;
     writeFileSync(lock, "partially-written", "utf8");
     const staleTime = new Date(Date.now() - REFRESH_LOCK_STALE_MS - 1_000);
     utimesSync(lock, staleTime, staleTime);
@@ -862,12 +919,15 @@ describe("runUpdateCheck", () => {
   });
 
   it("never replaces an old lock while its recorded process is still alive", async () => {
-    const lock = __testing.getRefreshLockFile();
+    const lock = `${__testing.getRefreshLockPrefix()}alive`;
     writeFileSync(
       lock,
       JSON.stringify({
         pid: process.pid,
         createdAt: Date.now() - REFRESH_LOCK_STALE_MS - 1_000,
+        id: "alive",
+        state: "ready",
+        ticket: 1,
       }),
       "utf8",
     );
@@ -883,50 +943,71 @@ describe("runUpdateCheck", () => {
   });
 
   it("does not remove or bypass a non-file refresh lock entry", async () => {
-    mkdirSync(__testing.getRefreshLockFile());
+    const lock = `${__testing.getRefreshLockPrefix()}directory`;
+    mkdirSync(lock);
     respondWith(packument(tagsFixture()));
 
     await __testing.runUpdateCheck({});
 
     expect(fetchMock).not.toHaveBeenCalled();
     expect(getUpdateStatus().state).toBe("unavailable");
-    expect(existsSync(__testing.getRefreshLockFile())).toBe(true);
+    expect(existsSync(lock)).toBe(true);
   });
 
-  it("does not acquire or egress while stale-lock recovery is active", async () => {
-    writeFileSync(__testing.getRefreshRecoveryLockFile(), "other-reclaimer", "utf8");
+  it("does not acquire or egress while another contender is choosing", async () => {
+    const choosing = `${__testing.getRefreshLockPrefix()}choosing`;
+    writeFileSync(
+      choosing,
+      JSON.stringify({
+        pid: process.pid,
+        createdAt: Date.now(),
+        id: "choosing",
+        state: "choosing",
+      }),
+      "utf8",
+    );
     respondWith(packument(tagsFixture()));
 
     await __testing.runUpdateCheck({});
 
     expect(fetchMock).not.toHaveBeenCalled();
     expect(getUpdateStatus().state).toBe("unavailable");
-    expect(existsSync(__testing.getRefreshLockFile())).toBe(false);
+    expect(existsSync(choosing)).toBe(true);
   });
 
-  it("reclaims an abandoned recovery lock before acquiring the refresh lock", () => {
-    const recovery = __testing.getRefreshRecoveryLockFile();
+  it("reclaims an abandoned unique contender before acquiring the refresh lock", () => {
+    const abandoned = `${__testing.getRefreshLockPrefix()}abandoned`;
     const createdAt = Date.now() - REFRESH_LOCK_STALE_MS - 1_000;
     const deadPid = 999_999_992;
     mockExitedProcess(deadPid);
-    writeFileSync(recovery, JSON.stringify({ pid: deadPid, createdAt }), "utf8");
+    writeFileSync(
+      abandoned,
+      JSON.stringify({
+        pid: deadPid,
+        createdAt,
+        id: "abandoned",
+        state: "ready",
+        ticket: 1,
+      }),
+      "utf8",
+    );
     const staleTime = new Date(createdAt);
-    utimesSync(recovery, staleTime, staleTime);
+    utimesSync(abandoned, staleTime, staleTime);
 
     const token = __testing.acquireRefreshLock(Date.now());
 
     expect(token).not.toBeNull();
-    expect(existsSync(recovery)).toBe(false);
-    expect(existsSync(__testing.getRefreshLockFile())).toBe(true);
+    expect(existsSync(abandoned)).toBe(false);
+    expect(__testing.listRefreshLocks()).toEqual([token]);
     __testing.releaseRefreshLock(token as string);
-    expect(existsSync(__testing.getRefreshLockFile())).toBe(false);
+    expect(__testing.listRefreshLocks()).toEqual([]);
   });
 
   it("cleans an abandoned atomic-publication temp lock on the next acquisition", () => {
     const createdAt = Date.now() - REFRESH_LOCK_STALE_MS - 1_000;
     const deadPid = 999_999_993;
     mockExitedProcess(deadPid);
-    const tempLock = `${__testing.getRefreshLockFile()}.tmp-abandoned`;
+    const tempLock = `${__testing.getRefreshLockPrefix()}abandoned.tmp-fixture`;
     writeFileSync(tempLock, JSON.stringify({ pid: deadPid, createdAt }), "utf8");
     const staleTime = new Date(createdAt);
     utimesSync(tempLock, staleTime, staleTime);
@@ -1514,7 +1595,7 @@ describe("privacy: cache retention and deletion", () => {
   // Deleting the cached registry result is a privacy promise. A small local
   // deletion-generation tombstone may remain to prevent in-flight writers from
   // quietly recreating the result the user asked to remove.
-  it("does not recreate the cache when a pending notice is delivered after deletion", async () => {
+  it("does not return or recreate a pending notice after cache deletion", async () => {
     respondWith(packument(tagsFixture()));
     await __testing.runUpdateCheck({});
     expect(cacheExists()).toBe(true);
@@ -1523,8 +1604,8 @@ describe("privacy: cache retention and deletion", () => {
     expect(cacheExists()).toBe(false);
 
     const notice = takePendingUpdateNotice();
-    expect(notice, "a notice was pending before the deletion").not.toBeNull();
-    expect(cacheExists(), "delivery must not resurrect a deleted cache").toBe(false);
+    expect(notice, "an unclaimable notice must be dropped").toBeNull();
+    expect(cacheExists(), "claiming must not resurrect a deleted cache").toBe(false);
   });
 
   it("does not recreate the cache when logout races an in-flight registry request", async () => {
@@ -1548,6 +1629,57 @@ describe("privacy: cache retention and deletion", () => {
     await check;
 
     expect(cacheExists(), "post-fetch write must not undo logout").toBe(false);
+    expect(takePendingUpdateNotice()).toBeNull();
+    expect(getUpdateStatus().state).toBe("unavailable");
+  });
+
+  it("does not adopt a logout generation that advances before lock acquisition", async () => {
+    respondWith(packument({ latest: PACKAGE_VERSION }));
+    await __testing.runUpdateCheck({});
+    const stale = readCacheFile();
+    writeFileSync(
+      getUpdateCacheFile(),
+      JSON.stringify({ ...stale, checkedAt: Date.now() - CHECK_TTL_MS }),
+      "utf8",
+    );
+    __testing.reset();
+    __testing.setInstalled(true);
+    fetchMock.mockClear();
+
+    // Force lock acquisition to observe a proven-dead contender. The liveness
+    // probe runs after runUpdateCheck's initial cache read but before it owns
+    // the refresh lock, giving logout a deterministic point to advance the
+    // deletion generation and remove the cache.
+    const deadPid = 999_999_990;
+    const lock = `${__testing.getRefreshLockPrefix()}logout-race`;
+    const createdAt = Date.now() - REFRESH_LOCK_STALE_MS - 1_000;
+    writeFileSync(
+      lock,
+      JSON.stringify({
+        pid: deadPid,
+        createdAt,
+        id: "logout-race",
+        state: "ready",
+        ticket: 1,
+      }),
+      "utf8",
+    );
+    const staleTime = new Date(createdAt);
+    utimesSync(lock, staleTime, staleTime);
+    vi.spyOn(process, "kill").mockImplementation(
+      ((candidate: number) => {
+        if (candidate === deadPid) {
+          removeUpdateCache();
+          throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+        }
+        return true;
+      }) as typeof process.kill,
+    );
+
+    await __testing.runUpdateCheck({});
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(cacheExists(), "pre-lock logout must remain authoritative").toBe(false);
     expect(takePendingUpdateNotice()).toBeNull();
     expect(getUpdateStatus().state).toBe("unavailable");
   });
@@ -1684,16 +1816,32 @@ describe("notice delivery is what marks a version as notified", () => {
     expect(readCacheFile()["notifiedFor"]).toEqual(["7.7.7", ...EXPECTED_NOTIFICATION_KEYS]);
   });
 
-  it("does not recreate a cache that logout deleted", async () => {
+  it("does not return or recreate a notice that logout made unclaimable", async () => {
     respondWith(packument(tagsFixture()));
     await __testing.runUpdateCheck({});
 
     removeUpdateCache();
     expect(cacheExists()).toBe(false);
 
-    // The pending notice is still delivered, but no file comes back.
-    expect(takePendingUpdateNotice()).not.toBeNull();
+    // Returning it without a durable claim could duplicate it in another
+    // process. Logout wins, so the pending notice is dropped.
+    expect(takePendingUpdateNotice()).toBeNull();
     expect(cacheExists()).toBe(false);
+  });
+
+  it("retries a pending notice after a transient cache-read failure", async () => {
+    respondWith(packument(tagsFixture()));
+    await __testing.runUpdateCheck({});
+    const saved = readCacheFile();
+
+    rmSync(getUpdateCacheFile(), { force: true });
+    mkdirSync(getUpdateCacheFile());
+    expect(takePendingUpdateNotice()).toBeNull();
+
+    rmSync(getUpdateCacheFile(), { recursive: true, force: true });
+    expect(__testing.writeCache(saved as Parameters<typeof __testing.writeCache>[0])).toBe(true);
+    expect(takePendingUpdateNotice()).not.toBeNull();
+    expect(readCacheFile()["notifiedFor"]).toEqual(EXPECTED_NOTIFICATION_KEYS);
   });
 
   it("never writes on delivery when there is nothing to deliver", async () => {

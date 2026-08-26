@@ -8,10 +8,12 @@
  * that only a real process boundary can show: the single announcement of a newer
  * version survives a server that probes and then exits before any tool call.
  *
- * Shape of the run (three sequential servers, one shared data directory):
+ * Shape of the run (sequential and simultaneous servers, one shared data directory):
  *   1. connect, then close without calling a tool  => nothing is burned
  *   2. restart, call a tool                        => exactly one notice
  *   3. restart, call a tool                        => silence forever after
+ *   4. two simultaneous first tool calls           => exactly one notice
+ *   5. many stale-lock reclaimers                   => exactly one request
  *
  * Hermetic by construction:
  *  - the update cache is pre-seeded as a *fresh success*, so the server reuses it
@@ -28,17 +30,25 @@
  * copy carries a sibling `package.json` so the runtime version lookup resolves.
  */
 
-import { execSync } from "node:child_process";
-import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { execSync, spawn } from "node:child_process";
+import {
+  cpSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  utimesSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { parseSemver, releaseChannel } from "./semver.js";
 import { ensureSecureDir, writeSecureFile } from "./secure-fs.js";
-import { DEFAULT_REGISTRY } from "./update-check.js";
+import { DEFAULT_REGISTRY, REFRESH_LOCK_STALE_MS } from "./update-check.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..");
@@ -111,9 +121,12 @@ function seedCache(notifiedFor: string[] = []): void {
   );
 }
 
-function readCacheFile(): { notifiedFor?: unknown } | null {
+function readCacheFile(): { notifiedFor?: unknown; outcome?: unknown } | null {
   if (!existsSync(cacheFile())) return null;
-  return JSON.parse(readFileSync(cacheFile(), "utf8")) as { notifiedFor?: unknown };
+  return JSON.parse(readFileSync(cacheFile(), "utf8")) as {
+    notifiedFor?: unknown;
+    outcome?: unknown;
+  };
 }
 
 function childEnv(): Record<string, string> {
@@ -164,6 +177,34 @@ async function stopServer(client?: Client, transport?: StdioClientTransport): Pr
   } catch {
     /* ignore */
   }
+}
+
+function runNodeChild(script: string): Promise<{ pid: number; stderr: string }> {
+  return new Promise((resolveChild, rejectChild) => {
+    const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+      cwd: REPO_ROOT,
+      env: childEnv(),
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    const pid = child.pid;
+    if (pid === undefined) {
+      rejectChild(new Error("spawned child did not receive a process ID"));
+      return;
+    }
+    let stderr = "";
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.once("error", rejectChild);
+    child.once("close", (code) => {
+      if (code === 0) {
+        resolveChild({ pid, stderr });
+      } else {
+        rejectChild(new Error(`spawned child ${pid} exited ${String(code)}: ${stderr}`));
+      }
+    });
+  });
 }
 
 /** Call the safe, no-network tool and return its text + structured payload. */
@@ -271,5 +312,105 @@ describe("update notice delivery over spawned JSON-RPC (AB#3219517)", () => {
     expect(readCacheFile()?.notifiedFor, "suppression list should not grow").toEqual(
       EXPECTED_NOTIFICATION_KEYS,
     );
+  }, 60000);
+
+  it("atomically delivers one notice across simultaneous server processes", async () => {
+    seedCache([]);
+    const servers = await Promise.all([startServer(), startServer()]);
+    try {
+      const results = await Promise.all(servers.map(({ client }) => callSafeTool(client)));
+      expect(
+        results.filter(({ text }) => /Update available:/i.test(text)),
+        "only one process may claim and return the shared pending target",
+      ).toHaveLength(1);
+      expect(
+        results.filter(({ structured }) => structured?.["updateAvailable"] !== undefined),
+        "the structured notice must have the same single delivery",
+      ).toHaveLength(1);
+    } finally {
+      await Promise.all(servers.map(({ client, transport }) => stopServer(client, transport)));
+    }
+
+    expect(readCacheFile()?.notifiedFor).toEqual(EXPECTED_NOTIFICATION_KEYS);
+  }, 60000);
+
+  it("allows only one request while processes race to recover a stale lock", async () => {
+    rmSync(cacheFile(), { force: true });
+    for (const name of readdirSync(dataDir)) {
+      if (name.startsWith("request-")) rmSync(join(dataDir, name), { force: true });
+    }
+
+    // Use an actual exited child PID rather than guessing a nonexistent PID,
+    // making the liveness proof portable across Windows, Linux, and macOS.
+    const exited = await runNodeChild("");
+    const staleCreatedAt = Date.now() - REFRESH_LOCK_STALE_MS - 1_000;
+    const lockFile = `${cacheFile()}.lock-stale-fixture`;
+    writeSecureFile(
+      lockFile,
+      JSON.stringify({
+        pid: exited.pid,
+        createdAt: staleCreatedAt,
+        id: "stale-fixture",
+        state: "ready",
+        ticket: 1,
+      }),
+    );
+    const staleDate = new Date(staleCreatedAt);
+    utimesSync(lockFile, staleDate, staleDate);
+
+    const moduleUrl = pathToFileURL(join(REPO_ROOT, "dist", "update-check.js")).href;
+    const tags = {
+      latest: SEED_LATEST,
+      ...(CHANNEL_TAG && SEED_CHANNEL_VERSION
+        ? { [CHANNEL_TAG]: SEED_CHANNEL_VERSION }
+        : {}),
+    };
+    const worker = `
+      const { existsSync, writeFileSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      writeFileSync(join(process.env.SPE_DATA_DIR, \`ready-\${process.pid}\`), "1");
+      while (!existsSync(join(process.env.SPE_DATA_DIR, "start-race"))) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      globalThis.fetch = async () => {
+        writeFileSync(join(process.env.SPE_DATA_DIR, \`request-\${process.pid}\`), "1");
+        await new Promise((resolve) => setTimeout(resolve, 350));
+        return new Response(${JSON.stringify(JSON.stringify({ "dist-tags": tags }))}, {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      };
+      const { __testing } = await import(${JSON.stringify(moduleUrl)});
+      __testing.setInstalled(true);
+      await __testing.runUpdateCheck({});
+    `;
+
+    const workers = Array.from({ length: 8 }, () => runNodeChild(worker));
+    await vi.waitFor(
+      () => {
+        expect(
+          readdirSync(dataDir).filter((name) => name.startsWith("ready-")),
+          "every child must reach the barrier before stale recovery starts",
+        ).toHaveLength(8);
+      },
+      { timeout: 10_000 },
+    );
+    writeSecureFile(join(dataDir, "start-race"), "go");
+    await Promise.all(workers);
+
+    expect(
+      readdirSync(dataDir).filter((name) => name.startsWith("request-")),
+      "stale recovery and the pre-egress reservation must admit one requester",
+    ).toHaveLength(1);
+    expect(readCacheFile(), "the winning process should publish a usable cache").toMatchObject({
+      outcome: "success",
+    });
+    expect(
+      readdirSync(dataDir).filter(
+        (name) =>
+          name.startsWith("update-check.json.lock-"),
+      ),
+      "no reclaimer may delete a successor lock or strand takeover artifacts",
+    ).toEqual([]);
   }, 60000);
 });

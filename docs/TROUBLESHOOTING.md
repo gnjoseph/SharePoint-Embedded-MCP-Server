@@ -112,11 +112,12 @@ Common situations:
   silently; the failure is cached so the server does not retry on every call. `status_get`
   reports `— unavailable (registry not reachable)`. This is harmless — no functionality
   depends on it.
-- **The check never succeeds behind an egress proxy.** Node's built-in `fetch` does **not**
-  honour `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`, so the request cannot be routed through a
-  proxy. It fails closed — nothing leaves by another route. Adding proxy support would require
-  a new runtime dependency, which this project avoids; this is an open, unresolved tradeoff.
-  In proxy-only environments, disable the check with `SPE_MCP_UPDATE_CHECK=false`.
+- **Proxy-only environment.** Routing depends on the Node.js runtime configuration. Releases
+  that support Node's environment-proxy mode (including current Node 24/26 releases) can honor
+  `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` when it is enabled with
+  `NODE_USE_ENV_PROXY=1` or `--use-env-proxy`; Node 22 may ignore those variables and attempt a
+  direct connection. Enforce mandatory proxy routing at the runtime or network layer, or
+  disable the check with `SPE_MCP_UPDATE_CHECK=false`.
 - **Internal/mirror registry.** Set `SPE_NPM_REGISTRY` to your mirror. It must be an `https:`
   URL with no embedded credentials, query string, or fragment; anything else is ignored and
   the check is disabled for that run. Redirects and cross-host responses are rejected. The

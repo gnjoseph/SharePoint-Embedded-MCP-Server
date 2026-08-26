@@ -56,11 +56,12 @@ By default, two calls use public endpoints outside your tenant, and neither carr
   **entirely** — it does not merely drop the `User-Agent`) — in
   which case no request is made, no notice is printed, and no cache is written. See
   [PRIVACY.md](../PRIVACY.md).
-  - **Known limitation:** Node's built-in `fetch` ignores `HTTP_PROXY` / `HTTPS_PROXY` /
-    `NO_PROXY`, so this request cannot be routed through an egress proxy for inspection. It
-    fails closed (the check is silently skipped) rather than falling back to another route.
-    Fixing this would require a new runtime dependency, which the project avoids; recorded as
-    an **open, unresolved tradeoff**. Disable the check where all egress must be proxied.
+  - **Proxy routing:** Routing depends on the Node.js runtime configuration. Releases that
+    support Node's environment-proxy mode (including current Node 24/26 releases) can honor
+    `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` when it is enabled with
+    `NODE_USE_ENV_PROXY=1` or `--use-env-proxy`; Node 22 may ignore those variables and attempt
+    a direct connection. If proxy routing is required, enforce it at the runtime or network
+    layer, or disable the check.
 
 ## Local artifacts
 
@@ -74,15 +75,19 @@ These never leave your machine:
   have already been notified about — **no identifiers of any kind**. It is **retained until you
   delete it**; `spe-mcp logout` and `spe-mcp auth --reset` remove it, and `status_get` prints
   its full path.
-- The transient owner-only **update-check lock files** (`update-check.json.lock`, plus a recovery
-  lock only while reclaiming an abandoned lock). They contain only the local process ID and
-  lock-acquisition timestamp, serialize stale-cache refreshes and cache suppression writes
-  across processes sharing the data directory, and are removed after use (or reclaimed after 30
-  seconds once the recorded process is no longer alive). Neither value is transmitted or copied
-  to the persistent cache. The refresh-lock owner records the 24-hour attempt in the cache
-  before egress. An abrupt exit while atomically publishing a lock can leave an owner-only
-  `.tmp-*` lock file; the next eligible check cleans it after the same liveness/30-second test,
-  or it remains local until the data directory is deleted.
+- The transient owner-only **update-check lock files** (`update-check.json.lock-*`). Each unique
+  contender contains only the local process ID, lock-acquisition timestamp, a random contender
+  name, and a local ordering number. They serialize stale-cache refreshes and cache suppression
+  writes across processes sharing the data directory, and are removed after use (or reclaimed
+  after 30 seconds once the recorded process is no longer alive). Names are never reused, so
+  stale cleanup cannot delete a successor lock. None of these values is transmitted or copied
+  to the persistent cache. A pending notice is claimed in the cache before it is returned,
+  preventing duplicate delivery across processes. This is at-most-once delivery: a crash after
+  the durable claim but before the response reaches the client can lose the notice. The
+  refresh-lock owner records the 24-hour attempt in the cache before egress. An abrupt exit
+  while atomically publishing a lock can leave an owner-only `.tmp-*` lock file; the next
+  eligible check cleans it after the same liveness/30-second test, or it remains local until the
+  data directory is deleted.
 - The owner-only **update-check deletion generation** (`update-check.json.deleted`), containing
   only a timestamp. Logout/reset advances it before deleting the cached registry result so an
   in-flight refresh cannot recreate that result afterward. It is not transmitted and remains
