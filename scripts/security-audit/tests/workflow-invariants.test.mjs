@@ -16,6 +16,7 @@ const WORKFLOW_DIR = path.join(REPO_ROOT, '.github', 'workflows');
 const SCRIPT_DIR = path.join(REPO_ROOT, 'scripts', 'security-audit');
 const AUDIT_WORKFLOW = path.join(WORKFLOW_DIR, 'security-audit.yml');
 const SECURITY_WORKFLOW = path.join(WORKFLOW_DIR, 'security.yml');
+const CI_WORKFLOW = path.join(WORKFLOW_DIR, 'ci.yml');
 
 // Comments are allowed to name a construct in order to explain why it is
 // absent; only executable lines are checked for the dangerous constructs.
@@ -184,6 +185,25 @@ test('all workflow actions are pinned to 40-hex commit SHAs', () => {
   }
 });
 
+test('normal CI runs audit contracts through a non-disclosing wrapper', () => {
+  const ci = readWorkflow(CI_WORKFLOW);
+  const steps = Object.values(ci.doc.jobs).flatMap((job) => job.steps ?? []);
+  const contract = steps.find((step) => /security:audit:ci/.test(step.run ?? ''));
+  assert.ok(contract, 'normal CI must run the security contract suite');
+  assert.equal(contract.name, 'Validate repository contracts');
+  assert.equal(
+    /security:audit:(?:test|pins)|check-action-pins|workflow-invariants/.test(ci.code),
+    false,
+    'the workflow log command must not identify the underlying scanner or test',
+  );
+
+  const wrapper = readFileSync(path.join(SCRIPT_DIR, 'ci-contracts.mjs'), 'utf8');
+  assert.match(wrapper, /stdio:\s*\['ignore', 'pipe', 'pipe'\]/);
+  assert.match(wrapper, /Repository contract validation failed\./);
+  assert.equal(/result\.(?:stdout|stderr)/.test(wrapper), false);
+  assert.equal(/process\.stdout\.write/.test(wrapper), false);
+});
+
 test('model output is never interpolated into a shell command', () => {
   // `${{ }}` is substituted before bash sees the script, so referencing a model
   // response inside `run:` is remote code execution on the runner.
@@ -200,16 +220,11 @@ test('model output is never interpolated into a shell command', () => {
 
 test('the model job is gated, environment-protected and tool-less', () => {
   const job = audit.doc.jobs['model-audit'];
-  assert.match(
+  assert.equal(
     job.if,
-    /\bfalse\s*&&/,
-    'repository variables alone must not activate the unapproved model scaffold',
+    '${{ false }}',
+    'the unapproved model scaffold must be unconditionally disabled',
   );
-  assert.match(job.if, /vars\.SECURITY_AUDIT_AI_ENABLED == 'true'/);
-  // Private reporting is the only egress for model findings, so the job cannot
-  // start unless private reporting is switched on as well. Two independent repo
-  // variables must be set before the environment is ever exercised.
-  assert.match(job.if, /vars\.SECURITY_AUDIT_PRIVATE_REPORTING_ENABLED == 'true'/);
   assert.equal(job.environment, 'security-audit-private-report');
   assert.equal(
     /copilot-allow-tools/.test(audit.code),
@@ -382,8 +397,24 @@ test('every job in the workflow is a known controller job', () => {
   // public repository, code scanning alerts are world-readable, so uploading
   // SARIF publishes vulnerability locations. Any new job added here must be
   // reviewed against the same non-publication policy.
-  const expected = [...CONTROLLER_JOBS, 'validate-inputs', 'summary'].sort();
+  const expected = [...CONTROLLER_JOBS, 'validate-inputs'].sort();
   assert.deepEqual(Object.keys(audit.doc.jobs).sort(), expected);
+});
+
+test('every public audit job is hard-disabled with an invariant display name', () => {
+  assert.equal(audit.doc.name, 'Private security audit (inactive)');
+  for (const [jobName, job] of Object.entries(audit.doc.jobs)) {
+    assert.equal(
+      job.if,
+      '${{ false }}',
+      `${jobName}: the activation gate must be exactly and unconditionally false`,
+    );
+    assert.equal(
+      job.name,
+      'Private audit inactive',
+      `${jobName}: public job labels must not identify a scanner or outcome`,
+    );
+  }
 });
 
 test('no helper script is ever executed from the target checkout', () => {
@@ -453,6 +484,19 @@ test('dependency audit stays lockfile-only inside a runner-owned workspace', () 
     );
     assert.equal(setupNode.with.cache, undefined, `${label}: setup-node cache must not consult project npm config`);
   }
+});
+
+test('the dormant dependency audit normalizes policy findings without an outcome side channel', () => {
+  const steps = audit.doc.jobs['dependency-audit'].steps;
+  const npmAudit = steps.find((step) => /^\s*npm audit\b/m.test(step.run ?? ''));
+  assert.ok(npmAudit);
+  assert.equal(npmAudit['continue-on-error'], undefined);
+  assert.match(npmAudit.run, /0\|1\) exit 0/);
+  assert.match(npmAudit.run, /\*\) exit 1/);
+  assert.equal(
+    steps.some((step) => /steps\.audit\.(?:outcome|outputs)/.test(step.if ?? '')),
+    false,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -550,15 +594,11 @@ test('a malformed response cannot invoke submission and still fails generically'
   assert.equal(/validation|model|finding|rejected|accepted/i.test(gate.run), false);
 });
 
-test('the summary receives both real and dry-run model job outcomes', () => {
-  const step = audit.doc.jobs.summary.steps.find((entry) =>
-    /summarize\.mjs/.test(entry.run ?? ''),
-  );
-  assert.ok(step, 'the summary job must invoke summarize.mjs');
-  assert.match(step.env.MODEL_RESULT, /needs\.model-audit\.result/);
-  assert.match(step.env.MODEL_DRY_RUN_RESULT, /needs\.model-audit-dry-run\.result/);
-  assert.match(step.run, /--model\s+"\$\{MODEL_RESULT\}"/);
-  assert.match(step.run, /--model-dry-run\s+"\$\{MODEL_DRY_RUN_RESULT\}"/);
+test('the public workflow has no finding-dependent summary or outcome aggregation', () => {
+  assert.equal(audit.doc.jobs.summary, undefined);
+  assert.equal(/summarize\.mjs/.test(audit.code), false);
+  assert.equal(/needs\.[A-Za-z0-9_-]+\.result/.test(audit.code), false);
+  assert.equal(/GITHUB_STEP_SUMMARY/.test(audit.code), false);
 });
 
 test('the advisory credential is scoped to the submit step, never to inference', () => {
@@ -711,12 +751,17 @@ test('the secret-scan job keeps every report inside the job', () => {
   assert.match(scan.run, /rm -f \.security-audit\/gitleaks-console\.log/);
 });
 
-test('the secret-scan failure message names no rule, path or count', () => {
+test('the dormant secret scan normalizes finding exits without an outcome side channel', () => {
   const steps = audit.doc.jobs['secret-scan'].steps;
-  const gate = steps.find((step) => /steps\.scan\.outcome == 'failure'/.test(step.if ?? ''));
-  assert.ok(gate, 'a fail gate must re-raise the suppressed scan failure');
-  assert.equal(gate.run.trim(), 'echo "Security audit: FAIL" >&2\nexit 1');
-  assert.equal(/gitleaks-summary|RuleID|jq /.test(gate.run), false);
+  const scan = steps.find((step) => step.id === 'scan');
+  assert.ok(scan);
+  assert.equal(scan['continue-on-error'], undefined);
+  assert.match(scan.run, /0\|2\) exit 0/);
+  assert.match(scan.run, /\*\) exit 1/);
+  assert.equal(
+    steps.some((step) => /steps\.scan\.(?:outcome|outputs)/.test(step.if ?? '')),
+    false,
+  );
 });
 
 test('pull-request gates expose no finding-dependent result channel', () => {
@@ -783,12 +828,11 @@ test('gitleaks policy and suppression inputs come only from the protected contro
   }
 });
 
-test('the action-pin job captures detailed CLI diagnostics and emits only generic failure', () => {
+test('the dormant action-pin job captures diagnostics and normalizes policy findings', () => {
   const steps = audit.doc.jobs['action-pins'].steps;
   const installIndex = steps.findIndex((step) => step.name === 'Install audit helper dependencies');
   const check = steps.find((step) => step.id === 'pin-check');
   const checkIndex = steps.indexOf(check);
-  const gate = steps.find((step) => /steps\.pin-check\.outcome == 'failure'/.test(step.if ?? ''));
 
   assert.ok(installIndex >= 0, 'the YAML-aware checker dependency must be installed');
   assert.ok(installIndex < checkIndex, 'the parser must be installed before the checker runs');
@@ -803,15 +847,17 @@ test('the action-pin job captures detailed CLI diagnostics and emits only generi
     'the parser install belongs only in the action-pin job',
   );
 
-  assert.ok(check, 'the action-pin check must expose an outcome to a fail gate');
-  assert.equal(check['continue-on-error'], 'true');
+  assert.ok(check, 'the action-pin check must exist');
+  assert.equal(check['continue-on-error'], undefined);
   assert.match(check.run, /> \.security-audit\/action-pins-diagnostics\.log 2>&1/);
   assert.match(check.run, /rm -f \.security-audit\/action-pins-diagnostics\.log/);
+  assert.match(check.run, /0\|2\) exit 0/);
+  assert.match(check.run, /\*\) exit 1/);
   assert.equal(/cat |tee |GITHUB_STEP_SUMMARY/.test(check.run), false);
-
-  assert.ok(gate, 'the captured action-pin failure must be re-raised');
-  assert.equal(gate.run.trim(), 'echo "Security audit: FAIL" >&2\nexit 1');
-  assert.equal(/path|line|action|reason|private|report/i.test(gate.run), false);
+  assert.equal(
+    steps.some((step) => /steps\.pin-check\.(?:outcome|outputs)/.test(step.if ?? '')),
+    false,
+  );
 });
 
 // The proposed CLI package is not approved or reproducible from the public npm
@@ -828,7 +874,7 @@ test('the Copilot CLI scaffold is hard-disabled pending an approved public lockf
     'a global ranged install is not reproducible',
   );
   assert.equal(existsSync(lockfile), false, 'an unapproved lockfile must not be committed');
-  assert.match(job.if, /\bfalse\s*&&/);
+  assert.equal(job.if, '${{ false }}');
   assert.match(code, /npm ci[\s\\]*--ignore-scripts/);
   assert.match(code, /if \[ ! -f tools\/copilot-cli\/package-lock\.json \]/);
   assert.match(code, /--registry=https:\/\/registry\.npmjs\.org\//);
@@ -951,19 +997,11 @@ test('gitleaks console output is discarded and never replayed', () => {
         /rm -f \.security-audit\/gitleaks-console\.log/,
         `${name}: the console log must be deleted unread`,
       );
-      if (name === 'security-audit.yml') {
-        assert.match(
-          step.run,
-          /exit "\$\{status\}"/,
-          `${name}: the private audit must still re-raise the scanner exit code`,
-        );
-      } else {
-        assert.match(
-          step.run,
-          /0\|2\) exit 0/,
-          `${name}: public results must not distinguish findings from a clean scan`,
-        );
-      }
+      assert.match(
+        step.run,
+        /0\|2\) exit 0/,
+        `${name}: public results must not distinguish findings from a clean scan`,
+      );
     }
 
     for (const step of steps) {
@@ -1050,9 +1088,9 @@ test('future activation determinations are recorded as open, never as approved',
 
 test('documentation makes no activation-ready or production-schedule claim', () => {
   assert.match(ROOT_README, /not activation-ready/i);
-  assert.match(ROOT_README, /no claim that a production\s+weekly audit is active/i);
-  assert.match(AUDIT_DOC, /does \*\*not\*\* claim that\s+the workflow is deployed or operating/i);
-  assert.match(CONTRIBUTING_DOC, /no claim that a production\s+schedule is active/i);
+  assert.match(ROOT_README, /no claim that a production weekly audit is active/i);
+  assert.match(AUDIT_DOC, /contains an \*\*inactive\*\* security-audit workflow/i);
+  assert.match(CONTRIBUTING_DOC, /no claim that a production schedule is active/i);
   assert.match(COPILOT_CLI_DOC, /hard-disabled scaffolding/i);
 
   assert.doesNotMatch(ROOT_README, /runs a scheduled weekly security audit/i);
@@ -1115,14 +1153,7 @@ test('contributors are told the model layer is disabled by default', () => {
 });
 
 test('the model layer remains disabled: nothing in the repository enables it', () => {
-  assert.ok(
-    audit.code.includes("vars.SECURITY_AUDIT_AI_ENABLED == 'true'"),
-    'the model job must stay gated on an opt-in repository variable',
-  );
-  assert.ok(
-    audit.code.includes("vars.SECURITY_AUDIT_PRIVATE_REPORTING_ENABLED == 'true'"),
-    'the model job must also stay gated on private reporting being enabled',
-  );
+  assert.equal(audit.doc.jobs['model-audit'].if, '${{ false }}');
 
   for (const file of readdirSync(WORKFLOW_DIR)) {
     if (!/\.ya?ml$/.test(file)) continue;
@@ -1140,7 +1171,7 @@ test('the model layer remains disabled: nothing in the repository enables it', (
   }
 
   assert.ok(
-    AUDIT_DOC.includes('The model-assisted layer is **non-activatable scaffolding**'),
-    'the docs must state that the model layer cannot be activated',
+    AUDIT_DOC.includes('The complete workflow is **non-activatable scaffolding**'),
+    'the docs must state that the complete workflow cannot be activated',
   );
 });

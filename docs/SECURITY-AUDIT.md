@@ -1,21 +1,22 @@
 # Repository security audit scaffolding
 
-This repository defines a security-audit workflow
+This repository contains an **inactive** security-audit workflow
 ([`.github/workflows/security-audit.yml`](../.github/workflows/security-audit.yml)) with a Monday
-schedule and a fixed `security-audit` repository-dispatch event. This PR does **not** claim that
-the workflow is deployed or operating on a production schedule. Repository dispatch always loads
-the workflow from the default branch; there is no branch-selectable Actions UI entry.
+cadence and a fixed `security-audit` repository-dispatch event. Every job has a literal `false`
+activation guard. Scheduled and dispatched runs therefore execute no audit code and expose only
+the same skipped state. Repository variables, secrets, or payload values cannot activate it.
 
 The audit has two layers:
 
 | Layer | Jobs | Gating |
 | --- | --- | --- |
-| **Deterministic** | dependency audit, secret scan, action pinning | Failures fail the run |
-| **Model-assisted scaffold** | `model-audit` (hard-disabled) / `model-audit-dry-run` (synthetic) | The real job cannot be activated by repository variables; the credential-free synthetic path is testable |
+| **Deterministic scaffold** | dependency audit, secret scan, action pinning | Hard-disabled |
+| **Model-assisted scaffold** | `model-audit` / `model-audit-dry-run` | Hard-disabled |
 
 > [!IMPORTANT]
-> The model-assisted layer is **non-activatable scaffolding**, not an activation-ready feature.
-> Its job expression begins with `false &&`, so repository variables and secrets cannot start it.
+> The complete workflow is **non-activatable scaffolding**, not an activation-ready feature.
+> Every job expression is exactly `${{ false }}`, so repository variables and secrets cannot
+> start deterministic, synthetic, or model-assisted execution.
 > The proposed Copilot CLI version is unavailable from `registry.npmjs.org`, no reproducible
 > lockfile is committed, and package/license/CELA/Privacy approvals remain open. A future reviewed
 > code change must resolve every item under
@@ -23,35 +24,40 @@ The audit has two layers:
 > hard-disable.
 
 > [!CAUTION]
-> **Disclosure policy — absolute.** Nothing this workflow discovers is ever published. No
-> finding, path, rule identifier, advisory URL, count or exploit detail is written to a public
-> log, an Actions artifact, a pull-request annotation, code scanning, a public issue, Azure
-> DevOps or IcM. Validated model findings leave the runner through exactly one channel:
+> **Disclosure policy — absolute.** Finding existence itself is private. No finding, scanner,
+> path, rule identifier, advisory URL, count, exploit detail, or private-submission outcome may
+> influence or appear in a public job name, step name, conclusion, log, artifact, pull-request
+> annotation, job summary, code-scanning result, public issue, Azure DevOps item, or IcM incident.
+> Validated model findings have exactly one designed egress:
 > a **private security advisory report** created through GitHub Private Vulnerability Reporting
-> (PVR) and visible only to repository maintainers. There is **no** fallback channel — if the
-> private channel is unavailable the run fails and the findings are discarded with the runner.
->
-> The only two strings the run may write to a public job summary are:
->
-> - `Security audit: PASS`
-> - `Security audit: FAIL`
->
-> `Security audit: PASS` means the required jobs completed successfully; the model job may have
-> been disabled. It is **not** a statement that the repository is free of vulnerabilities.
+> (PVR) and visible only to repository maintainers. There is no fallback channel. Because a public
+> Actions success/failure conclusion would itself disclose private state, activation stays disabled
+> until operational failure and submission handling can satisfy the same invariant. The workflow
+> publishes no pass/fail summary.
 
-## What runs
+## What is present but inactive
 
 ### Deterministic jobs
 
-| Job | What it does | Notes |
+| Internal job | Dormant design | Notes |
 | --- | --- | --- |
-| `validate-inputs` | Normalizes and validates the dispatch payload | Target must be a 40-hex SHA reachable from `main`; scope and model come from allowlists. Scheduled runs and omitted payload fields supply no ref, so the current `origin/main` tip is resolved to a full SHA and then validated by the same rules |
-| `dependency-audit` | `npm audit --package-lock-only --audit-level=high` | The workflow validates `package.json` / `package-lock.json` first, then audits the lockfile without installing target-controlled packages. The raw JSON never leaves the runner. It is reduced in-job to severity **counts only** — no package names, versions, advisory identifiers or advisory URLs — and the counts are not published either |
-| `secret-scan` | Gitleaks **CLI**, downloaded at a pinned version and SHA256-verified | Nothing is published. Rule identifiers, file paths, line numbers, commit metadata and the matched secret never leave the runner; the raw report and the scanner console output are discarded inside the job. Counts are computed for in-job gating only |
-| `action-pins` | Fails if any workflow or local action uses a mutable external ref | Parses workflow/local-action YAML and enforces 40-hex commit pinning for `uses:` values plus fail-closed Dockerfile validation for explicit external references (`# syntax`, `FROM`, `COPY --from`, `RUN --mount=from`). `ADD` accepts only literal local sources after parsing; remote or dynamic/expanded sources are rejected. It scans `.github/workflows` and every `action.yml`/`action.yaml`, including hidden action directories. Detailed local CLI diagnostics are captured and deleted unread in CI; the workflow emits only the generic failure literal |
-| `summary` | Emits the generic public pass/fail literal | Fails the run if any deterministic job did not succeed or an enabled model job failed or was cancelled. It renders no job names, targets, scopes or counts |
+| `validate-inputs` | Normalizes and validates dispatch payload | Hard-disabled |
+| `dependency-audit` | Lockfile-only dependency analysis | Hard-disabled; finding exit is normalized and raw output remains runner-local |
+| `secret-scan` | Repository-history secret analysis | Hard-disabled; finding exit is normalized and raw output remains runner-local |
+| `action-pins` | Immutable action/image policy | Hard-disabled; diagnostics remain runner-local. Dockerfile `ADD` accepts only literal local sources; remote or dynamic/expanded sources fail closed |
+| `model-audit` | Model-assisted analysis and PVR submission | Hard-disabled pending all activation prerequisites |
+| `model-audit-dry-run` | Synthetic rehearsal | Hard-disabled in public Actions; run locally only |
 
-Dependency validation and audit run from a runner-owned directory containing only
+All public job display names are the same generic inactive label. There is no summary job and no
+job-result aggregation. This keeps job, step, and workflow outcomes invariant with respect to
+findings and private-report submission state.
+
+The pin contract still runs in normal CI through `scripts/security-audit/ci-contracts.mjs`. That
+wrapper captures the complete pin/invariant test output and emits only one generic error if a
+repository contract regresses. It never forwards synthetic fixtures, paths, action references, or
+scanner output into the public log.
+
+In the dormant design, dependency validation and audit run from a runner-owned directory containing only
 `package.json` and `package-lock.json`. The trusted preflight validator rejects unsupported source
 forms and workspace-like expansion before npm runs, and `npm audit --package-lock-only` uses empty
 runner-owned user/global configuration files plus the explicit public npm registry. A target
@@ -74,10 +80,11 @@ scanning at the repository or organization level and treat it as a separately-ow
 control with its own visibility model. It is independent of this workflow and receives nothing
 from it.
 
-### Trusted controller vs audited target
+### Dormant controller/target design
 
-Any commit reachable from `main` can be audited, including commits from before this workflow
-existed. The audit therefore never runs code from the commit it is auditing:
+If a future activation satisfies every prerequisite, any commit reachable from `main` can be
+audited, including commits from before this workflow existed. The design never runs code from the
+commit it is auditing:
 
 - **Controller** — the validation job checks out protected `main` and resolves its tip to
   `controller_sha`. Every downstream controller checkout pins that exact SHA at the workspace
@@ -99,10 +106,10 @@ Tests assert that no `node scripts/security-audit/...` invocation ever resolves 
 Auditing an ancestor such as `819431d` — a commit with no `scripts/security-audit/` directory at
 all — is a supported case and is covered by a regression test.
 
-### Result attribution
+### Dormant result attribution design
 
-Because there is no upload path, attribution is carried entirely inside the private report. Each
-report's summary line embeds the audited commit:
+If activated, attribution would be carried entirely inside the private report. Each report's
+summary line embeds the audited commit:
 
 ```
 SPE automated security audit — <first 12 hex of the target SHA>
@@ -160,12 +167,13 @@ closed. A malformed response writes no report and makes no submission.
 | Deduplication | Before submitting, the script follows GitHub's cursor `Link` headers through existing `triage`, `draft`, `published` and `closed` reports and matches the exact summary string. Every continuation must remain on `api.github.com` and the same repository advisory endpoint. A re-run for the same SHA is a no-op |
 | Visibility | Repository **maintainers only**. A report is not an advisory and is not published; maintainers triage it in the Security tab |
 | Retry | Idempotent `GET` requests retry `5xx` at most twice, fixed 5 s apart. A report `POST` is attempted exactly once because a `5xx` can be ambiguous after persistence; retrying could create a duplicate. Every other error **fails the job immediately with no fallback** |
-| Output | The standalone CLI writes exactly one result token to stdout and no private metadata. The public workflow suppresses both output streams and propagates only the process exit status |
+| Output | The standalone CLI writes exactly one result token to stdout and no private metadata. No outcome token or finding-dependent process result may reach public Actions |
 
 If the private channel cannot be used — PVR not enabled, credential missing, endpoint rejecting —
-the run **fails**. Findings are not written anywhere else, not retried through another surface,
-and not retained after the job ends. There is no ADO work item, no IcM incident, no GitHub issue
-and no artifact fallback, by design.
+processing must halt fail closed. Findings are not written anywhere else, retried through another
+surface, or retained after the job ends. There is no ADO work item, IcM incident, GitHub issue, or
+artifact fallback. Activation remains prohibited until that operational state can be conveyed
+privately without changing public behavior or conclusion.
 
 Nothing else from the model layer is published: no issues, no comments, no raw-finding artifacts,
 no code scanning alerts, no job-summary detail.
@@ -235,70 +243,36 @@ findings and never prints finding detail.
 Individual stages can be run directly — see
 [`scripts/security-audit/README.md`](../scripts/security-audit/README.md).
 
-## Running the deterministic or synthetic path on demand
+## Dispatch behavior while inactive
 
-Once the workflow is present on the default branch, an operator with permission to create
-repository dispatches can request the deterministic jobs and credential-free synthetic dry run
-without selecting the controller branch:
+The fixed `security-audit` repository-dispatch event remains declared for future design work, but a
+dispatch cannot run an audit. Every job is independently blocked by a literal `false` condition, so
+scheduled and dispatched runs have the same all-skipped public shape. Payload values, repository
+variables, secrets, and environment configuration cannot bypass those gates.
 
-```bash
-gh api --method POST \
-  repos/microsoft/SharePoint-Embedded-MCP-Server/dispatches \
-  -f event_type=security-audit \
-  -F 'client_payload[ref]=<full-40-hex-main-ancestor>' \
-  -F 'client_payload[scope]=server-core' \
-  -F 'client_payload[model]=claude-opus-5' \
-  -F 'client_payload[dry_run]=true'
-```
+## Local validation and private triage
 
-Every `client_payload` value is optional and untrusted. `validate-target.mjs` is the sole parameter
-gate: it applies the same full-SHA/reachability, allowlist, and strict-boolean checks used by the
-schedule-declared path. Omitting `ref` audits the current `origin/main` tip. The fixed event type does not allow
-the caller to choose workflow YAML from another branch. The real model job remains skipped
-regardless of repository-variable values while the hard-disable is present.
+The normal-CI contract wrapper is the only active automated integration. Maintainers investigating a
+generic contract failure should reproduce it on a controlled local workstation:
 
-## Triaging results
+- `npm run security:audit:test` validates the security-audit contract suite.
+- `npm run security:audit:pins` validates immutable external action and Docker references.
+- `npm run security:audit:ci` executes both while suppressing their detailed output, matching CI.
 
-1. **A failing run tells you only that it failed.** The public summary is `Security audit: FAIL`
-   and nothing else — no claim that a private report exists, no scanner identity, rule, path or
-   count. That is deliberate: this repository is public, so Actions logs, job summaries and
-   artifacts are world-readable. Start triage from the job list (which job is red) and reproduce
-   locally.
-2. **Dependency findings reproduce locally.** Clone the repository, check out the audited commit,
-   then run `node scripts/security-audit/validate-npm-audit-inputs.mjs && npm audit
-   --package-lock-only --audit-level=high`. The workflow writes the raw JSON report to the runner's
-   workspace, reduces it to counts, and deletes it — the report is never uploaded and the counts
-   are never published.
-3. **Secret-scan hits publish nothing at all.** Neither rule identifiers nor file paths nor counts
-   leave the job. A rule id paired with a path states which file holds which class of credential,
-   which is exactly the pre-rotation disclosure an attacker wants — and the scanner's console
-   output repeats file path, line, commit, author and e-mail for every finding, so it is discarded
-   inside the job and the raw Gitleaks report is deleted before the job ends. To locate a hit,
-   reproduce the scan **locally, at the commit the run audited**, on a machine you control:
-   `git clone <repo> && cd <repo> && git checkout <target-sha>` then
-   `gitleaks git . --redact --no-banner`. Rotate the credential *before* removing it from source,
-   then re-run the workflow to confirm. Keep the local report on the workstation — do not paste
-   rule identifiers or paths into an issue, a pull request or any other public surface.
-4. **Action-pin failures are configuration errors, not vulnerabilities.** Run
-   `npm run security:audit:pins` locally; the output names the offending workflow and action.
-5. **After a future approved activation, accepted model findings arrive only as a private
-   report.** Open the
-   repository's **Security → Advisories** tab and look for
-   `SPE automated security audit — <12hex>`. A malformed response or failed submission can make the
-   model job fail without creating a report. Each accepted finding carries a confidence and a
-   control anchor: they are leads, not verdicts. Confirm the code path by hand before acting.
-   Response-validation diagnostics and counts are never printed by CI; reproduce a validation
-   failure locally rather than moving its diagnostics to a public tracking surface.
-6. **Report real vulnerabilities privately** per [`SECURITY.md`](../SECURITY.md), through the same
-   Private Vulnerability Reporting channel the automated audit uses. Never open a public issue for
-   an unfixed vulnerability, and never file one in an external tracker.
+The local pin checker exits `0` when compliant, `2` for policy violations, and `1` for an
+operational or parsing failure. Local diagnostics can identify paths and references and therefore
+must not be copied to public PRs, issues, CI logs, Azure DevOps, or IcM.
+
+Report real vulnerabilities privately per [`SECURITY.md`](../SECURITY.md), using GitHub Private
+Vulnerability Reporting. Never open a public issue for an unfixed vulnerability and never record
+finding existence or private-submission outcome in an external tracker.
 
 ## Model-assisted scaffold: blocked prerequisites
 
-This section is **not an activation procedure**. The credentialed model job is hard-disabled by a
-literal `false &&` in its job condition. Repository administrators cannot enable it with variables,
-secrets or environment configuration. Nothing in this repository stores, references or reuses a
-credential, and the deterministic and synthetic paths do not depend on the proposed model runtime.
+This section is **not an activation procedure**. Every workflow job is hard-disabled by a literal
+`false` in its job condition. Repository administrators cannot enable it with variables, secrets,
+payloads, or environment configuration. Nothing in this repository stores, references, or reuses a
+credential.
 
 The runtime currently recorded in `tools/copilot-cli/package.json` is a proposal only:
 
@@ -330,18 +304,23 @@ literal hard-disable, it must provide evidence for all of the following:
    acceptable.
 5. **Provider/model compatibility.** Validate the allowlisted model and subprocessor chain without
    publishing prompts, responses, findings, counts or submission outcomes.
-6. **Code-reviewed enablement.** Only after items 1–5 are approved may a code change remove the
-   literal hard-disable. The existing `SECURITY_AUDIT_AI_ENABLED` and
-   `SECURITY_AUDIT_PRIVATE_REPORTING_ENABLED` variables remain defence-in-depth gates; they are not
-   an activation mechanism while `false &&` remains.
+6. **Private operational handling.** Processing or submission failure must be reported only through
+   a maintainer-private channel. Public job, step, and workflow status must remain invariant with
+   respect to findings and submission outcome. If that cannot be implemented fail closed without a
+   public signal, activation is prohibited.
+7. **Code-reviewed enablement.** Only after items 1–6 are approved may a code change remove any
+   literal hard-disable. That future redesign must add independently reviewed defence-in-depth
+   enablement controls; no repository variable currently exists as an activation mechanism.
 
-After activation, a missing credential, disabled reporting channel or rejected submission must
-fail the job. No step may degrade to a pass or write findings anywhere else.
+No activation may turn a missing credential, processing error, unavailable reporting channel, or
+rejected submission into either a success-shaped fallback or a distinguishable public failure.
+Operational problems must be conveyed privately and the audit must fail closed. If both conditions
+cannot be met, leave every job disabled. No step may write findings anywhere else.
 
 ### `COPILOT_PAT` governance requirements
 
-These are prerequisites for step 4, not suggestions. If any cannot be met, leave the layer
-disabled — the deterministic jobs are unaffected.
+These are prerequisites for step 4, not suggestions. If any cannot be met, leave the entire
+workflow disabled.
 
 | Requirement | Obligation |
 | --- | --- |
@@ -362,8 +341,8 @@ assume it is available.
 ### Future activation determinations (to be completed by CELA/Privacy)
 
 Nothing in this table is answered, agreed or approved. These are **open questions** that CELA and
-Privacy must determine and record before `SECURITY_AUDIT_AI_ENABLED` is set. This repository makes
-no claim about any of them; the rows exist so that activation cannot proceed on assumption.
+Privacy must determine and record before any model enablement change is approved. This repository
+makes no claim about any of them; the rows exist so that activation cannot proceed on assumption.
 
 | Determination | Question to be answered | Status |
 | --- | --- | --- |
@@ -375,8 +354,7 @@ no claim about any of them; the rows exist so that activation cannot proceed on 
 | Contributor disclosure sufficiency | Is the disclosure in [`../CONTRIBUTING.md`](../CONTRIBUTING.md) sufficient notice to external contributors? | ☐ Not determined |
 | Export/third-party review | Are there export-control or third-party-review obligations triggered by sending this source to the provider? | ☐ Not determined |
 
-If any row is unresolved, the literal hard-disable must remain. The deterministic jobs and
-credential-free synthetic path are independent of this blocked scaffold.
+If any row is unresolved, every literal hard-disable must remain.
 
 Related administrative follow-ups (independent of the model layer):
 
@@ -384,9 +362,8 @@ Related administrative follow-ups (independent of the model layer):
   any future model-assisted layer (see item 3 above) and is also the channel external researchers
   use.
 - Enable **native secret scanning** and **push protection** on the repository.
-- Add the deterministic jobs as **required status checks** in the organization ruleset.
-  Do **not** make the model job a required check. It is advisory, non-deterministic, and its
-  findings are delivered privately rather than as a public check result.
+- Keep the generic normal-CI repository-contract check required. Do not require or activate any
+  dormant audit job: its public conclusion could reveal finding or submission state.
 
 ### Assumption: audited commits are reachable from `main`
 
@@ -401,8 +378,7 @@ the resulting commit on `main` instead — that is the code that actually ships.
 want auditing by a PR's original head to work must standardize on merge commits; the audit does
 not relax the reachability rule to accommodate rewritten history.
 
-Scheduled runs are unaffected: they supply no ref, so the current `origin/main` tip is resolved
-and validated by the same rules.
+While the workflow is inactive, scheduled runs resolve no target and execute no audit step.
 
 Reachability does **not** imply the commit contains this workflow. Older ancestors are audited
 using the controller/target split described above. Auditing a historical commit needs no special
@@ -414,8 +390,13 @@ private report names the audited commit explicitly — see [Result attribution](
 - The workflow has **no** `pull_request` or `pull_request_target` trigger, so untrusted forks
   can never reach the audit path or its secrets.
 - Workflow-level permissions are `{}` (deny-all); each job re-grants only what it needs.
-- Every action is pinned to a 40-hex commit SHA with the version in a trailing comment, and
-  `action-pins` fails the run if that ever regresses.
+- Every external action is pinned to a 40-hex commit SHA with the version in a trailing comment.
+  The pin checker recursively resolves every workflow-referenced local action and reusable workflow,
+  even under broad discovery exclusions such as `dist`, `coverage`, `node_modules`, and
+  `.security-audit`. It validates nested `uses:` and `runs.image` references, workflow job and
+  service containers, Dockerfiles, version comments, path containment, metadata ambiguity, cycles,
+  and symlinks fail closed. Dockerfile image references use an adjacent
+  `# pin-version: <version>` comment.
 - Dependency audit stays lockfile-only: the workflow validates copied manifests first and never
   installs target-controlled packages in the privileged audit job.
 - Checkouts use `persist-credentials: false`.
@@ -424,7 +405,9 @@ private report names the audited commit explicitly — see [Result attribution](
 - Model findings have exactly one egress path: a private vulnerability report visible only to
   maintainers. There is no artifact, job summary, code-scanning, issue or external-tracker
   fallback, and the audited commit is named inside the report itself.
-- The public job summary is one of two fixed literals and carries no scanner identity, path, rule,
-  count, advisory link, commit or scope.
-- Every `continue-on-error: true` step is paired with an explicit failure gate that re-raises
-  the failure after the raw report has been sanitized — a test enforces this invariant.
+- Public job names, step names, conclusions, and summaries do not vary with finding existence,
+  scanner identity, private-report submission, or operational outcome because all audit jobs are
+  inactive and there is no result aggregator.
+- Dormant deterministic finding exit codes are normalized before any later control flow. Operational
+  errors remain fail closed, but activation is prohibited until those errors can be handled without
+  a distinguishable public outcome.

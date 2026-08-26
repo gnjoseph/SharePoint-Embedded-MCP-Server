@@ -3,9 +3,9 @@
  *
  * Every assertion here exercises a trust boundary: what the model is allowed to
  * see (corpus collection), what it is allowed to say (schema validation and
- * redaction), and what leaves the workflow (counts-only deterministic summaries
- * and a fixed public verdict; findings themselves leave only as a private
- * vulnerability report). They run entirely offline and require no credential.
+ * redaction), and what may leave the dormant workflow (validated findings only
+ * through private vulnerability reporting). They run entirely offline and
+ * require no credential.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -32,8 +32,6 @@ import {
   DELIMITER_NEUTRALIZED,
   DELIMITER_SENTINEL,
   MAX_FINDINGS,
-  PUBLIC_SUMMARY_FAIL,
-  PUBLIC_SUMMARY_PASS,
   SCOPES,
   SEVERITIES,
   corpusDelimiters,
@@ -57,7 +55,6 @@ import {
   collectFiles,
 } from '../check-action-pins.mjs';
 import { sanitizeNpmAudit, sanitizeGitleaks } from '../sanitize-findings.mjs';
-import { modelStatus, buildSummary } from '../summarize.mjs';
 
 const REPO_ROOT = path.resolve(import.meta.dirname, '..', '..', '..');
 const SCRIPT_DIR = path.join(REPO_ROOT, 'scripts', 'security-audit');
@@ -1287,135 +1284,6 @@ test('sanitizer success is quiet everywhere without changing files or failures',
 });
 
 // ---------------------------------------------------------------------------
-// Status reporting when no credential exists
-// ---------------------------------------------------------------------------
-
-// `modelStatus` still exists because the workflow needs to decide whether the
-// model layer ran, but its value is deliberately *not* rendered: publishing
-// "AI COMPLETED" against a run that produced findings tells a reader that this
-// commit has open, unfixed model findings. The status is retained for the
-// summarize unit contract and for local debugging only.
-test('a skipped model job reports NOT_CONFIGURED rather than success', () => {
-  assert.equal(modelStatus('skipped', false), 'AI NOT_CONFIGURED');
-  assert.equal(modelStatus('', false), 'AI NOT_CONFIGURED');
-  assert.equal(modelStatus(undefined, false), 'AI NOT_CONFIGURED');
-  assert.equal(modelStatus('skipped', true), 'AI DRY_RUN');
-  assert.equal(modelStatus('failure', false), 'AI FAILED');
-  assert.equal(modelStatus('success', false), 'AI COMPLETED');
-});
-
-// The public verdict is one of exactly two fixed literals. Anything else — a
-// scanner name, a path, a rule identifier, a count, an advisory link, the
-// audited commit, the audited scope, even the model status — would let a reader
-// of the public run page infer something about an unfixed weakness.
-test('a passing summary renders the generic PASS literal and nothing else', () => {
-  const summary = buildSummary({
-    'dependency-audit': 'success',
-    'secret-scan': 'success',
-    'action-pins': 'success',
-    model: 'skipped',
-    'dry-run': 'false',
-  });
-  assert.equal(summary.failed, false);
-  assert.equal(summary.status, 'AI NOT_CONFIGURED');
-  assert.equal(summary.markdown, `${PUBLIC_SUMMARY_PASS}\n`);
-  assert.equal(/AI |NOT_CONFIGURED|COMPLETED/.test(summary.markdown), false);
-});
-
-test('a deterministic failure renders a truthful generic FAIL without claiming a report exists', () => {
-  const summary = buildSummary({
-    'dependency-audit': 'failure',
-    'secret-scan': 'success',
-    'action-pins': 'success',
-    model: 'skipped',
-    'dry-run': 'false',
-  });
-  assert.equal(summary.failed, true);
-  assert.equal(summary.markdown, `${PUBLIC_SUMMARY_FAIL}\n`);
-  assert.equal(summary.markdown, 'Security audit: FAIL\n');
-  assert.equal(/report|private|maintainer/i.test(summary.markdown), false);
-});
-
-test('a model failure or cancellation can never be reported as PASS', () => {
-  for (const model of ['failure', 'cancelled']) {
-    const summary = buildSummary({
-      'dependency-audit': 'success',
-      'secret-scan': 'success',
-      'action-pins': 'success',
-      model,
-      'dry-run': 'false',
-    });
-    assert.equal(summary.failed, true, `${model} must fail the public verdict`);
-    assert.equal(summary.markdown, `${PUBLIC_SUMMARY_FAIL}\n`);
-  }
-});
-
-test('a failed or cancelled model dry run can never be reported as PASS', () => {
-  for (const dryRunResult of ['failure', 'cancelled', 'skipped']) {
-    const summary = buildSummary({
-      'dependency-audit': 'success',
-      'secret-scan': 'success',
-      'action-pins': 'success',
-      model: 'skipped',
-      'model-dry-run': dryRunResult,
-      'dry-run': 'true',
-    });
-    assert.equal(summary.failed, true, `${dryRunResult} dry run must fail`);
-    assert.equal(summary.markdown, `${PUBLIC_SUMMARY_FAIL}\n`);
-  }
-
-  const success = buildSummary({
-    'dependency-audit': 'success',
-    'secret-scan': 'success',
-    'action-pins': 'success',
-    model: 'skipped',
-    'model-dry-run': 'success',
-    'dry-run': 'true',
-  });
-  assert.equal(success.failed, false);
-  assert.equal(success.markdown, `${PUBLIC_SUMMARY_PASS}\n`);
-});
-
-// Whatever the inputs, the rendered markdown must be one of the two approved
-// literals. A summary that grew a per-job table or an interpolated commit would
-// be a disclosure regression that no single-case assertion would catch.
-test('every summary permutation renders one of exactly two approved literals', () => {
-  const results = ['success', 'failure', 'skipped', 'cancelled', ''];
-  const approved = new Set([`${PUBLIC_SUMMARY_PASS}\n`, `${PUBLIC_SUMMARY_FAIL}\n`]);
-  for (const dependency of results) {
-    for (const secret of results) {
-      for (const pins of results) {
-        for (const model of results) {
-          const summary = buildSummary({
-            'dependency-audit': dependency,
-            'secret-scan': secret,
-            'action-pins': pins,
-            model,
-            'dry-run': 'false',
-            // Deliberately supply the fields the old renderer interpolated: a
-            // caller passing them must not be able to reach the summary text.
-            target: 'a'.repeat(40),
-            scope: 'server-core',
-            codeql: 'failure',
-          });
-          assert.ok(
-            approved.has(summary.markdown),
-            `unexpected summary markdown: ${JSON.stringify(summary.markdown)}`,
-          );
-          assert.equal(/a{40}|server-core|codeql/i.test(summary.markdown), false);
-        }
-      }
-    }
-  }
-});
-
-test('a missing deterministic job result is treated as a failure, never a pass', () => {
-  const summary = buildSummary({ model: 'success' });
-  assert.equal(summary.failed, true);
-  assert.equal(summary.markdown, `${PUBLIC_SUMMARY_FAIL}\n`);
-});
-
-// ---------------------------------------------------------------------------
 // The offline dry run
 // ---------------------------------------------------------------------------
 
@@ -1721,7 +1589,7 @@ test('hidden local Docker actions are scanned while repository Dockerfiles remai
   );
   writeFileSync(
     path.join(nested, 'Dockerfile'),
-    `FROM alpine@sha256:${'c'.repeat(64)}\n`,
+    `# pin-version: alpine 3\nFROM alpine@sha256:${'c'.repeat(64)}\n`,
     'utf8',
   );
   assert.deepEqual(checkLocalActions(root), []);
@@ -1741,6 +1609,8 @@ test('local Dockerfiles require immutable frontend and external base images', ()
   const pinned = checkDockerfileSource(
     [
       `# syntax=docker/dockerfile@sha256:${'a'.repeat(64)}`,
+      '# pin-version: Dockerfile frontend 1',
+      '# pin-version: node 24',
       `FROM node@sha256:${'b'.repeat(64)} AS build`,
       'FROM build AS packaged',
       'FROM scratch',
@@ -1749,6 +1619,23 @@ test('local Dockerfiles require immutable frontend and external base images', ()
     'Dockerfile',
   );
   assert.deepEqual(pinned, []);
+  const undocumented = checkDockerfileSource(
+    `FROM node@sha256:${'c'.repeat(64)}\n`,
+    'Dockerfile',
+  );
+  assert.equal(undocumented.length, 1);
+  assert.equal(undocumented[0].reason, 'missing-version-comment');
+  const nonAdjacent = checkDockerfileSource(
+    [
+      '# pin-version: node 24',
+      '# this unrelated comment breaks adjacency',
+      `FROM node@sha256:${'d'.repeat(64)}`,
+      '',
+    ].join('\n'),
+    'Dockerfile',
+  );
+  assert.equal(nonAdjacent.length, 1);
+  assert.equal(nonAdjacent[0].reason, 'missing-version-comment');
 
   const dynamic = checkDockerfileSource('FROM ${BASE_IMAGE}\n', 'Dockerfile');
   assert.equal(dynamic.length, 1);
@@ -1764,6 +1651,7 @@ test('local Dockerfiles require immutable frontend and external base images', ()
 test('local Dockerfiles reject remote or dynamic ADD and validate explicit external stage imports', () => {
   const floating = checkDockerfileSource(
     [
+      '# pin-version: node 24',
       `FROM node@sha256:${'1'.repeat(64)} AS build`,
       'ADD https://example.test/tool.tgz /tmp/tool.tgz',
       'COPY --from=ghcr.io/example/tool:latest /bin/tool /bin/tool',
@@ -1779,10 +1667,13 @@ test('local Dockerfiles reject remote or dynamic ADD and validate explicit exter
 
   const pinned = checkDockerfileSource(
     [
+      '# pin-version: node 24',
       `FROM node@sha256:${'2'.repeat(64)} AS build`,
       'COPY --from=build /workspace/out /app/out',
       'COPY --from=0 /workspace/out /app/out-from-index',
+      '# pin-version: tool 3',
       `COPY --from=ghcr.io/example/tool@sha256:${'3'.repeat(64)} /bin/tool /bin/tool`,
+      '# pin-version: cache 4',
       `RUN --mount=type=bind,from=ghcr.io/example/cache@sha256:${'4'.repeat(64)},target=/cache true`,
       '',
     ].join('\n'),
@@ -1792,6 +1683,7 @@ test('local Dockerfiles reject remote or dynamic ADD and validate explicit exter
 
   const jsonAdd = checkDockerfileSource(
     [
+      '# pin-version: node 24',
       `FROM node@sha256:${'5'.repeat(64)}`,
       'ADD ["https://example.test/tool.tgz", "/tmp/tool.tgz"]',
       '',
@@ -1803,6 +1695,7 @@ test('local Dockerfiles reject remote or dynamic ADD and validate explicit exter
 
   const dynamicAdd = checkDockerfileSource(
     [
+      '# pin-version: node 24',
       `FROM node@sha256:${'6'.repeat(64)} AS build`,
       'add    $ARCHIVE    /tmp/archive.tgz',
       'ADD    ${ARCHIVE_NAME}    /tmp/archive-two.tgz',
@@ -1894,6 +1787,25 @@ test('local Dockerfile references never follow symlinks', (context) => {
   assert.throws(() => checkLocalActions(root), /symlink/);
 });
 
+test('local Dockerfile references reject symlinked parent directories', (context) => {
+  const root = tempDir('spe-docker-parent-symlink-');
+  const action = path.join(root, 'action');
+  const realDocker = path.join(root, 'real-docker');
+  mkdirSync(action, { recursive: true });
+  mkdirSync(realDocker, { recursive: true });
+  writeFileSync(path.join(realDocker, 'Dockerfile'), 'FROM scratch\n', 'utf8');
+  if (!trySymlink(realDocker, path.join(action, 'linked'), 'dir')) {
+    context.skip('platform does not allow unprivileged symlink creation');
+    return;
+  }
+  writeFileSync(
+    path.join(action, 'action.yml'),
+    ['runs:', '  using: docker', '  image: linked/Dockerfile', ''].join('\n'),
+    'utf8',
+  );
+  assert.throws(() => checkLocalActions(root), /symlink/);
+});
+
 test('only explicit generated and dependency directories are skipped', () => {
   const root = tempDir('spe-skipped-composites-');
   for (const name of ['node_modules', '.git', 'dist', 'coverage', '.security-audit']) {
@@ -1906,6 +1818,264 @@ test('only explicit generated and dependency directories are skipped', () => {
     );
   }
   assert.deepEqual(checkLocalActions(root), []);
+});
+
+test('workflow-referenced actions are inspected inside excluded discovery trees', () => {
+  const root = tempDir('spe-referenced-dist-action-');
+  const workflows = path.join(root, '.github', 'workflows');
+  const action = path.join(root, 'dist', 'generated-action');
+  mkdirSync(workflows, { recursive: true });
+  mkdirSync(action, { recursive: true });
+  writeFileSync(
+    path.join(workflows, 'ci.yml'),
+    'jobs:\n  check:\n    steps:\n      - uses: ./dist/generated-action\n',
+    'utf8',
+  );
+  writeFileSync(
+    path.join(action, 'action.yml'),
+    'runs:\n  using: composite\n  steps:\n    - uses: actions/checkout@v5\n',
+    'utf8',
+  );
+
+  const result = runScript(
+    'check-action-pins.mjs',
+    ['--dir', workflows, '--root', root],
+    { GITHUB_ACTIONS: 'true' },
+  );
+  assert.equal(result.status, 2, result.stderr);
+  assert.match(result.stderr, /dist\/generated-action\/action\.yml/);
+  assert.match(result.stderr, /not-sha-pinned/);
+});
+
+test('nested local actions recursively validate external actions and runs.image', () => {
+  const root = tempDir('spe-transitive-local-actions-');
+  const workflows = path.join(root, '.github', 'workflows');
+  const first = path.join(root, 'dist', 'first');
+  const second = path.join(root, 'coverage', 'second');
+  mkdirSync(workflows, { recursive: true });
+  mkdirSync(first, { recursive: true });
+  mkdirSync(second, { recursive: true });
+  writeFileSync(
+    path.join(workflows, 'ci.yml'),
+    'jobs:\n  check:\n    steps:\n      - uses: ./dist/first\n',
+    'utf8',
+  );
+  writeFileSync(
+    path.join(first, 'action.yml'),
+    'runs:\n  using: composite\n  steps:\n    - uses: ./coverage/second\n',
+    'utf8',
+  );
+  writeFileSync(
+    path.join(second, 'action.yaml'),
+    'runs:\n  using: docker\n  image: docker://ghcr.io/example/helper:latest # v1\n',
+    'utf8',
+  );
+
+  const floating = runScript(
+    'check-action-pins.mjs',
+    ['--dir', workflows, '--root', root],
+    { GITHUB_ACTIONS: 'true' },
+  );
+  assert.equal(floating.status, 2, floating.stderr);
+  assert.match(floating.stderr, /coverage\/second\/action\.yaml/);
+  assert.match(floating.stderr, /not-digest-pinned/);
+
+  writeFileSync(
+    path.join(second, 'action.yaml'),
+    [
+      'runs:',
+      '  using: docker',
+      `  image: docker://ghcr.io/example/helper@sha256:${'f'.repeat(64)} # v1`,
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+  const pinned = runScript(
+    'check-action-pins.mjs',
+    ['--dir', workflows, '--root', root],
+    { GITHUB_ACTIONS: 'true' },
+  );
+  assert.equal(pinned.status, 0, pinned.stderr);
+  assert.equal(pinned.stderr, '');
+});
+
+test('nested local actions preserve version-comment coverage', () => {
+  const root = tempDir('spe-transitive-version-comment-');
+  const workflows = path.join(root, '.github', 'workflows');
+  const action = path.join(root, 'dist', 'nested');
+  mkdirSync(workflows, { recursive: true });
+  mkdirSync(action, { recursive: true });
+  writeFileSync(
+    path.join(workflows, 'ci.yml'),
+    'jobs:\n  check:\n    steps:\n      - uses: ./dist/nested\n',
+    'utf8',
+  );
+  writeFileSync(
+    path.join(action, 'action.yml'),
+    `runs:\n  using: composite\n  steps:\n    - uses: example/action@${'a'.repeat(40)}\n`,
+    'utf8',
+  );
+
+  const result = runScript(
+    'check-action-pins.mjs',
+    ['--dir', workflows, '--root', root],
+    { GITHUB_ACTIONS: 'true' },
+  );
+  assert.equal(result.status, 2, result.stderr);
+  assert.match(result.stderr, /missing-version-comment/);
+});
+
+test('local reference resolution fails closed on missing, ambiguous, escaping, and cyclic metadata', () => {
+  const cases = [
+    {
+      name: 'missing',
+      reference: './dist/missing',
+      setup: (root) => mkdirSync(path.join(root, 'dist', 'missing'), { recursive: true }),
+      pattern: /metadata is missing/,
+    },
+    {
+      name: 'ambiguous',
+      reference: './dist/ambiguous',
+      setup: (root) => {
+        const action = path.join(root, 'dist', 'ambiguous');
+        mkdirSync(action, { recursive: true });
+        writeFileSync(path.join(action, 'action.yml'), 'runs:\n  using: composite\n  steps: []\n');
+        writeFileSync(path.join(action, 'action.yaml'), 'runs:\n  using: composite\n  steps: []\n');
+      },
+      pattern: /metadata is ambiguous/,
+    },
+    {
+      name: 'escaping',
+      reference: './../outside',
+      setup: () => {},
+      pattern: /escapes the scan root/,
+    },
+  ];
+
+  for (const entry of cases) {
+    const root = tempDir(`spe-local-${entry.name}-`);
+    const workflows = path.join(root, '.github', 'workflows');
+    mkdirSync(workflows, { recursive: true });
+    entry.setup(root);
+    writeFileSync(
+      path.join(workflows, 'ci.yml'),
+      `jobs:\n  check:\n    steps:\n      - uses: ${entry.reference}\n`,
+      'utf8',
+    );
+    const result = runScript(
+      'check-action-pins.mjs',
+      ['--dir', workflows, '--root', root],
+      { GITHUB_ACTIONS: 'true' },
+    );
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, entry.pattern);
+  }
+
+  const root = tempDir('spe-local-cycle-');
+  const workflows = path.join(root, '.github', 'workflows');
+  const first = path.join(root, 'actions', 'first');
+  const second = path.join(root, 'actions', 'second');
+  mkdirSync(workflows, { recursive: true });
+  mkdirSync(first, { recursive: true });
+  mkdirSync(second, { recursive: true });
+  writeFileSync(
+    path.join(workflows, 'ci.yml'),
+    'jobs:\n  check:\n    steps:\n      - uses: ./actions/first\n',
+    'utf8',
+  );
+  writeFileSync(
+    path.join(first, 'action.yml'),
+    'runs:\n  using: composite\n  steps:\n    - uses: ./actions/second\n',
+    'utf8',
+  );
+  writeFileSync(
+    path.join(second, 'action.yml'),
+    'runs:\n  using: composite\n  steps:\n    - uses: ./actions/first\n',
+    'utf8',
+  );
+  const cycle = runScript(
+    'check-action-pins.mjs',
+    ['--dir', workflows, '--root', root],
+    { GITHUB_ACTIONS: 'true' },
+  );
+  assert.equal(cycle.status, 1, cycle.stderr);
+  assert.match(cycle.stderr, /cycle detected/);
+});
+
+test('workflow-referenced local reusable workflows are traversed', () => {
+  const root = tempDir('spe-local-reusable-workflow-');
+  const workflows = path.join(root, '.github', 'workflows');
+  mkdirSync(workflows, { recursive: true });
+  writeFileSync(
+    path.join(workflows, 'ci.yml'),
+    'jobs:\n  reuse:\n    uses: ./.github/workflows/reuse.yml\n',
+    'utf8',
+  );
+  writeFileSync(
+    path.join(workflows, 'reuse.yml'),
+    'jobs:\n  nested:\n    steps:\n      - uses: actions/checkout@v5\n',
+    'utf8',
+  );
+
+  const result = runScript(
+    'check-action-pins.mjs',
+    ['--dir', workflows, '--root', root],
+    { GITHUB_ACTIONS: 'true' },
+  );
+  assert.equal(result.status, 2, result.stderr);
+  assert.match(result.stderr, /reuse\.yml/);
+  assert.match(result.stderr, /not-sha-pinned/);
+});
+
+test('workflow-referenced local actions never traverse symlink components', (context) => {
+  const root = tempDir('spe-referenced-action-symlink-');
+  const workflows = path.join(root, '.github', 'workflows');
+  const realAction = path.join(root, 'real-action');
+  const dist = path.join(root, 'dist');
+  mkdirSync(workflows, { recursive: true });
+  mkdirSync(realAction, { recursive: true });
+  mkdirSync(dist, { recursive: true });
+  writeFileSync(
+    path.join(realAction, 'action.yml'),
+    `runs:\n  using: composite\n  steps:\n    - uses: actions/checkout@${'b'.repeat(40)} # v1\n`,
+    'utf8',
+  );
+  if (!trySymlink(realAction, path.join(dist, 'linked-action'), 'dir')) {
+    context.skip('platform does not allow unprivileged symlink creation');
+    return;
+  }
+  writeFileSync(
+    path.join(workflows, 'ci.yml'),
+    'jobs:\n  check:\n    steps:\n      - uses: ./dist/linked-action\n',
+    'utf8',
+  );
+
+  const result = runScript(
+    'check-action-pins.mjs',
+    ['--dir', workflows, '--root', root],
+    { GITHUB_ACTIONS: 'true' },
+  );
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /symlink/);
+});
+
+test('workflow files named like local action metadata are checked in both roles', () => {
+  const root = tempDir('spe-dual-policy-');
+  const workflows = path.join(root, '.github', 'workflows');
+  mkdirSync(workflows, { recursive: true });
+  writeFileSync(
+    path.join(workflows, 'action.yml'),
+    ['jobs:', '  build:', '    container: node:latest # v24', ''].join('\n'),
+    'utf8',
+  );
+
+  const result = runScript(
+    'check-action-pins.mjs',
+    ['--dir', workflows, '--root', root],
+    { GITHUB_ACTIONS: 'true' },
+  );
+  assert.equal(result.status, 2, result.stderr);
+  assert.match(result.stderr, /not-digest-pinned/);
 });
 
 test('a pinned reference with a version comment is accepted', () => {
@@ -1993,6 +2163,44 @@ test('Docker actions require an immutable sha256 digest and a version comment', 
   );
   assert.equal(undocumented[0].reason, 'missing-version-comment');
   assert.deepEqual(checkWorkflowSource('steps:\n  - uses: ./.actions/local\n', 'local.yml'), []);
+});
+
+test('workflow job and service containers require immutable digests and version comments', () => {
+  const digest = 'd'.repeat(64);
+  const pinned = [
+    'jobs:',
+    '  scalar:',
+    `    container: node@sha256:${digest} # v24`,
+    '    services:',
+    '      cache:',
+    `        image: redis@sha256:${digest} # v8`,
+    '  mapping:',
+    '    container:',
+    `      image: ghcr.io/example/build@sha256:${digest} # v1`,
+    '',
+  ].join('\n');
+  assert.deepEqual(checkWorkflowSource(pinned, 'containers.yml'), []);
+
+  const mutable = checkWorkflowSource(
+    ['jobs:', '  build:', '    container: node:latest # v24', ''].join('\n'),
+    'containers.yml',
+  );
+  assert.equal(mutable.length, 1);
+  assert.equal(mutable[0].reason, 'not-digest-pinned');
+
+  const undocumented = checkWorkflowSource(
+    [
+      'jobs:',
+      '  build:',
+      '    services:',
+      '      db:',
+      `        image: postgres@sha256:${digest}`,
+      '',
+    ].join('\n'),
+    'containers.yml',
+  );
+  assert.equal(undocumented.length, 1);
+  assert.equal(undocumented[0].reason, 'missing-version-comment');
 });
 
 test('the pin-check CLI is silent on Actions success and preserves failure semantics', () => {

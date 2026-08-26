@@ -6,11 +6,16 @@ Most use only the Node standard library. `check-action-pins.mjs` uses the commit
 development dependency so all valid YAML encodings are parsed consistently; run `npm ci` before
 the pin check.
 
+The public weekly workflow is intentionally inactive: every job has a literal `false` condition,
+uses the same generic public display name, and produces no result summary. The repository-contract
+tests and pin checker run in normal CI through `ci-contracts.mjs`, which captures all child output
+and emits only a fixed generic failure.
+
 Operator-facing documentation lives in [`docs/SECURITY-AUDIT.md`](../../docs/SECURITY-AUDIT.md).
 
 ## Controller vs target
 
-In CI these scripts always run from a checkout of protected `main` (the *controller*), while the
+The dormant audit design runs these scripts from a checkout of protected `main` (the *controller*), while the
 commit being audited is checked out separately into `target/` and treated purely as data. Scripts
 that read repository content therefore accept `--repo-root` (default `.`) so the controller can
 point them at the target without ever executing code from it. Locally the default is what you
@@ -27,31 +32,24 @@ want — the working tree is both controller and target.
 | `validate-response.mjs` | Parses, schema-checks, rejects, and redacts the model response. A partial rejection writes only accepted findings to the sanitized report before failing, so CI can attempt the sole private egress | `0` ok, `1` malformed/no report, `3` rejected (sanitized report written; fail closed) |
 | `submit-report.mjs` | Submits the validated report as **one** private vulnerability report per audited SHA, de-duplicated by title. Prints only `report: submitted\|existing\|none\|failed` | `0` ok, `1` failed (fail closed) |
 | `sanitize-findings.mjs` | Reduces `npm audit` / gitleaks reports to counts only — no paths, rules, advisory URLs, GHSA or CVE identifiers | `0` ok, `1` error |
-| `check-action-pins.mjs` | Parses workflow/local-action YAML and referenced local-action Dockerfiles. External actions require a 40-hex commit pin plus version comment; explicit Dockerfile external references (`# syntax`, `FROM`, `COPY --from`, `RUN --mount=from`) must be digest-pinned, and `ADD` accepts only literal local sources after parsing (remote or dynamic/expanded sources are rejected) | `0` clean, `1` violations/parse failure |
-| `summarize.mjs` | Emits the public pass/fail literal and decides pass/fail | `0` pass, `1` a deterministic or enabled model job failed/cancelled |
+| `check-action-pins.mjs` | Parses workflow and local-action YAML plus referenced local-action Dockerfiles. It recursively resolves every explicit local action or reusable workflow, including references under broad discovery exclusions. External actions require a 40-hex commit pin plus version comment. Workflow, action, and Dockerfile images require digests plus version comments; Dockerfiles use an adjacent `# pin-version: <version>` comment. Dockerfile `ADD` accepts only literal local sources. Cycles, path escapes, symlinks, missing/ambiguous metadata, remote or dynamic sources, and dynamic references fail closed | `0` clean, `2` policy violations, `1` operational/parse failure |
+| `ci-contracts.mjs` | Runs the invariant suite and pin checker with child output captured; prints only a fixed generic error to public CI | `0` contracts pass, `1` generic contract failure |
 | `dry-run.mjs` | Offline end-to-end run against a synthetic response, honouring `--repo-root` | `0` ok, non-zero on failure |
 
 ## Disclosure policy
 
-These scripts operate under an absolute non-disclosure rule: **automated security findings and any
-exploit detail never become public.** Nothing here writes findings to job logs, workflow artifacts,
-job summaries, pull request annotations, code scanning / SARIF, public issues, Azure DevOps or IcM.
+These scripts operate under an absolute non-disclosure rule: **automated security findings, their
+existence, scanner identity, private-submission outcome, and exploit detail never become public.**
+Nothing here writes or signals them through job/step names, conclusions, logs, workflow artifacts,
+job summaries, pull request annotations, code scanning / SARIF, public issues, Azure DevOps, or IcM.
 There is no SARIF converter and no artifact upload anywhere in the audit path.
 
 The only egress for a validated model finding is `submit-report.mjs`, which posts to
 `POST /repos/{owner}/{repo}/security-advisories/reports` — GitHub Private Vulnerability Reporting,
-visible to repository maintainers only. There is no fallback: if that submission cannot happen the
-audit fails closed and publishes nothing.
-
-Public output is limited to two literals, produced by `summarize.mjs`:
-
-```text
-Security audit: PASS
-Security audit: FAIL
-```
-
-`Security audit: PASS` means the required jobs completed successfully; the model job may have
-been disabled. It makes no claim that the repository is vulnerability-free.
+visible to repository maintainers only. There is no fallback. Public workflow execution remains
+disabled because exposing success or failure from processing or submission would itself disclose
+private state. Activation is prohibited until operational problems can be conveyed privately while
+public behavior remains invariant.
 
 ### `submit-report.mjs` contract
 
@@ -63,9 +61,9 @@ been disabled. It makes no claim that the repository is vulnerability-free.
 - Body is built in process: `summary`, markdown `description`, `severity` (the maximum severity
   across findings), `start_private_fork: false`. `vulnerabilities` is deliberately omitted — the
   findings are source-level, not package-level.
-- Stdout is exactly one line: `report: submitted`, `report: existing`, `report: none` or
+- When invoked locally, stdout is exactly one line: `report: submitted`, `report: existing`, `report: none` or
   `report: failed`. Response bodies, status codes, GHSA identifiers and URLs are never printed.
-  The public workflow suppresses both output streams and uses only the process exit status.
+  These outcome tokens must never be forwarded to a public workflow.
 - Idempotent `GET` requests retry `5xx` at most twice with a fixed 5s delay. Report `POST` requests
   are attempted exactly once because an ambiguous persisted POST must not create duplicates.
   Every error fails closed.
@@ -106,6 +104,7 @@ lib/mini-yaml.mjs    fail-closed YAML-subset parser used by the tests
 lib/controls.mjs     parses docs/SECURITY-CONTROLS.md into a code set
 lib/redaction.mjs    reject/redact pattern sets
 check-action-pins.mjs YAML-aware action-reference extractor and pin policy
+ci-contracts.mjs      non-disclosing normal-CI contract wrapper
 prompt.md            auditor preamble template  -> rendered to system.txt
 prompt-suffix.md     trusted output contract    -> appended after the corpus
 fixtures/            synthetic, malformed, unsafe, injection and delimiter fixtures
@@ -141,7 +140,8 @@ node scripts/security-audit/check-action-pins.mjs \
 with `fetch-depth: 0`). `SECURITY_AUDIT_TEST_MODE=1` skips only the reachability check and is used
 by the test suite; no workflow sets it, and a test asserts that.
 
-Or via npm: `security:audit:dry-run`, `security:audit:test`, `security:audit:pins`.
+Or via npm: `security:audit:dry-run`, `security:audit:test`, `security:audit:pins`,
+`security:audit:ci`.
 
 ## Tests
 
@@ -157,8 +157,9 @@ npm run security:audit:test
   the trusted suffix follows the last corpus fence, and the vocabulary is injected from
   `constants.mjs` so it cannot drift), schema validation, every rejection reason,
   credential/shell smuggling, prompt injection, findings-cap overflow, redaction, sanitizers
-  reducing to counts with no advisory URLs, composite-action pin coverage, the public summary
-  emitting only the two approved literals, the offline dry run, `--repo-root` isolation (the corpus
+  reducing to counts with no advisory URLs, recursive local-action and reusable-workflow pin
+  coverage (including excluded trees, cycles, escapes, metadata ambiguity, missing targets, and
+  symlinks), the offline dry run, `--repo-root` isolation (the corpus
   reads the audited tree, not the controller cwd, and keys stay repository-relative), the
   historical-ancestor regression using a commit that predates these scripts, and a repo walk
   proving no script creates issues, comments, or repository writes.
@@ -172,16 +173,17 @@ npm run security:audit:test
   absence of a credential preventing any POST, and stdout being restricted to the four allowed
   `report:` tokens with no status codes, bodies, GHSA identifiers or URLs.
 - `workflow-invariants.test.mjs` — parses the real workflow YAML and asserts: no PR triggers,
-  weekly Monday schedule, fixed default-branch repository dispatch, deny-all workflow permissions,
+  weekly Monday schedule, fixed default-branch repository dispatch, every audit job hard-disabled
+  behind a literal false gate with one generic public name, no result aggregator, deny-all workflow permissions,
   **no write permission of any kind** (no `security-events: write` anywhere — model findings never
   reach code scanning), per-job timeouts and concurrency, validated payload wiring, YAML-aware
   action/digest pins, no shell interpolation of model output,
-  the model job is gated on two separate opt-in variables, environment-protected and tool-less, the
+  the model job is exactly and unconditionally disabled, environment-protected and tool-less, the
   advisory credential is exposed only to the submit step and never to inference, no job uploads
-  artifacts, no job writes to `$GITHUB_STEP_SUMMARY` except the generic pass/fail literal,
+  artifacts, no job writes to `$GITHUB_STEP_SUMMARY`,
   `--ignore-scripts` in the audit path, no workflow sets `SECURITY_AUDIT_TEST_MODE` (the
-  reachability escape hatch stays unreachable from CI), `persist-credentials: false`, every
-  `continue-on-error` step is re-raised, the controller checkout precedes the `target/` checkout in
+  reachability escape hatch stays unreachable from CI), `persist-credentials: false`, dormant
+  finding exit codes are normalized without exposing their state, the controller checkout precedes the `target/` checkout in
   every job that runs a helper, audited npm manifests are isolated from `target/`, the submit step
   carries the audited SHA, and the legacy no-op gitleaks gate is gone.
 

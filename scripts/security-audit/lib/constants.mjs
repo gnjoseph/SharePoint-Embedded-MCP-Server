@@ -273,22 +273,3 @@ export const REPORT_RETRY_LIMIT = 2;
 
 /** Fixed delay between retries; deliberately not randomised or exponential. */
 export const REPORT_RETRY_DELAY_MS = 5000;
-
-/**
- * The only two strings this workflow may publish to a step or job summary.
- * Anything that identifies a scanner, path, rule, count, advisory, commit or
- * scope is withheld — a public summary is world-readable on a public
- * repository.
- */
-export const PUBLIC_SUMMARY_PASS = 'Security audit: PASS';
-
-/** Failure counterpart of {@link PUBLIC_SUMMARY_PASS}. */
-export const PUBLIC_SUMMARY_FAIL = 'Security audit: FAIL';
-
-/** Status literals emitted by the audit; asserted by tests and the summary job. */
-export const STATUS = Object.freeze({
-  notConfigured: 'AI NOT_CONFIGURED',
-  dryRun: 'AI DRY_RUN',
-  completed: 'AI COMPLETED',
-  failed: 'AI FAILED',
-});

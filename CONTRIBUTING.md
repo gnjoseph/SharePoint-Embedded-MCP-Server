@@ -40,12 +40,12 @@ comments.
 
 ## Optional model-assisted security analysis
 
-**This feature is disabled by default.** In this PR it is also hard-disabled in code and is not
-activation-ready. It is documented here so contributors know what a future, separately reviewed
-version could do.
+**This feature is disabled by default.** The complete weekly workflow is hard-disabled in code and
+is not activation-ready. It is documented here so contributors know what a future, separately
+reviewed version could do.
 
-The repository contains security-audit workflow scaffolding with a declared weekly schedule; this
-PR makes no claim that a production schedule is active. Its credentialed model stage cannot run.
+The repository contains security-audit workflow scaffolding with a declared weekly schedule; there
+is no claim that a production schedule is active. No workflow job can run.
 A future approved implementation may send a bounded selection of **already-public,
 git-tracked source files from `main`** to **GitHub Copilot**, which relays them to a
 **third-party model provider** for advisory security analysis.
@@ -63,20 +63,20 @@ What this stage does and does not do:
   and without any write permission. It cannot open issues, comment, push, or change settings.
 - **Advisory and redacted.** Output is schema-validated and redacted before use, is advisory only,
   and is never a required check for merging a pull request.
-- **Never published.** Validated findings are submitted only through **GitHub Private Vulnerability
-  Reporting**, where they are visible to repository maintainers alone. They are never written to
-  job logs, workflow artifacts, job summaries, pull request annotations, code scanning / SARIF,
-  public issues, Azure DevOps or IcM. There is no fallback surface: if private reporting is
-  unavailable the audit fails closed and publishes nothing. The only public output of an audit run
-  is `Security audit: PASS` or `Security audit: FAIL`; failure does not claim that a private report
-  exists.
+- **Never published or signaled.** Validated findings have exactly one designed egress:
+  **GitHub Private Vulnerability Reporting**, where they are visible to repository maintainers
+  alone. Finding existence, scanner identity, counts, paths, private-submission outcome, and exploit
+  detail never appear in or influence public job/step names, conclusions, logs, artifacts, summaries,
+  pull request annotations, code scanning / SARIF, public issues, Azure DevOps, or IcM. There is no
+  fallback surface.
 - **Never triggered by contributions.** The workflow has no `pull_request` or
   `pull_request_target` trigger. Opening or updating a pull request never sends anything anywhere.
 
-Repository variables and secrets cannot activate the current scaffold: its job condition begins
-with a literal `false &&`, and its proposed runtime is neither approved nor reproducible from the
-public npm registry. A future activation requires a reviewed code change plus Private Vulnerability
-Reporting, a protected environment, managed credentials and all legal/privacy approvals.
+The complete weekly workflow is intentionally inactive. Every job has a literal `false` activation
+guard and the same generic public display name; it produces no audit summary. Repository variables,
+secrets, or dispatch payloads cannot activate it. A future activation requires a reviewed code
+change plus Private Vulnerability Reporting, a private operational-failure channel, public outcome
+invariance, a protected environment, managed credentials, and all legal/privacy approvals.
 
 The full design, boundaries and blocked prerequisites are documented in
 [docs/SECURITY-AUDIT.md](docs/SECURITY-AUDIT.md).
