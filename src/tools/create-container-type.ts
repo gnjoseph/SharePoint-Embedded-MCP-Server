@@ -29,7 +29,10 @@ import {
 import { readState, writeState } from "../state.js";
 import { defineTool, z } from "../tooling/define-tool.js";
 import { resolveContextGate } from "./context-gate.js";
-import { resolveStandardBillingTarget } from "./standard-billing-target.js";
+import {
+  resolveStandardBillingTarget,
+  validateProvidedStandardBillingTarget,
+} from "./standard-billing-target.js";
 import type { BillingClassification } from "../types.js";
 import { fail, ok } from "../responses.js";
 import { clientSafeMessage } from "../errors.js";
@@ -315,13 +318,32 @@ export const createContainerTypeTool = defineTool({
       // existing region check + rollback in executeCreateContainerType unchanged.
       let effectiveArgs = args;
       let guidedNotes: string[] = [];
-      if (args.billingClassification === "standard" && (!args.azureSubscriptionId || !args.resourceGroup)) {
-        const target = await resolveStandardBillingTarget({
+      if (args.billingClassification === "standard") {
+        const validated = validateProvidedStandardBillingTarget({
           azureSubscriptionId: args.azureSubscriptionId,
           resourceGroup: args.resourceGroup,
         });
+        if (!validated.ok) return validated.error;
+        effectiveArgs = {
+          ...args,
+          azureSubscriptionId: validated.azureSubscriptionId,
+          resourceGroup: validated.resourceGroup,
+        };
+      }
+      if (
+        effectiveArgs.billingClassification === "standard" &&
+        (!effectiveArgs.azureSubscriptionId || !effectiveArgs.resourceGroup)
+      ) {
+        const target = await resolveStandardBillingTarget({
+          azureSubscriptionId: effectiveArgs.azureSubscriptionId,
+          resourceGroup: effectiveArgs.resourceGroup,
+        });
         if (!target.resolved) return target.result;
-        effectiveArgs = { ...args, azureSubscriptionId: target.azureSubscriptionId, resourceGroup: target.resourceGroup };
+        effectiveArgs = {
+          ...effectiveArgs,
+          azureSubscriptionId: target.azureSubscriptionId,
+          resourceGroup: target.resourceGroup,
+        };
         guidedNotes = target.notes;
       }
 
