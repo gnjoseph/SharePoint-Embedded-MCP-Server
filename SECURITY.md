@@ -28,10 +28,10 @@ The repository's optional model-assisted security audit
 (see [docs/SECURITY-AUDIT.md](docs/SECURITY-AUDIT.md)) submits its validated findings through the
 **same** PVR endpoint, and through no other channel. Specifically:
 
-- Automated findings and any exploit detail are **never** written to job logs, workflow artifacts,
-  job summaries, pull request annotations, code scanning / SARIF, public issues, Azure DevOps, or
-  IcM. There is no fallback surface: if private reporting is unavailable, the audit fails closed
-  and publishes nothing.
+- Automated findings, finding existence, scanner identity, private-submission outcome, and exploit
+  detail are **never** written to or signaled through public job/step names, conclusions, logs,
+  workflow artifacts, job summaries, pull request annotations, code scanning / SARIF, public
+  issues, Azure DevOps, or IcM. There is no fallback surface.
 - Each audited commit produces at most **one aggregate report**, titled
   `SPE automated security audit — <first 12 hex of the audited commit SHA>`.
 - Submission is de-duplicated against existing reports in the `triage`, `draft`, `published`, and
@@ -41,10 +41,9 @@ The repository's optional model-assisted security audit
   therefore visible only to maintainers. They are advisory input for human triage; they are not
   published advisories and they never gate a pull request.
 
-Public workflow output for a security audit run is limited to one of two literals:
-`Security audit: PASS` or `Security audit: FAIL`. A failure does not claim that a private report
-exists.
-
-The model-assisted stage is **disabled by default** and requires explicit maintainer activation,
-including PVR being enabled on the repository. See
+The complete weekly workflow is intentionally inactive: every job has a literal `false` guard,
+the same generic public display name, and no result summary. Variables, secrets, and dispatch
+payloads cannot activate it. Any future activation must keep public behavior invariant with respect
+to findings and private-report submission and must privately report operational problems while
+failing closed. See
 [docs/SECURITY-AUDIT.md](docs/SECURITY-AUDIT.md) for the full activation prerequisites.

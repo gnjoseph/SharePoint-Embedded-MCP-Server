@@ -1,4 +1,4 @@
-name: Security audit
+name: Private security audit (inactive)
 
 # Deliberately scheduled + trusted repository dispatch only.
 #
@@ -8,6 +8,13 @@ name: Security audit
 # steer the prompt. `repository_dispatch` loads this workflow from the default
 # branch, so an operator cannot select a modified controller workflow.
 # `security.yml` remains the per-PR security gate.
+#
+# IMPORTANT: every job in this public-repository workflow is hard-disabled.
+# GitHub Actions exposes job, step, and workflow conclusions publicly, so an
+# active audit cannot both fail closed and keep finding existence plus private
+# report submission state confidential. Activation requires a separate reviewed
+# design whose public surface is invariant. Repository variables alone must
+# never enable this workflow.
 on:
   schedule:
     # Mondays, 06:17 UTC. Offset from the hour to avoid the scheduler stampede.
@@ -40,7 +47,8 @@ jobs:
   # or a 40-hex SHA reachable from main.
   # ---------------------------------------------------------------------------
   validate-inputs:
-    name: Validate inputs
+    name: Private audit inactive
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -119,8 +127,9 @@ jobs:
   # finding locally (see docs/SECURITY-AUDIT.md).
   # ---------------------------------------------------------------------------
   dependency-audit:
-    name: Dependency audit
+    name: Private audit inactive
     needs: validate-inputs
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -173,7 +182,8 @@ jobs:
       # sanitizer never reads from, or writes into, the audited tree. `--json`
       # output is redirected to a file and never to the console: the raw report
       # names vulnerable packages and versions. The exit status is captured by
-      # `continue-on-error` and re-raised by the fail gate below.
+      # a local status. A policy finding is normalized so it cannot change a
+      # public step or job conclusion if this dormant scaffold is redesigned.
       - name: Run npm audit
         id: audit
         working-directory: ${{ runner.temp }}/security-audit-npm
@@ -190,6 +200,7 @@ jobs:
             validate_status=$?
           rm -f "${GITHUB_WORKSPACE}/.security-audit/npm-audit-inputs.log"
           [ "${validate_status}" -eq 0 ] || exit 1
+          set +e
           npm audit \
             --package-lock-only \
             --audit-level=high \
@@ -198,18 +209,12 @@ jobs:
             --userconfig="${NPM_USER_CONFIG}" \
             --globalconfig="${NPM_GLOBAL_CONFIG}" \
             > "${GITHUB_WORKSPACE}/.security-audit/npm-audit.json" 2>/dev/null
-        continue-on-error: true
-
-      # The sanitized summary holds severity counts only. It is consumed by the
-      # fail gate and is neither echoed, written to a job summary nor uploaded.
-      - name: Reduce report to sanitized counts
-        run: |
-          set -euo pipefail
-          node scripts/security-audit/sanitize-findings.mjs \
-            --kind npm-audit \
-            --in .security-audit/npm-audit.json \
-            --out .security-audit/npm-audit-summary.json
-          rm -f .security-audit/npm-audit.json
+          status=$?
+          set -e
+          case "${status}" in
+            0|1) exit 0 ;;
+            *) exit 1 ;;
+          esac
 
       - name: Discard dependency audit workspace
         if: ${{ always() }}
@@ -217,15 +222,7 @@ jobs:
           AUDIT_NPM_DIR: ${{ runner.temp }}/security-audit-npm
         run: |
           rm -rf "${AUDIT_NPM_DIR}"
-          rm -f .security-audit/npm-audit.json .security-audit/npm-audit-summary.json
-
-      # Generic failure only. Package names, versions, advisory identifiers and
-      # counts stay out of the log; maintainers reproduce locally.
-      - name: Fail if npm audit reported high or critical advisories
-        if: steps.audit.outcome == 'failure'
-        run: |
-          echo "Security audit: FAIL" >&2
-          exit 1
+          rm -f .security-audit/npm-audit.json
 
   # ---------------------------------------------------------------------------
   # Deterministic check 2: secret scanning that actually runs.
@@ -236,8 +233,9 @@ jobs:
   # version and verified by SHA-256 before execution.
   # ---------------------------------------------------------------------------
   secret-scan:
-    name: Secret scan (gitleaks)
+    name: Private audit inactive
     needs: validate-inputs
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -281,7 +279,7 @@ jobs:
           echo "${GITLEAKS_SHA256}  ${asset}" | sha256sum --check --strict
           tar -xzf "$asset" gitleaks
           chmod +x gitleaks
-          ./gitleaks version
+          ./gitleaks version > /dev/null 2>&1
 
       # `--exit-code 2` distinguishes "leaks found" from an operational failure,
       # so a crashed scanner is never mistaken for a clean scan. The exit code is
@@ -294,7 +292,6 @@ jobs:
       # logs are world-readable on a public repository.
       - name: Scan repository history
         id: scan
-        continue-on-error: true
         run: |
           set -uo pipefail
           mkdir -p .security-audit
@@ -314,43 +311,20 @@ jobs:
             > .security-audit/gitleaks-console.log 2>&1
           status=$?
           rm -f .security-audit/gitleaks-console.log
-          exit "${status}"
-
-      # The raw report contains the match context, commit metadata, rule
-      # identifiers and file paths. Everything that locates a finding is
-      # dropped: the sanitized summary carries counts only, is consumed solely
-      # by the fail gate below, and the raw report is deleted immediately.
-      # Nothing here is echoed, written to a job summary or uploaded. Actions
-      # logs and artifacts on a public repository are world-readable, so the
-      # scanner's console output is discarded in the scan step rather than used
-      # for triage. Triage is a restricted local `gitleaks git .` run by a
-      # maintainer on a workstation checked out at the target SHA this run
-      # audited; rule identifiers and paths stay on that workstation until the
-      # credential has been rotated. See docs/SECURITY-AUDIT.md.
-      - name: Reduce report to sanitized counts
-        run: |
-          set -euo pipefail
-          [ -f .security-audit/gitleaks.json ] || echo '[]' > .security-audit/gitleaks.json
-          node scripts/security-audit/sanitize-findings.mjs \
-            --kind gitleaks \
-            --in .security-audit/gitleaks.json \
-            --out .security-audit/gitleaks-summary.json
           rm -f .security-audit/gitleaks.json
-
-      # Generic failure only. Counts, rules and paths stay out of the log.
-      - name: Fail if secrets were detected
-        if: steps.scan.outcome == 'failure'
-        run: |
-          echo "Security audit: FAIL" >&2
-          exit 1
+          case "${status}" in
+            0|2) exit 0 ;;
+            *) exit 1 ;;
+          esac
 
   # ---------------------------------------------------------------------------
   # Deterministic check 3: every action in every workflow is pinned to a
   # 40-character commit SHA.
   # ---------------------------------------------------------------------------
   action-pins:
-    name: Action pinning
+    name: Private audit inactive
     needs: validate-inputs
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -401,7 +375,6 @@ jobs:
       # execution captures and deletes them unread before re-raising the status.
       - name: Verify action pinning
         id: pin-check
-        continue-on-error: true
         run: |
           set -uo pipefail
           mkdir -p .security-audit
@@ -413,13 +386,10 @@ jobs:
           status=$?
           set -e
           rm -f .security-audit/action-pins-diagnostics.log
-          exit "${status}"
-
-      - name: Fail if action pinning validation failed
-        if: steps.pin-check.outcome == 'failure'
-        run: |
-          echo "Security audit: FAIL" >&2
-          exit 1
+          case "${status}" in
+            0|2) exit 0 ;;
+            *) exit 1 ;;
+          esac
 
   # ---------------------------------------------------------------------------
   # Model-assisted advisory pass (credentialed, disabled scaffold).
@@ -451,7 +421,7 @@ jobs:
   # remain separately testable. See docs/SECURITY-AUDIT.md.
   # ---------------------------------------------------------------------------
   model-audit:
-    name: Model-assisted review
+    name: Private audit inactive
     # `secret-scan` is a hard predecessor, not an ordering preference: it is the
     # gate that must pass before any repository source leaves the runner. If the
     # tree still contains a live credential, sending the corpus to the model
@@ -460,7 +430,7 @@ jobs:
     needs:
       - validate-inputs
       - secret-scan
-    if: ${{ false && vars.SECURITY_AUDIT_AI_ENABLED == 'true' && vars.SECURITY_AUDIT_PRIVATE_REPORTING_ENABLED == 'true' && needs.validate-inputs.outputs.dry_run != 'true' }}
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: security-audit-private-report
@@ -699,9 +669,9 @@ jobs:
   # for a real one, and the dry run has no private reporting path either.
   # ---------------------------------------------------------------------------
   model-audit-dry-run:
-    name: Model-assisted review (dry run)
+    name: Private audit inactive
     needs: validate-inputs
-    if: ${{ needs.validate-inputs.outputs.dry_run == 'true' }}
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -738,60 +708,3 @@ jobs:
 
       - name: Run script test suite
         run: npm run security:audit:test
-
-  # ---------------------------------------------------------------------------
-  # Reports the outcome. Deterministic failures fail the run; the model layer is
-  # advisory and its absence is stated explicitly rather than implied to pass.
-  #
-  # The rendered summary is deliberately generic — `Security audit: PASS` or
-  # `Security audit: FAIL` — and names no scanner, path, rule, count, advisory
-  # or commit. A failure does not claim that a private report exists.
-  # ---------------------------------------------------------------------------
-  summary:
-    name: Summary
-    needs:
-      - validate-inputs
-      - dependency-audit
-      - secret-scan
-      - action-pins
-      - model-audit
-      - model-audit-dry-run
-    if: ${{ always() }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    steps:
-      # This job runs with `if: always()`, so validate-inputs may have failed and
-      # `needs.validate-inputs.outputs.controller_sha` may be empty. An empty
-      # `ref` makes actions/checkout fall back to the event ref. Use the protected
-      # branch name directly so this trusted summary helper always resolves to
-      # the main tip, even after input validation fails.
-      - name: Checkout controller scripts from main
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: main
-          persist-credentials: false
-
-      - name: Set up Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Render summary
-        env:
-          DEPENDENCY_RESULT: ${{ needs.dependency-audit.result }}
-          SECRET_RESULT: ${{ needs.secret-scan.result }}
-          PINS_RESULT: ${{ needs.action-pins.result }}
-          MODEL_RESULT: ${{ needs.model-audit.result }}
-          MODEL_DRY_RUN_RESULT: ${{ needs.model-audit-dry-run.result }}
-          DRY_RUN: ${{ needs.validate-inputs.outputs.dry_run }}
-        run: |
-          set -euo pipefail
-          node scripts/security-audit/summarize.mjs \
-            --dependency-audit "${DEPENDENCY_RESULT}" \
-            --secret-scan "${SECRET_RESULT}" \
-            --action-pins "${PINS_RESULT}" \
-            --model "${MODEL_RESULT}" \
-            --model-dry-run "${MODEL_DRY_RUN_RESULT}" \
-            --dry-run "${DRY_RUN:-false}"

@@ -2,14 +2,16 @@
 /**
  * Verifies that every external action reference is immutable and carries a
  * human-readable version comment. This covers `uses:` values, external
- * `runs.image: docker://...` values, and every external base/frontend image
- * used by a Dockerfile-backed local action.
+ * `runs.image: docker://...` values, workflow job/service container images,
+ * and every external base/frontend image used by a Dockerfile-backed local
+ * action.
  *
  * A floating tag (`@v4`) is mutable: whoever controls the tag controls what runs
  * inside the workflow, including in the job that holds the advisory credential
  * used to file a private vulnerability report.
- * Local (`./…`) `uses:` references are out of scope, but the referenced local
- * action metadata is scanned separately. Docker references must use an
+ * Local (`./…`) `uses:` references are resolved from the repository root and
+ * traversed recursively, even when they live in directories excluded from broad
+ * discovery. Docker references must use an
  * immutable `sha256` digest. A local action that names a Dockerfile causes that
  * exact file to be parsed; dynamic, missing, escaping, or ambiguous image
  * references fail closed.
@@ -28,7 +30,7 @@
  *   node scripts/security-audit/check-action-pins.mjs [--dir .github/workflows] [--root .]
  */
 
-import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
@@ -284,6 +286,118 @@ function extractLocalDockerImage(parsed, file) {
 }
 
 /**
+ * Returns every job-level and service container image in a workflow.
+ *
+ * GitHub accepts both `container: image` and `container: { image: image }`.
+ * Service images use `services.<name>.image`. All execute registry content
+ * before repository steps, so they use the same digest and version-comment
+ * policy as `docker://` action references.
+ *
+ * @param {ReturnType<typeof parsePolicySource>} parsed
+ * @param {string} file
+ * @returns {Array<{ file: string, line: number, uses: string, comment: string }>}
+ */
+function extractWorkflowContainerImages(parsed, file) {
+  const root = parsed.document.contents;
+  if (!isMap(root)) return [];
+
+  const jobsPair = root.items.find(
+    (pair) => isPair(pair) && isScalar(pair.key) && pair.key.value === 'jobs',
+  );
+  if (!jobsPair) return [];
+  if (!isMap(jobsPair.value)) {
+    throw new Error(`${file}: jobs must be a YAML mapping`);
+  }
+
+  /** @type {Array<{ file: string, line: number, uses: string, comment: string }>} */
+  const images = [];
+
+  /**
+   * @param {import('yaml').Pair} pair
+   * @param {string} keyName
+   */
+  function addImage(pair, keyName) {
+    const record = stringPairRecord(
+      pair,
+      keyName,
+      file,
+      parsed.lineCounter,
+      parsed.lines,
+    );
+    images.push({
+      file,
+      line: record.line,
+      uses: `docker://${record.value}`,
+      comment: record.comment,
+    });
+  }
+
+  for (const jobPair of jobsPair.value.items) {
+    if (!isPair(jobPair) || !isScalar(jobPair.key) || typeof jobPair.key.value !== 'string') {
+      throw new Error(`${file}: job names must be scalar strings`);
+    }
+    if (!isMap(jobPair.value)) {
+      throw new Error(`${file}: jobs.${jobPair.key.value} must be a YAML mapping`);
+    }
+
+    const containerPair = jobPair.value.items.find(
+      (pair) => isPair(pair) && isScalar(pair.key) && pair.key.value === 'container',
+    );
+    if (containerPair) {
+      if (isScalar(containerPair.value)) {
+        addImage(containerPair, `jobs.${jobPair.key.value}.container`);
+      } else if (isMap(containerPair.value)) {
+        const imagePair = containerPair.value.items.find(
+          (pair) => isPair(pair) && isScalar(pair.key) && pair.key.value === 'image',
+        );
+        if (!imagePair) {
+          throw new Error(`${file}: jobs.${jobPair.key.value}.container must declare image`);
+        }
+        addImage(imagePair, `jobs.${jobPair.key.value}.container.image`);
+      } else {
+        throw new Error(`${file}: jobs.${jobPair.key.value}.container is unsupported`);
+      }
+    }
+
+    const servicesPair = jobPair.value.items.find(
+      (pair) => isPair(pair) && isScalar(pair.key) && pair.key.value === 'services',
+    );
+    if (!servicesPair) continue;
+    if (!isMap(servicesPair.value)) {
+      throw new Error(`${file}: jobs.${jobPair.key.value}.services must be a YAML mapping`);
+    }
+    for (const servicePair of servicesPair.value.items) {
+      if (
+        !isPair(servicePair) ||
+        !isScalar(servicePair.key) ||
+        typeof servicePair.key.value !== 'string'
+      ) {
+        throw new Error(`${file}: service names must be scalar strings`);
+      }
+      if (!isMap(servicePair.value)) {
+        throw new Error(
+          `${file}: jobs.${jobPair.key.value}.services.${servicePair.key.value} must be a YAML mapping`,
+        );
+      }
+      const imagePair = servicePair.value.items.find(
+        (pair) => isPair(pair) && isScalar(pair.key) && pair.key.value === 'image',
+      );
+      if (!imagePair) {
+        throw new Error(
+          `${file}: jobs.${jobPair.key.value}.services.${servicePair.key.value} must declare image`,
+        );
+      }
+      addImage(
+        imagePair,
+        `jobs.${jobPair.key.value}.services.${servicePair.key.value}.image`,
+      );
+    }
+  }
+
+  return images;
+}
+
+/**
  * Split an instruction shell fragment into tokens.
  *
  * Supports the quoting needed by the repository's Dockerfiles and rejects
@@ -460,9 +574,17 @@ function parseMountSpec(value, file, line) {
  * @param {number} line
  * @param {Set<string>} stageAliases
  * @param {number} stageCount
+ * @param {string} versionComment
  * @returns {Array<{ file: string, line: number, uses: string, reason: string }>}
  */
-function validateDockerImageReference(reference, file, line, stageAliases, stageCount) {
+function validateDockerImageReference(
+  reference,
+  file,
+  line,
+  stageAliases,
+  stageCount,
+  versionComment,
+) {
   const normalized = reference.toLowerCase();
   if (normalized === 'scratch') return [];
   if (/^\d+$/u.test(reference)) {
@@ -472,7 +594,11 @@ function validateDockerImageReference(reference, file, line, stageAliases, stage
     return [];
   }
   if (stageAliases.has(normalized)) return [];
-  if (CONTAINER_IMAGE_DIGEST_RE.test(reference)) return [];
+  if (CONTAINER_IMAGE_DIGEST_RE.test(reference)) {
+    return versionComment === ''
+      ? [{ file, line, uses: reference, reason: 'missing-version-comment' }]
+      : [];
+  }
   return [{ file, line, uses: reference, reason: 'not-digest-pinned' }];
 }
 
@@ -490,13 +616,15 @@ function validateDockerImageReference(reference, file, line, stageAliases, stage
 export function checkDockerfileSource(text, file) {
   /** @type {Array<{ file: string, line: number, uses: string, reason: string }>} */
   const violations = [];
-  /** @type {Array<{ line: number, value: string }>} */
+  /** @type {Array<{ line: number, value: string, versionComment: string }>} */
   const instructions = [];
   const stageAliases = new Set();
   let stageCount = 0;
   const lines = text.split(/\r?\n/);
   let pending = '';
   let pendingLine = 0;
+  let pendingVersionComment = '';
+  let instructionVersionComment = '';
 
   for (let index = 0; index < lines.length; index += 1) {
     const raw = lines[index];
@@ -510,6 +638,13 @@ export function checkDockerfileSource(text, file) {
       const image = directive[1];
       if (!CONTAINER_IMAGE_DIGEST_RE.test(image)) {
         violations.push({ file, line, uses: image, reason: 'not-digest-pinned' });
+      } else {
+        const version = /^\s*#\s*pin-version\s*:\s*(\S.*)\s*$/i.exec(lines[index + 1] ?? '');
+        if (!version) {
+          violations.push({ file, line, uses: image, reason: 'missing-version-comment' });
+        } else {
+          index += 1;
+        }
       }
       continue;
     }
@@ -522,23 +657,42 @@ export function checkDockerfileSource(text, file) {
       continue;
     }
 
-    if (/^\s*(?:#.*)?$/.test(raw)) {
+    if (/^\s*$/.test(raw)) {
       if (pending !== '') {
         throw new Error(`${file}:${line}: comments inside continued instructions are not supported`);
       }
+      pendingVersionComment = '';
+      continue;
+    }
+
+    if (/^\s*#/.test(raw)) {
+      if (pending !== '') {
+        throw new Error(`${file}:${line}: comments inside continued instructions are not supported`);
+      }
+      const version = /^\s*#\s*pin-version\s*:\s*(\S.*)\s*$/i.exec(raw);
+      pendingVersionComment = version ? version[1] : '';
       continue;
     }
 
     const trimmed = raw.trimEnd();
     const continues = /\\$/.test(trimmed);
     const fragment = continues ? trimmed.slice(0, -1) : trimmed;
-    if (pending === '') pendingLine = line;
+    if (pending === '') {
+      pendingLine = line;
+      instructionVersionComment = pendingVersionComment;
+      pendingVersionComment = '';
+    }
     pending += `${fragment.trim()} `;
     if (continues) continue;
 
-    instructions.push({ line: pendingLine, value: pending.trim() });
+    instructions.push({
+      line: pendingLine,
+      value: pending.trim(),
+      versionComment: instructionVersionComment,
+    });
     pending = '';
     pendingLine = 0;
+    instructionVersionComment = '';
   }
 
   if (pending !== '') {
@@ -593,6 +747,7 @@ export function checkDockerfileSource(text, file) {
           instruction.line,
           stageAliases,
           stageCount,
+          instruction.versionComment,
         ),
       );
 
@@ -613,6 +768,7 @@ export function checkDockerfileSource(text, file) {
               instruction.line,
               stageAliases,
               stageCount,
+              instruction.versionComment,
             ),
           );
         }
@@ -646,6 +802,7 @@ export function checkDockerfileSource(text, file) {
             instruction.line,
             stageAliases,
             stageCount,
+            instruction.versionComment,
           ),
         );
       }
@@ -681,19 +838,10 @@ function checkReferencedDockerfile(image, rootReal) {
     throw new Error(`${image.file}:${image.line}: local Dockerfile escapes the scan root`);
   }
 
-  let stats;
-  try {
-    stats = lstatSync(absolute);
-  } catch {
-    throw new Error(`${image.file}:${image.line}: local Dockerfile could not be read`);
-  }
-  if (stats.isSymbolicLink()) {
-    throw new Error(`${image.file}:${image.line}: local Dockerfile must not be a symlink`);
-  }
+  const stats = inspectRepositoryPath(rootReal, absolute, image.file, image.line);
   if (!stats.isFile()) {
     throw new Error(`${image.file}:${image.line}: local Dockerfile is not a regular file`);
   }
-  assertWithinRoot(rootReal, absolute);
 
   return checkDockerfileSource(
     readFileSync(absolute, 'utf8'),
@@ -750,7 +898,11 @@ function checkReferences(references) {
  * @returns {Array<{ file: string, line: number, uses: string, reason: string }>}
  */
 export function checkWorkflowSource(text, file) {
-  return checkReferences(parsePolicySource(text, file).references);
+  const parsed = parsePolicySource(text, file);
+  return checkReferences([
+    ...parsed.references,
+    ...extractWorkflowContainerImages(parsed, file),
+  ]);
 }
 
 /**
@@ -808,6 +960,172 @@ function assertWithinRoot(rootReal, absolute) {
     throw new Error(`security-audit: path escapes the scan root: ${absolute} -> ${real}`);
   }
   return real;
+}
+
+/**
+ * Checks every path component without following a symbolic link.
+ *
+ * `realpath` containment alone is insufficient for a reference such as
+ * `./dist/action`: a link can remain inside the repository while still hiding
+ * the reviewed action metadata behind different content.
+ *
+ * @param {string} rootReal
+ * @param {string} absolute
+ * @param {string} sourceFile
+ * @param {number} sourceLine
+ * @returns {import('node:fs').Stats}
+ */
+function inspectRepositoryPath(rootReal, absolute, sourceFile, sourceLine) {
+  const lexical = relative(rootReal, absolute);
+  if (lexical !== '' && (lexical.startsWith('..') || isAbsolute(lexical))) {
+    throw new Error(`${sourceFile}:${sourceLine}: local reference escapes the scan root`);
+  }
+
+  let current = rootReal;
+  let stats = lstatSync(rootReal);
+  for (const segment of lexical.split(/[\\/]/u).filter(Boolean)) {
+    current = join(current, segment);
+    try {
+      stats = lstatSync(current);
+    } catch {
+      throw new Error(`${sourceFile}:${sourceLine}: local reference could not be read`);
+    }
+    if (stats.isSymbolicLink()) {
+      throw new Error(`${sourceFile}:${sourceLine}: local reference must not contain a symlink`);
+    }
+  }
+  assertWithinRoot(rootReal, absolute);
+  return stats;
+}
+
+/**
+ * Resolves one repository-local `uses:` value to exact executable policy
+ * metadata. Directories must contain exactly one action metadata file. Files
+ * must be reusable-workflow YAML.
+ *
+ * @param {{ file: string, line: number, uses: string }} reference
+ * @param {string} rootReal
+ * @returns {{ file: string, kind: 'action' | 'workflow' }}
+ */
+function resolveLocalReference(reference, rootReal) {
+  const value = reference.uses;
+  if (
+    !value.startsWith('./') ||
+    value === './' ||
+    value.trim() !== value ||
+    value.includes('\\') ||
+    value.includes('\0') ||
+    value.includes('$') ||
+    value.includes('?') ||
+    value.includes('#') ||
+    isAbsolute(value)
+  ) {
+    throw new Error(`${reference.file}:${reference.line}: unprovable local action reference`);
+  }
+
+  const absolute = resolve(rootReal, value.slice(2));
+  const stats = inspectRepositoryPath(rootReal, absolute, reference.file, reference.line);
+  if (stats.isFile()) {
+    if (!/\.ya?ml$/u.test(absolute)) {
+      throw new Error(
+        `${reference.file}:${reference.line}: local workflow reference must name YAML`,
+      );
+    }
+    return { file: absolute.split('\\').join('/'), kind: 'workflow' };
+  }
+  if (!stats.isDirectory()) {
+    throw new Error(
+      `${reference.file}:${reference.line}: local action reference is not a file or directory`,
+    );
+  }
+
+  const candidates = [...ACTION_METADATA_NAMES]
+    .map((name) => join(absolute, name))
+    .filter((candidate) => existsSync(candidate));
+  if (candidates.length === 0) {
+    throw new Error(`${reference.file}:${reference.line}: local action metadata is missing`);
+  }
+  if (candidates.length !== 1) {
+    throw new Error(`${reference.file}:${reference.line}: local action metadata is ambiguous`);
+  }
+
+  const metadata = candidates[0];
+  const metadataStats = inspectRepositoryPath(
+    rootReal,
+    metadata,
+    reference.file,
+    reference.line,
+  );
+  if (!metadataStats.isFile()) {
+    throw new Error(`${reference.file}:${reference.line}: local action metadata is not a file`);
+  }
+  return { file: metadata.split('\\').join('/'), kind: 'action' };
+}
+
+/**
+ * Scans the transitive executable-reference graph rooted at workflow and local
+ * action metadata files.
+ *
+ * @param {string} root
+ * @param {Array<{ file: string, kind: 'action' | 'workflow' }>} seeds
+ */
+function checkPolicyGraph(root, seeds) {
+  const rootReal = realpathSync.native(root);
+  /** @type {Set<string>} */
+  const visited = new Set();
+  /** @type {Set<string>} */
+  const active = new Set();
+  /** @type {Array<{ file: string, line: number, uses: string, reason: string }>} */
+  const violations = [];
+
+  /**
+   * @param {{ file: string, kind: 'action' | 'workflow' }} policy
+   */
+  function visit(policy) {
+    const absolute = resolve(policy.file);
+    const stats = inspectRepositoryPath(rootReal, absolute, policy.file, 1);
+    if (!stats.isFile()) {
+      throw new Error(`${policy.file}: policy input is not a regular file`);
+    }
+    const canonical = assertWithinRoot(rootReal, absolute);
+    const visitedKey = `${policy.kind}:${canonical}`;
+    if (active.has(canonical)) {
+      throw new Error(`${policy.file}: local action reference cycle detected`);
+    }
+    if (visited.has(visitedKey)) return;
+
+    active.add(canonical);
+    const displayFile = absolute.split('\\').join('/');
+    const parsed = parsePolicySource(readFileSync(absolute, 'utf8'), displayFile);
+    const image =
+      policy.kind === 'action' ? extractLocalDockerImage(parsed, displayFile) : null;
+    const workflowImages =
+      policy.kind === 'workflow' ? extractWorkflowContainerImages(parsed, displayFile) : [];
+    const executableReferences = [
+      ...parsed.references,
+      ...(image?.uses.startsWith('docker://') ? [image] : []),
+      ...workflowImages,
+    ];
+    violations.push(...checkReferences(executableReferences));
+
+    if (image && !image.uses.startsWith('docker://')) {
+      violations.push(...checkReferencedDockerfile(image, rootReal));
+    }
+
+    for (const reference of parsed.references) {
+      if (!reference.uses.startsWith('./')) continue;
+      visit(resolveLocalReference(reference, rootReal));
+    }
+
+    active.delete(canonical);
+    visited.add(visitedKey);
+  }
+
+  for (const seed of seeds.toSorted((left, right) => left.file.localeCompare(right.file))) {
+    visit(seed);
+  }
+
+  return { violations, scanned: visited.size };
 }
 
 /**
@@ -882,10 +1200,12 @@ export function collectFiles(dir, predicate) {
  *
  * @param {string} dir
  */
-export function checkWorkflowDirectory(dir) {
+export function checkWorkflowDirectory(dir, root = resolve(dir, '..', '..')) {
   const files = collectFiles(dir, (name) => name.endsWith('.yml') || name.endsWith('.yaml'));
-
-  return files.flatMap((file) => checkWorkflowSource(readFileSync(file, 'utf8'), file));
+  return checkPolicyGraph(
+    root,
+    files.map((file) => ({ file, kind: 'workflow' })),
+  ).violations;
 }
 
 /**
@@ -897,10 +1217,10 @@ export function checkWorkflowDirectory(dir) {
  */
 export function checkLocalActions(root) {
   const files = collectFiles(root, (name) => ACTION_METADATA_NAMES.has(name));
-  const rootReal = realpathSync.native(root);
-
-  return files.flatMap((file) =>
-    checkLocalActionSource(readFileSync(file, 'utf8'), file, rootReal));
+  return checkPolicyGraph(
+    root,
+    files.map((file) => ({ file, kind: 'action' })),
+  ).violations;
 }
 
 function main() {
@@ -917,19 +1237,17 @@ function main() {
       dir,
       (name) => name.endsWith('.yml') || name.endsWith('.yaml'),
     );
-    const rootReal = realpathSync.native(root);
-    const localActionFiles = checkLocalActionPaths(root, workflowFiles);
-    const localActionSet = new Set(localActionFiles);
-    const workflowOnlyFiles = workflowFiles.filter((file) => !localActionSet.has(file));
-    scanned = workflowOnlyFiles.length + localActionFiles.length;
-    violations = [
-      ...workflowOnlyFiles.flatMap((file) =>
-        checkWorkflowSource(readFileSync(file, 'utf8'), file)),
-      ...localActionFiles.flatMap((file) =>
-        checkLocalActionSource(readFileSync(file, 'utf8'), file, rootReal)),
-    ];
+    const localActionFiles = collectFiles(root, (name) => ACTION_METADATA_NAMES.has(name));
+    const result = checkPolicyGraph(root, [
+      ...workflowFiles.map((file) => ({ file, kind: 'workflow' })),
+      ...localActionFiles.map((file) => ({ file, kind: 'action' })),
+    ]);
+    scanned = result.scanned;
+    violations = result.violations;
   } catch (error) {
-    process.stderr.write(`security-audit: unable to read ${dir}: ${error.message}\n`);
+    process.stderr.write(
+      `security-audit: unable to read ${dir}: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
     process.exit(1);
     return;
   }
@@ -951,20 +1269,7 @@ function main() {
   process.stderr.write(
     `security-audit: ${violations.length} unpinned or undocumented action reference(s)\n`,
   );
-  process.exit(1);
-}
-
-/**
- * @param {string} root
- * @param {string[]} alreadyScanned
- */
-function checkLocalActionPaths(root, alreadyScanned) {
-  const files = collectFiles(root, (name) => ACTION_METADATA_NAMES.has(name));
-  for (const file of alreadyScanned) {
-    const name = file.slice(file.lastIndexOf('/') + 1);
-    if (ACTION_METADATA_NAMES.has(name)) files.push(file);
-  }
-  return [...new Set(files)].sort();
+  process.exit(2);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

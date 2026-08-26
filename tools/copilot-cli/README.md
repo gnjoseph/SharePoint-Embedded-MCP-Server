@@ -5,9 +5,9 @@ This directory exists for one reason: `.github/workflows/security-audit.yml` run
 talk to a model directly. It shells out to the **GitHub Copilot CLI**, which must
 already be installed on the runner.
 
-The credentialed model job is currently **hard-disabled scaffolding**. Its job
-condition begins with a literal `false &&`, so repository variables and secrets
-cannot make it run. The dormant install step deliberately refuses global or
+The complete workflow is currently **hard-disabled scaffolding**. Every job
+condition is exactly `${{ false }}`, so repository variables and secrets
+cannot make any audit run. The dormant install step deliberately refuses global or
 floating installation and would require `npm ci --ignore-scripts` from an
 approved manifest and committed lockfile before any repository source is
 assembled.
@@ -49,7 +49,7 @@ the proposed package merely to make installation pass. A future reviewed change
 must first select an approved, compatible version that is directly available from
 the public registry. It must then generate and verify the lockfile using empty
 user/global npm configuration and the explicit public registry. Until that code
-change lands, the literal `false &&` guard in `security-audit.yml` must remain.
+change lands, every literal `false` guard in `security-audit.yml` must remain.
 
 ## Future runtime update
 
@@ -60,7 +60,8 @@ change lands, the literal `false &&` guard in `security-audit.yml` must remain.
    user/global npm configuration.
 5. Verify every `resolved` URL uses that public registry and every integrity value
    is `sha512-…`; run a clean `npm ci --ignore-scripts`.
-6. Remove the job-level hard-disable only in the same reviewed change.
+6. Satisfy the public-outcome invariance and private operational-failure requirements.
+7. Remove hard-disables only in the same reviewed change.
 
 Dependabot watches this directory (`.github/dependabot.yml`), so version bumps
 surface as pull requests once the lockfile exists.
