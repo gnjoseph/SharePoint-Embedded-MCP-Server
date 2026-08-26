@@ -78,9 +78,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   owner-only (SEC-003) with a 24-hour TTL — a failed check backs off for the same 24 hours,
   so at most one request per day is made either way — deleted on `logout` /
   `auth --reset`. `SPE_NPM_REGISTRY` values carrying credentials, a query string, or a
-  fragment are rejected. **Known limitation:** Node's built-in `fetch` ignores
-  `HTTP(S)_PROXY`/`NO_PROXY`, so the request cannot be routed through an egress proxy; it
-  fails closed.
+  fragment are rejected. Proxy routing follows the runtime configuration: releases that support
+  Node's environment-proxy mode (including current Node 24/26 releases) can use
+  `HTTP(S)_PROXY`/`NO_PROXY` when enabled with `NODE_USE_ENV_PROXY=1` or `--use-env-proxy`;
+  Node 22 may ignore those variables and attempt a direct connection.
 
 - **Fail-closed credential/state file handling.** The data directory and token
   cache files are now validated fail-closed: a symlinked, foreign-owned, or

@@ -104,10 +104,11 @@ newer releases, which can also be turned off. Specifically:
   identifier**. It is **retained locally until you delete it**: there is no automatic expiry of
   the file itself, only of its freshness. Run `spe-mcp logout` or `spe-mcp auth --reset` to
   delete it, or remove the file by hand. A transient owner-only
-  `update-check.json.lock` file (plus a recovery lock only while reclaiming an abandoned lock)
-  coordinates processes that share the data directory. Each contains only the local process ID
-  and lock-acquisition timestamp, is removed after the operation, and an abandoned lock can be
-  reclaimed after 30 seconds only after the recorded process is no longer alive. The
+  uniquely named `update-check.json.lock-*` files coordinate processes that share the data
+  directory. Each contains only the local process ID, lock-acquisition timestamp, a random
+  contender name, and a local ordering number; it is removed after the operation, and an
+  abandoned contender can be reclaimed after 30 seconds only after the recorded process is no
+  longer alive. Names are never reused, so stale cleanup cannot delete a successor lock. The
   refresh-lock owner writes the 24-hour attempt timestamp to the cache
   before opening the registry connection, so another process cannot start a duplicate request
   if the first process exits after egress. Changing the running package version or registry, or
@@ -117,6 +118,11 @@ newer releases, which can also be turned off. Specifically:
   remains local until you delete the data directory. The same atomic-write pattern can leave an
   owner-only `update-check.json.tmp-*` file after an abrupt exit; it is cleaned by the next
   eligible check after 30 seconds or by logout/reset.
+
+  A process claims a pending update target in this cache before returning its notice, preventing
+  duplicate delivery by processes that share the cache. This is at-most-once delivery: a crash
+  after the durable claim but before the client receives the response can lose the notice rather
+  than repeat it. The cached update remains available through `status_get`.
 
   Logout/reset also writes an owner-only `update-check.json.deleted` generation containing only
   a timestamp before deleting the cached result. That local tombstone prevents a registry
@@ -134,13 +140,11 @@ newer releases, which can also be turned off. Specifically:
   source checkout, and can be disabled outright (see [Turning it off](#turning-it-off)); when
   disabled, **no request is made, no notice is printed, and no cache file is written**.
 
-  **Known limitation (proxy).** The check uses the Node.js built-in `fetch`, which does **not**
-  honour `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`. On a network that requires an egress proxy
-  the request simply fails and is silently ignored (fail-closed — no data leaves by another
-  route), but it also means the check **cannot be routed through your proxy for inspection or
-  policy enforcement**. Adding proxy support would require a new runtime dependency, which this
-  project deliberately avoids. This is recorded as an **open, unresolved tradeoff**; if your
-  environment requires all egress to be proxied, disable the check.
+  **Proxy routing.** Routing depends on the Node.js runtime configuration. Releases that support
+  Node's environment-proxy mode (including current Node 24/26 releases) can honor `HTTP_PROXY` /
+  `HTTPS_PROXY` / `NO_PROXY` when it is enabled with `NODE_USE_ENV_PROXY=1` or
+  `--use-env-proxy`; Node 22 may ignore those variables and attempt a direct connection. If
+  proxy routing is required, enforce it at the runtime or network layer, or disable the check.
 
 See [docs/DATA-FLOW.md](docs/DATA-FLOW.md) for the full list of network endpoints and what
 travels to each.

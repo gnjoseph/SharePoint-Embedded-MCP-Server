@@ -157,8 +157,12 @@ How it behaves:
 - **Channel-aware.** A prerelease install (e.g. `alpha`) is compared against its
   own dist-tag. The `latest` target is mentioned separately as **stable** only
   when it resolves to a non-prerelease version.
-- **Quiet.** Channel and stable targets are tracked independently, and each is
-  shown once per newer version rather than on every call.
+- **Quiet.** Channel and stable targets are tracked independently. A target is
+  claimed in the shared cache before its notice is returned, so processes
+  sharing that cache do not return duplicate notices. This is an at-most-once
+  guarantee: a process crash after the durable claim but before the client
+  receives the tool result can lose that notice. The update remains visible in
+  `status_get`.
 - **Unauthenticated, without a user identifier.** Exactly one unauthenticated
   `GET` of the package metadata — by default,
   `https://registry.npmjs.org/@microsoft%2fspe-mcp` — with no query string and
@@ -194,12 +198,13 @@ How it behaves:
 > policies, and compliance boundary depend on your configuration. Disable the
 > update check to remove registry egress entirely.
 
-> **Known limitation.** Node's built-in `fetch` does not honour `HTTP_PROXY` /
-> `HTTPS_PROXY` / `NO_PROXY`, so this request cannot be routed through an egress
-> proxy for inspection. It fails closed — the check is skipped, and no data
-> leaves by another route. Adding proxy support would require a new runtime
-> dependency, which this project avoids; this is an open, unresolved tradeoff.
-> Disable the check in environments where all egress must be proxied.
+> **Proxy routing.** Routing follows the Node.js runtime configuration. Releases
+> that support Node's environment-proxy mode (including current Node 24/26
+> releases) can honor `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` when it is
+> enabled with `NODE_USE_ENV_PROXY=1` or `--use-env-proxy`. Node 22 may ignore
+> those variables and attempt a direct connection. If proxy routing is
+> mandatory, enforce it at the runtime or network layer, or disable the update
+> check.
 
 It is skipped automatically when the server is run from a source checkout or in
 CI, and can be turned off explicitly:

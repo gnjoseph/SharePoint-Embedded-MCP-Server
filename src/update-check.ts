@@ -15,10 +15,11 @@
  * - When the installed build is a prerelease (e.g. `0.2.0-alpha.1`) the matching
  *   channel dist-tag (`alpha`) is the primary target, and a newer STABLE release
  *   is reported separately so prerelease users learn when GA lands.
- * - The result is surfaced by appending one short notice to exactly ONE
- *   subsequent successful tool result (plus `structuredContent.updateAvailable`),
- *   and by `status_get`. It is never printed to stdout — stdout is the JSON-RPC
- *   channel and writing to it corrupts the protocol.
+ * - The result is surfaced by appending one short notice to at most one
+ *   subsequent successful tool result across processes that share the data
+ *   directory (plus `structuredContent.updateAvailable`), and by `status_get`.
+ *   It is never printed to stdout — stdout is the JSON-RPC channel and writing
+ *   to it corrupts the protocol.
  *
  * WHERE THE DATA GOES (disclosure)
  * - The only endpoint contacted is the public npm registry, by default
@@ -74,12 +75,14 @@
  *   egress, lock errors, and stale-lock recovery therefore cannot cause a
  *   second request inside the reservation window while the cache is retained.
  *
- * KNOWN LIMITATION (accepted tradeoff, not a sign-off)
- * - Node's built-in `fetch` does not honour `HTTP_PROXY` / `HTTPS_PROXY` /
- *   `NO_PROXY`. Adding proxy support would require a new runtime dependency,
- *   which this package deliberately does not take. On a proxy-only network the
- *   probe simply fails closed (silent no-op) rather than bypassing the proxy.
- *   Operators who must not egress at all should turn the check off outright.
+ * PROXY ROUTING
+ * - Routing follows the running Node.js configuration. Releases that support
+ *   Node's environment-proxy mode (including current Node 24/26 releases) can
+ *   use `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` when it is enabled with
+ *   `NODE_USE_ENV_PROXY=1` or `--use-env-proxy`; Node 22 may ignore those
+ *   variables and attempt a direct connection. Operators who require enforced
+ *   proxy routing must configure it at the runtime/network layer or disable
+ *   this check outright.
  *
  * ZERO-NETWORK OPT-OUTS — each skips the check entirely (no request, no notice,
  * no cache read, no cache write): `--no-update-check`, `SPE_MCP_UPDATE_CHECK=false`,
@@ -87,7 +90,13 @@
  * `SPE_MCP_COLLECT_TELEMETRY=false`, any CI marker, and source checkouts.
  */
 
-import { existsSync, lstatSync, readdirSync, unlinkSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  existsSync,
+  lstatSync,
+  readdirSync,
+  unlinkSync,
+} from "node:fs";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -133,9 +142,6 @@ export const FAILURE_BACKOFF_MS = CHECK_TTL_MS;
  * authoritative 24-hour request gate even when a stale lock is reclaimed.
  */
 export const REFRESH_LOCK_STALE_MS = 30_000;
-
-/** Cap on remembered "already told the user about this version" entries. */
-const MAX_NOTIFIED_ENTRIES = 10;
 
 /** Cap on a dist-tag name we are willing to look at. */
 const MAX_TAG_NAME_LENGTH = 64;
@@ -303,8 +309,9 @@ type NoticeTarget =
   | { readonly kind: "channel"; readonly channel: string; readonly version: string }
   | { readonly kind: "stable"; readonly version: string };
 
-interface PendingUpdateNotice extends UpdateNotice {
-  readonly suppressionKeys: readonly string[];
+interface PendingUpdateNotice {
+  readonly channel: string | null;
+  readonly targets: readonly NoticeTarget[];
 }
 
 // ---------------------------------------------------------------------------
@@ -600,16 +607,8 @@ async function fetchDistTags(
 // Cache
 // ---------------------------------------------------------------------------
 
-/** Read the cache, tolerating absence, corruption, and secure-fs rejections. */
-function readCache(): UpdateCache | null {
-  let raw: string | null;
-  try {
-    raw = readSecureFile(getUpdateCacheFile());
-  } catch {
-    return null;
-  }
-  if (raw === null) return null;
-
+/** Parse the owner-only cache after secure-fs has read it. */
+function parseCache(raw: string): UpdateCache | null {
   try {
     const parsed: unknown = JSON.parse(raw);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
@@ -636,11 +635,36 @@ function readCache(): UpdateCache | null {
       channelTag: isSafeTagName(candidate.channelTag) ? candidate.channelTag : undefined,
       channelVersion:
         typeof candidate.channelVersion === "string" ? candidate.channelVersion : undefined,
-      notifiedFor: notified.slice(-MAX_NOTIFIED_ENTRIES),
+      // Never evict a delivered target while this cache is retained. Otherwise
+      // a dist-tag rollback could make an old target appear unannounced again.
+      notifiedFor: [...new Set(notified)],
     };
   } catch {
     return null;
   }
+}
+
+type CacheReadResult =
+  | { readonly state: "value"; readonly cache: UpdateCache }
+  | { readonly state: "missing" | "invalid" | "unreadable" };
+
+/** Read the cache while preserving the distinction needed by notice claims. */
+function readCacheResult(): CacheReadResult {
+  let raw: string | null;
+  try {
+    raw = readSecureFile(getUpdateCacheFile());
+  } catch {
+    return { state: "unreadable" };
+  }
+  if (raw === null) return { state: "missing" };
+  const cache = parseCache(raw);
+  return cache ? { state: "value", cache } : { state: "invalid" };
+}
+
+/** Read the cache, tolerating absence, corruption, and secure-fs rejections. */
+function readCache(): UpdateCache | null {
+  const result = readCacheResult();
+  return result.state === "value" ? result.cache : null;
 }
 
 /** Persist the cache with owner-only permissions. Returns false on any refusal. */
@@ -649,7 +673,7 @@ function writeCache(cache: UpdateCache): boolean {
     ensureSecureDir(getDataDir());
     writeSecureFileAtomic(
       getUpdateCacheFile(),
-      JSON.stringify({ ...cache, notifiedFor: cache.notifiedFor.slice(-MAX_NOTIFIED_ENTRIES) }, null, 2),
+      JSON.stringify({ ...cache, notifiedFor: [...new Set(cache.notifiedFor)] }, null, 2),
     );
     return true;
   } catch {
@@ -722,26 +746,9 @@ function writeCacheForGeneration(
   return false;
 }
 
-/** Ephemeral owner-only lock beside the update cache. */
-function getRefreshLockFile(): string {
-  return `${getUpdateCacheFile()}.lock`;
-}
-
-/** Serializes recovery of an abandoned refresh lock. */
-function getRefreshRecoveryLockFile(): string {
-  return `${getRefreshLockFile()}.recovery`;
-}
-
-/**
- * Whether an owner-only lock path currently exists. A security/read error is
- * treated as "present" so acquisition fails closed.
- */
-function secureLockExists(file: string): boolean {
-  try {
-    return readSecureFile(file) !== null;
-  } catch {
-    return true;
-  }
+/** Prefix for unique owner-only lock contenders beside the update cache. */
+function getRefreshLockPrefix(): string {
+  return `${getUpdateCacheFile()}.lock-`;
 }
 
 /** Parsed ownership data for one of this module's transient lock files. */
@@ -786,22 +793,62 @@ function lockOwnerMayBeAlive(raw: string): boolean {
   }
 }
 
+interface RefreshLockRecord {
+  readonly pid: number;
+  readonly createdAt: number;
+  readonly id: string;
+  readonly state: "choosing" | "ready";
+  readonly ticket?: number;
+}
+
+/** Parse one unique bakery-lock contender. Invalid metadata fails closed. */
+function refreshLockRecord(raw: string): RefreshLockRecord | null {
+  const owner = lockOwner(raw);
+  if (!owner) return null;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (
+      typeof parsed["id"] !== "string" ||
+      parsed["id"].length === 0 ||
+      parsed["id"].length > 64 ||
+      (parsed["state"] !== "choosing" && parsed["state"] !== "ready")
+    ) {
+      return null;
+    }
+    if (
+      parsed["state"] === "ready" &&
+      (!Number.isSafeInteger(parsed["ticket"]) || (parsed["ticket"] as number) <= 0)
+    ) {
+      return null;
+    }
+    return {
+      ...owner,
+      id: parsed["id"],
+      state: parsed["state"],
+      ticket: parsed["state"] === "ready" ? (parsed["ticket"] as number) : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Remove abandoned temp inodes left if a process exited while atomically
  * publishing a lock. These names are never synchronization points, so deleting
- * an old malformed temp is fail-closed: at worst its still-live creator's link
- * operation fails and no request occurs.
+ * an old malformed temp is fail-closed: at worst its still-live creator's
+ * publication fails and no request occurs.
  */
 function cleanupAbandonedUpdateTemps(now: number): void {
   const dir = getDataDir();
-  const prefixes = [
-    `${basename(getUpdateCacheFile())}.tmp-`,
-    `${basename(getRefreshLockFile())}.tmp-`,
-    `${basename(getRefreshRecoveryLockFile())}.tmp-`,
-  ];
+  const cacheTempPrefix = `${basename(getUpdateCacheFile())}.tmp-`;
+  const lockPrefix = basename(getRefreshLockPrefix());
   try {
     for (const name of readdirSync(dir)) {
-      if (!prefixes.some((prefix) => name.startsWith(prefix))) continue;
+      const isCacheTemp = name.startsWith(cacheTempPrefix);
+      const isLockTemp = name.startsWith(lockPrefix) && name.includes(".tmp-");
+      if (!isCacheTemp && !isLockTemp) {
+        continue;
+      }
       const file = join(dir, name);
       try {
         const stat = lstatSync(file);
@@ -824,98 +871,165 @@ function cleanupAbandonedUpdateTemps(now: number): void {
 }
 
 /**
- * Remove an abandoned regular-file lock, but never follow or remove a symlink
- * or non-file entry. Returns true only when the path is absent afterward.
- *
- * Refresh-lock callers invoke this while holding the recovery lock. Normal
- * acquirers check that recovery lock both before and after creating the refresh
- * lock, closing the stale-observer/replacement race.
+ * Return the exact contents of a regular-file lock only when it is old enough
+ * and its recorded local process has exited. Malformed, live, symlink, and
+ * unreadable entries fail closed.
  */
-function removeStaleLock(file: string, now: number): boolean {
+function abandonedLockContents(file: string, now: number): string | null {
   try {
-    const first = readSecureFile(file);
-    if (first === null) return true;
-
+    const raw = readSecureFile(file);
+    if (raw === null) return null;
     const stat = lstatSync(file);
-    if (stat.isSymbolicLink() || !stat.isFile()) return false;
+    if (stat.isSymbolicLink() || !stat.isFile()) return null;
     const age = now - stat.mtimeMs;
-    if (!Number.isFinite(age) || age < REFRESH_LOCK_STALE_MS) return false;
-    if (lockOwnerMayBeAlive(first)) return false;
+    if (!Number.isFinite(age) || age < REFRESH_LOCK_STALE_MS) return null;
+    return lockOwnerMayBeAlive(raw) ? null : raw;
+  } catch {
+    return null;
+  }
+}
 
-    // Re-read the ownership token immediately before unlinking. This narrows
-    // the release/reacquire race so an old observer does not remove a successor
-    // process's lock.
-    if (readSecureFile(file) !== first) return false;
-    unlinkSync(file);
-    return true;
-  } catch (error) {
-    // A concurrent owner may have released the lock after our first check.
-    return (error as NodeJS.ErrnoException)?.code === "ENOENT";
+/** List fully published, unique bakery-lock contenders. */
+function listRefreshLocks(): string[] {
+  const prefix = basename(getRefreshLockPrefix());
+  try {
+    return readdirSync(getDataDir())
+      .filter((name) => name.startsWith(prefix) && !name.includes(".tmp-"))
+      .map((name) => join(getDataDir(), name));
+  } catch {
+    // An unreadable directory must block acquisition, not enable it.
+    return [getRefreshLockPrefix()];
+  }
+}
+
+/**
+ * Remove abandoned unique lock contenders.
+ *
+ * Contender names are UUID-based and never reused. Deleting a proven-dead
+ * contender therefore cannot remove a successor synchronization object.
+ */
+function cleanupAbandonedRefreshLocks(now: number): void {
+  for (const marker of listRefreshLocks()) {
+    if (!abandonedLockContents(marker, now)) continue;
+    try {
+      unlinkSync(marker);
+    } catch {
+      // Another cleanup observer may already have removed the unique contender.
+    }
+  }
+}
+
+type RefreshLockRead =
+  | { readonly state: "missing" }
+  | { readonly state: "invalid" }
+  | { readonly state: "present"; readonly record: RefreshLockRecord };
+
+/** Read one contender while distinguishing disappearance from invalid state. */
+function readRefreshLock(file: string): RefreshLockRead {
+  try {
+    const raw = readSecureFile(file);
+    if (raw === null) {
+      return existsSync(file) ? { state: "invalid" } : { state: "missing" };
+    }
+    const record = refreshLockRecord(raw);
+    return record ? { state: "present", record } : { state: "invalid" };
+  } catch {
+    return { state: "invalid" };
   }
 }
 
 /**
  * Atomically acquire the cross-process refresh lock.
  *
- * Any filesystem/security error fails closed: no lock means no registry
- * request. A stale lock is reclaimed once and acquisition is retried.
+ * This is a fail-fast Lamport bakery protocol over owner-only files:
+ * 1. publish a never-reused UUID contender in `choosing` state;
+ * 2. choose one more than the largest published ticket;
+ * 3. atomically publish that ticket; and
+ * 4. enter only when no contender is still choosing and no ready contender has
+ *    the lower `(ticket, UUID)` tuple.
+ *
+ * A contender that starts after step 4 observes this process's ready ticket and
+ * loses. Concurrent choosers either observe one another or cause one/both calls
+ * to fail closed. Crashed contenders are reclaimed only through their unique
+ * paths after the owner is proven dead, so no observer ever unlinks or renames a
+ * shared pathname that a successor could have replaced.
  */
 function acquireRefreshLock(now: number): string | null {
-  const file = getRefreshLockFile();
-  const recoveryFile = getRefreshRecoveryLockFile();
-  // The local PID is used only to prove that a stale lock owner is gone before
-  // replacement. It is transient, never enters the cache/request, and is
-  // disclosed in PRIVACY.md.
-  const token = JSON.stringify({ pid: process.pid, createdAt: now });
+  const id = randomUUID();
+  const file = `${getRefreshLockPrefix()}${id}`;
+  const choosing = JSON.stringify({
+    pid: process.pid,
+    createdAt: now,
+    id,
+    state: "choosing",
+  });
+  let acquired = false;
   try {
     ensureSecureDir(getDataDir());
     cleanupAbandonedUpdateTemps(now);
+    cleanupAbandonedRefreshLocks(now);
+    if (!tryCreateSecureFileExclusive(file, choosing)) return null;
 
-    // A crashed recovery operation must not block forever. Multiple contenders
-    // may observe it as stale, but each revalidates the main lock under whichever
-    // recovery lock it obtains; a newly created main lock is never stale.
-    if (secureLockExists(recoveryFile) && !removeStaleLock(recoveryFile, now)) {
-      return null;
+    let maxTicket = 0;
+    for (const contender of listRefreshLocks()) {
+      if (contender === file) continue;
+      const read = readRefreshLock(contender);
+      if (read.state === "missing") continue;
+      if (read.state === "invalid") return null;
+      if (read.record.state === "ready") {
+        maxTicket = Math.max(maxTicket, read.record.ticket ?? 0);
+      }
     }
+    if (!Number.isSafeInteger(maxTicket) || maxTicket >= Number.MAX_SAFE_INTEGER) return null;
 
-    // Fast path. Re-check recovery AFTER the atomic create: if a stale-lock
-    // reclaimer raced us, surrender our lock before any cache write or egress.
-    if (tryCreateSecureFileExclusive(file, token)) {
-      if (secureLockExists(recoveryFile)) {
-        releaseLock(file, token);
+    const ticket = maxTicket + 1;
+    writeSecureFileAtomic(
+      file,
+      JSON.stringify({
+        pid: process.pid,
+        createdAt: now,
+        id,
+        state: "ready",
+        ticket,
+      }),
+    );
+
+    for (const contender of listRefreshLocks()) {
+      if (contender === file) continue;
+      const read = readRefreshLock(contender);
+      if (read.state === "missing") continue;
+      if (read.state === "invalid" || read.record.state === "choosing") return null;
+      const otherTicket = read.record.ticket;
+      if (
+        otherTicket === undefined ||
+        otherTicket < ticket ||
+        (otherTicket === ticket && read.record.id < id)
+      ) {
         return null;
       }
-      return token;
     }
 
-    const recoveryToken = token;
-    if (!tryCreateSecureFileExclusive(recoveryFile, recoveryToken)) return null;
-    try {
-      // Revalidate under the recovery lock. If another contender replaced the
-      // stale lock, its fresh mtime prevents us from removing it.
-      if (!removeStaleLock(file, now)) return null;
-      return tryCreateSecureFileExclusive(file, token) ? token : null;
-    } finally {
-      releaseLock(recoveryFile, recoveryToken);
-    }
+    acquired = true;
+    return file;
   } catch {
     return null;
+  } finally {
+    if (!acquired) releaseRefreshLock(file);
   }
 }
 
-/** Release only the lock at `file` created with `token`. */
-function releaseLock(file: string, token: string): void {
+/**
+ * Release this caller's never-reused contender path.
+ *
+ * No token reread is needed: the protocol never creates a successor at this
+ * UUID pathname, which removes the read-then-unlink pathname race entirely.
+ */
+function releaseRefreshLock(file: string): void {
   try {
-    if (readSecureFile(file) !== token) return;
     unlinkSync(file);
   } catch {
-    // Best-effort. A surviving lock is reclaimed after REFRESH_LOCK_STALE_MS.
+    // Best-effort. A surviving contender is reclaimed after the owner exits.
   }
-}
-
-/** Release only the refresh lock created by this caller. */
-function releaseRefreshLock(token: string): void {
-  releaseLock(getRefreshLockFile(), token);
 }
 
 /** Whether a cache entry is still authoritative for `registry` and this build. */
@@ -1149,7 +1263,11 @@ async function runUpdateCheck(options: StartUpdateCheckOptions): Promise<void> {
     }
 
     const now = Date.now();
-    const cached = readCache();
+    // Capture logout/reset's generation before the first cache read. If it
+    // advances anywhere before the under-lock reread, this run started on a
+    // superseded view and must not adopt the new generation or recreate state.
+    const deletionGenerationAtStart = readDeletionGeneration();
+    let cached = readCache();
     let fresh = cached && isCacheFresh(cached, registry, now) ? cached : null;
     let refreshLock: string | null = null;
     let deletionGeneration: string | null = null;
@@ -1160,6 +1278,21 @@ async function runUpdateCheck(options: StartUpdateCheckOptions): Promise<void> {
         // Another process may have completed between our first cache read and
         // lock acquisition. Re-check under the lock before reserving a request.
         const afterLock = readCache();
+        // Even when this entry is stale, its suppression history is now the
+        // authoritative one. A notice claim may have landed after `cached` was
+        // read but before this lock was acquired; carrying the initial history
+        // forward would erase that claim and permit a duplicate notice.
+        cached = afterLock;
+        if (readDeletionGeneration() !== deletionGenerationAtStart) {
+          releaseRefreshLock(refreshLock);
+          refreshLock = null;
+          status = {
+            enabled: true,
+            state: "unavailable",
+            currentVersion: PACKAGE_VERSION,
+          };
+          return;
+        }
         fresh = afterLock && isCacheFresh(afterLock, registry, now) ? afterLock : null;
       } else {
         // The lock owner may have completed between contention and this read.
@@ -1183,7 +1316,7 @@ async function runUpdateCheck(options: StartUpdateCheckOptions): Promise<void> {
       releaseRefreshLock(refreshLock);
       refreshLock = null;
     }
-    if (!fresh) deletionGeneration = readDeletionGeneration();
+    if (!fresh) deletionGeneration = deletionGenerationAtStart;
 
     let tags: Record<string, string> | null;
     let checkedAt: number;
@@ -1271,13 +1404,20 @@ async function runUpdateCheck(options: StartUpdateCheckOptions): Promise<void> {
     const channel = releaseChannel(current);
     const channelVersion = newerTagVersion(tags ?? {}, channel, current);
     const stableVersion = newerStableVersion(tags ?? {}, current);
-    const channelTarget =
+    const rawChannelTarget =
       channel && channelVersion
         ? ({ kind: "channel", channel, version: channelVersion } as const)
         : undefined;
     const stableTarget = stableVersion
       ? ({ kind: "stable", version: stableVersion } as const)
       : undefined;
+    // A channel dist-tag is allowed to point at a GA. When it converges with
+    // `latest`, represent the target once as stable so the notice names
+    // `@latest` and only the stable suppression key is consumed.
+    const channelTarget =
+      rawChannelTarget?.version === stableTarget?.version
+        ? undefined
+        : rawChannelTarget;
     const targets: NoticeTarget[] = [
       ...(channelTarget ? [channelTarget] : []),
       ...(stableTarget ? [stableTarget] : []),
@@ -1312,11 +1452,9 @@ async function runUpdateCheck(options: StartUpdateCheckOptions): Promise<void> {
       updateAvailable: update,
     };
 
-    // Per-target suppression: each newer version is announced exactly once, even
-    // across restarts. The suppression entry is persisted by
-    // `takePendingUpdateNotice()` at *delivery* time, not here: a process that
-    // probes and then exits before any tool call would otherwise burn the only
-    // announcement without the user ever seeing it.
+    // Per-target suppression is claimed atomically by
+    // `takePendingUpdateNotice()`, not here: a process that probes and then exits
+    // before any tool call leaves the announcement available to another process.
     const unnotifiedTargets = targets.filter(
       (target) => !isTargetNotified(notifiedFor, target),
     );
@@ -1338,9 +1476,8 @@ async function runUpdateCheck(options: StartUpdateCheckOptions): Promise<void> {
     if (!noticeUpdate) return;
 
     pendingNotice = {
-      text: renderNotice(noticeUpdate),
-      updateAvailable: noticeUpdate,
-      suppressionKeys: unnotifiedTargets.map(targetSuppressionKey),
+      channel,
+      targets: unnotifiedTargets,
     };
     logger.debug(`Update available: ${PACKAGE_VERSION} -> ${latest}`);
   } catch {
@@ -1379,17 +1516,17 @@ export function startUpdateCheck(options: StartUpdateCheckOptions = {}): void {
 }
 
 /**
- * Take the pending notice, clearing it.
+ * Atomically claim and take the pending notice.
  *
- * Returning-and-clearing is what makes the notice appear on exactly one tool
- * result: whichever call happens to run after the probe resolves gets it, and
- * every later call sees `null`.
+ * The claim is durably written before a notice is returned, so simultaneous
+ * processes sharing a data directory cannot both return the same target. If a
+ * process exits after that durable claim but before its MCP response reaches the
+ * client, the notice can be missed rather than duplicated; filesystem state
+ * alone cannot make response delivery transactional.
  *
- * Cross-process suppression is persisted *here*, at delivery, rather than when
- * the probe found the update: a process that exits before any tool call leaves
- * the cache untouched, so the next process still announces the version. The
- * cache is re-read immediately before writing under the same cross-process lock
- * as refreshes, so concurrent entries are merged rather than clobbered.
+ * A transient lock/security failure keeps the process-local notice pending for a
+ * later tool call. An absent cache (for example after logout) drops the notice
+ * rather than returning something that cannot be claimed cross-process.
  *
  * An absent cache file is never re-created here: `spe-mcp logout` deletes it,
  * and delivery must not resurrect state the user just erased.
@@ -1398,8 +1535,29 @@ export function takePendingUpdateNotice(): UpdateNotice | null {
   const pending = pendingNotice;
   pendingNotice = null;
   if (!pending) return null;
-  persistNotified(pending.suppressionKeys);
-  return { text: pending.text, updateAvailable: pending.updateAvailable };
+
+  const claim = claimNoticeTargets(pending.targets);
+  if (claim.state === "retry") {
+    pendingNotice ??= pending;
+    return null;
+  }
+  if (claim.state !== "claimed") return null;
+
+  const channelTarget = claim.targets.find(
+    (target): target is Extract<NoticeTarget, { kind: "channel" }> =>
+      target.kind === "channel",
+  );
+  const stableTarget = claim.targets.find(
+    (target): target is Extract<NoticeTarget, { kind: "stable" }> =>
+      target.kind === "stable",
+  );
+  const updateAvailable = buildUpdateAvailable(
+    pending.channel,
+    channelTarget,
+    stableTarget,
+  );
+  if (!updateAvailable) return null;
+  return { text: renderNotice(updateAvailable), updateAvailable };
 }
 
 /** Namespaced suppression key so channel and stable targets advance independently. */
@@ -1423,28 +1581,46 @@ function isTargetNotified(notifiedFor: readonly string[], target: NoticeTarget):
   );
 }
 
-/** Record target keys as announced, serialized with refresh cache writes. */
-function persistNotified(suppressionKeys: readonly string[]): void {
+type NoticeClaimResult =
+  | { readonly state: "claimed"; readonly targets: readonly NoticeTarget[] }
+  | { readonly state: "already-claimed" }
+  | { readonly state: "retry" };
+
+/**
+ * Claim only the targets still unannounced in the authoritative cache.
+ *
+ * The read, comparison, and write all happen under the refresh lock. Returning
+ * the represented targets only after the atomic write is what prevents two
+ * processes from both returning the same notice.
+ */
+function claimNoticeTargets(targets: readonly NoticeTarget[]): NoticeClaimResult {
   let lock: string | null = null;
   try {
-    // No cache (never written, or deleted by logout) => do not create a lock or
-    // resurrect state the user intentionally removed.
-    if (!readCache()) return;
+    const beforeLock = readCacheResult();
+    if (beforeLock.state === "unreadable") return { state: "retry" };
+    if (beforeLock.state !== "value") return { state: "already-claimed" };
     lock = acquireRefreshLock(Date.now());
-    if (!lock) return;
+    if (!lock) return { state: "retry" };
     const deletionGeneration = readDeletionGeneration();
 
-    const cache = readCache();
-    // No cache (never written, or deleted by logout) => nothing to update.
-    if (!cache) return;
-    const missing = suppressionKeys.filter((key) => !cache.notifiedFor.includes(key));
-    if (missing.length === 0) return;
-    writeCacheForGeneration(
-      { ...cache, notifiedFor: [...cache.notifiedFor, ...missing] },
+    const afterLock = readCacheResult();
+    if (afterLock.state === "unreadable") return { state: "retry" };
+    if (afterLock.state !== "value") return { state: "already-claimed" };
+    const cache = afterLock.cache;
+    const unclaimed = targets.filter(
+      (target) => !isTargetNotified(cache.notifiedFor, target),
+    );
+    if (unclaimed.length === 0) return { state: "already-claimed" };
+    const suppressionKeys = unclaimed.map(targetSuppressionKey);
+    const persisted = writeCacheForGeneration(
+      { ...cache, notifiedFor: [...cache.notifiedFor, ...suppressionKeys] },
       deletionGeneration,
     );
+    return persisted
+      ? { state: "claimed", targets: unclaimed }
+      : { state: "retry" };
   } catch {
-    // Best-effort: at worst the notice is shown once more next run.
+    return { state: "retry" };
   } finally {
     if (lock) releaseRefreshLock(lock);
   }
@@ -1512,8 +1688,8 @@ export const __testing = {
   readCappedText,
   readCache,
   writeCache,
-  getRefreshLockFile,
-  getRefreshRecoveryLockFile,
+  getRefreshLockPrefix,
+  listRefreshLocks,
   getDeletionGenerationFile,
   acquireRefreshLock,
   releaseRefreshLock,
