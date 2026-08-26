@@ -1761,7 +1761,7 @@ test('local Dockerfiles require immutable frontend and external base images', ()
   assert.equal(dynamicRegistry[0].reason, 'not-digest-pinned');
 });
 
-test('local Dockerfiles reject remote ADD and validate explicit external stage imports', () => {
+test('local Dockerfiles reject remote or dynamic ADD and validate explicit external stage imports', () => {
   const floating = checkDockerfileSource(
     [
       `FROM node@sha256:${'1'.repeat(64)} AS build`,
@@ -1800,6 +1800,29 @@ test('local Dockerfiles reject remote ADD and validate explicit external stage i
   );
   assert.equal(jsonAdd.length, 1);
   assert.equal(jsonAdd[0].reason, 'unsupported-remote-source');
+
+  const dynamicAdd = checkDockerfileSource(
+    [
+      `FROM node@sha256:${'6'.repeat(64)} AS build`,
+      'add    $ARCHIVE    /tmp/archive.tgz',
+      'ADD    ${ARCHIVE_NAME}    /tmp/archive-two.tgz',
+      'ADD [ "${ARCHIVE_JSON}", "/tmp/archive-json.tgz" ]',
+      'AdD \\',
+      '  "$ARCHIVE_MULTI" \\',
+      '  /tmp/archive-multi.tgz',
+      '',
+    ].join('\n'),
+    'Dockerfile',
+  );
+  assert.deepEqual(
+    dynamicAdd.map((entry) => entry.reason),
+    [
+      'unsupported-dynamic-source',
+      'unsupported-dynamic-source',
+      'unsupported-dynamic-source',
+      'unsupported-dynamic-source',
+    ],
+  );
 });
 
 test('local Dockerfile references fail closed when missing, escaping, or malformed', () => {

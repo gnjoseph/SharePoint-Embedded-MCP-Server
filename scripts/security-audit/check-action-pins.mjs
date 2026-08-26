@@ -12,7 +12,8 @@
  * action metadata is scanned separately. Docker references must use an
  * immutable `sha256` digest. A local action that names a Dockerfile causes that
  * exact file to be parsed; dynamic, missing, escaping, or ambiguous image
- * references fail closed.
+ * references fail closed, and `ADD` sources must be provably literal local
+ * paths.
  *
  * The check parses YAML before inspecting executable references. Unsupported
  * or ambiguous constructs fail closed rather than being ignored.
@@ -50,6 +51,7 @@ const CONTAINER_IMAGE_DIGEST_RE = new RegExp(
   `^${STATIC_IMAGE_PREFIX}@sha256:[0-9a-fA-F]{64}$`,
 );
 const REMOTE_SOURCE_RE = /^(?:[A-Za-z][A-Za-z0-9+.-]*:|git@)/u;
+const DYNAMIC_ADD_SOURCE_RE = /\$/u;
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'coverage', '.security-audit']);
 const ACTION_METADATA_NAMES = new Set(['action.yml', 'action.yaml']);
 
@@ -477,11 +479,35 @@ function validateDockerImageReference(reference, file, line, stageAliases, stage
 }
 
 /**
+ * `ADD` can import either local build-context paths or remote URLs. The pin
+ * policy accepts only sources that remain provably local after this parser has
+ * resolved quoting/JSON-array syntax; any `$`-driven interpolation is
+ * unsupported because the parser cannot prove what concrete source Docker will
+ * fetch after environment replacement.
+ *
+ * @param {string} source
+ * @param {string} file
+ * @param {number} line
+ * @returns {{ file: string, line: number, uses: string, reason: string } | null}
+ */
+function validateAddSource(source, file, line) {
+  if (DYNAMIC_ADD_SOURCE_RE.test(source)) {
+    return { file, line, uses: source, reason: 'unsupported-dynamic-source' };
+  }
+  if (REMOTE_SOURCE_RE.test(source)) {
+    return { file, line, uses: source, reason: 'unsupported-remote-source' };
+  }
+  return null;
+}
+
+/**
  * Parses a Dockerfile conservatively and checks every explicit external
  * frontend/image reference plus every Dockerfile construct that can import
  * external content declaratively (`ADD`, `COPY --from`, `RUN --mount=from`).
  * Local stage aliases, prior numeric stage indexes, and `scratch` are treated
- * as in-repository / in-file references rather than registry inputs.
+ * as in-repository / in-file references rather than registry inputs. `ADD`
+ * sources must stay literal local paths after parsing; remote or dynamic
+ * sources are rejected.
  *
  * @param {string} text
  * @param {string} file
@@ -619,14 +645,8 @@ export function checkDockerfileSource(text, file) {
       }
       if (keyword === 'ADD') {
         for (const source of parsed.sources) {
-          if (REMOTE_SOURCE_RE.test(source)) {
-            violations.push({
-              file,
-              line: instruction.line,
-              uses: source,
-              reason: 'unsupported-remote-source',
-            });
-          }
+          const violation = validateAddSource(source, file, instruction.line);
+          if (violation) violations.push(violation);
         }
       }
       continue;
