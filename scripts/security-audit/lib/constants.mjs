@@ -103,6 +103,35 @@ export const ALLOWED_MODELS = Object.freeze(['claude-opus-5']);
 /** Default model for the audit. */
 export const DEFAULT_MODEL = 'claude-opus-5';
 
+/** Public npm registry origin used by the dependency-audit workflows. */
+export const NPM_AUDIT_REGISTRY = 'https://registry.npmjs.org/';
+
+/** Allowed protocol for dependency-audit lockfile `resolved` URLs. */
+export const NPM_AUDIT_ALLOWED_PROTOCOL = 'https:';
+
+/** Allowed hostnames for dependency-audit lockfile `resolved` URLs. */
+export const NPM_AUDIT_ALLOWED_HOSTS = Object.freeze(['registry.npmjs.org']);
+
+/** Manifest/lockfile names copied into the isolated dependency-audit workspace. */
+export const NPM_AUDIT_FILES = Object.freeze({
+  manifest: 'package.json',
+  lockfile: 'package-lock.json',
+});
+
+/** Dependency maps whose values may steer npm away from the public registry. */
+export const NPM_AUDIT_DEPENDENCY_KEYS = Object.freeze([
+  'dependencies',
+  'devDependencies',
+  'optionalDependencies',
+  'peerDependencies',
+]);
+
+/** Rewrite maps that may also carry non-registry dependency sources. */
+export const NPM_AUDIT_REWRITE_KEYS = Object.freeze(['overrides', 'resolutions']);
+
+/** Target-controlled install topologies that the lockfile-only audit does not model. */
+export const NPM_AUDIT_UNSUPPORTED_KEYS = Object.freeze(['workspaces', 'pnpm']);
+
 /** Accepted finding severities, ordered from most to least severe. */
 export const SEVERITIES = Object.freeze(['critical', 'high', 'medium', 'low']);
 

@@ -21,12 +21,13 @@ want — the working tree is both controller and target.
 | Script | Purpose | Exit codes |
 | --- | --- | --- |
 | `validate-target.mjs` | Validates repository-dispatch payload values: 40-hex SHA reachable from `main`, allowlisted scope/model, strict boolean dry-run. An empty/absent ref (scheduled runs or omitted payload) resolves to the `origin/main` tip and is then held to the same rules. Also publishes `target_ref` and `is_main_tip` for provenance | `0` ok, `1` rejected |
+| `validate-npm-audit-inputs.mjs` | Validates `package.json` / `package-lock.json` before `npm audit --package-lock-only`: only the public npm registry is allowed, workspace-like expansion is rejected, and unsupported source forms fail closed | `0` ok, `1` rejected |
 | `collect-corpus.mjs` | Collects the complete allowlisted corpus from `--repo-root` within hard caps, wraps each file in per-run nonce fences, and writes a manifest with repository-relative keys. Any eligible omitted or unreadable file fails the run | `0` ok, `1` error |
 | `build-prompt.mjs` | Renders `system.txt` (preamble) and `prompt.txt` (corpus + trusted suffix) from the manifest nonce | `0` ok, `1` error |
 | `validate-response.mjs` | Parses, schema-checks, rejects, and redacts the model response. A partial rejection writes only accepted findings to the sanitized report before failing, so CI can attempt the sole private egress | `0` ok, `1` malformed/no report, `3` rejected (sanitized report written; fail closed) |
 | `submit-report.mjs` | Submits the validated report as **one** private vulnerability report per audited SHA, de-duplicated by title. Prints only `report: submitted\|existing\|none\|failed` | `0` ok, `1` failed (fail closed) |
 | `sanitize-findings.mjs` | Reduces `npm audit` / gitleaks reports to counts only — no paths, rules, advisory URLs, GHSA or CVE identifiers | `0` ok, `1` error |
-| `check-action-pins.mjs` | Parses workflow/local-action YAML and referenced local-action Dockerfiles. External actions require a 40-hex commit pin plus version comment; external Docker metadata, base images, and frontend images require a 64-hex `sha256` digest | `0` clean, `1` violations/parse failure |
+| `check-action-pins.mjs` | Parses workflow/local-action YAML and referenced local-action Dockerfiles. External actions require a 40-hex commit pin plus version comment; explicit Dockerfile external references (`# syntax`, `FROM`, `COPY --from`, `RUN --mount=from`) must be digest-pinned, and remote `ADD` sources are rejected | `0` clean, `1` violations/parse failure |
 | `summarize.mjs` | Emits the public pass/fail literal and decides pass/fail | `0` pass, `1` a deterministic or enabled model job failed/cancelled |
 | `dry-run.mjs` | Offline end-to-end run against a synthetic response, honouring `--repo-root` | `0` ok, non-zero on failure |
 
@@ -116,6 +117,7 @@ tests/               node:test suites (no vitest, no coverage thresholds)
 ```bash
 node scripts/security-audit/validate-target.mjs --ref <40-hex-sha> --scope server-core
 node scripts/security-audit/validate-target.mjs --scope server-core   # empty ref -> origin/main tip
+node scripts/security-audit/validate-npm-audit-inputs.mjs
 node scripts/security-audit/collect-corpus.mjs  --scope server-core --out .security-audit
 node scripts/security-audit/build-prompt.mjs    --corpus .security-audit --out .security-audit
 node scripts/security-audit/validate-response.mjs \
@@ -128,6 +130,7 @@ node scripts/security-audit/check-action-pins.mjs
 The CI shape, where the audited commit lives under `target/`:
 
 ```bash
+node scripts/security-audit/validate-npm-audit-inputs.mjs --dir target
 node scripts/security-audit/collect-corpus.mjs \
   --scope server-core --out .security-audit --repo-root target
 node scripts/security-audit/check-action-pins.mjs \

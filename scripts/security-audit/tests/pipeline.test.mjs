@@ -44,6 +44,11 @@ import { loadControlCodes } from '../lib/controls.mjs';
 import { findRejectReasons, redact } from '../lib/redaction.mjs';
 import { validateFindings, extractJson } from '../validate-response.mjs';
 import { FULL_SHA } from '../validate-target.mjs';
+import {
+  validateAuditInputs,
+  validateLockfileObject,
+  validateManifestObject,
+} from '../validate-npm-audit-inputs.mjs';
 import { renderTemplate, templateValues } from '../build-prompt.mjs';
 import {
   checkDockerfileSource,
@@ -1027,6 +1032,157 @@ test('scanner sanitizers reject malformed successful-output shapes', () => {
   assert.throws(() => sanitizeGitleaks({}), /invalid gitleaks report/);
 });
 
+test('the committed package manifest and lockfile stay within the public audit policy', () => {
+  assert.doesNotThrow(() => validateAuditInputs(REPO_ROOT));
+});
+
+test('manifest validation rejects unsupported dependency source forms and workspace expansion', () => {
+  assert.doesNotThrow(() =>
+    validateManifestObject(
+      {
+        dependencies: { alpha: '^1.0.0' },
+        devDependencies: { bravo: '~2.0.0' },
+        overrides: { alpha: { charlie: '3.0.0' } },
+        resolutions: { delta: '4.0.0' },
+      },
+      'package.json',
+    ));
+
+  for (const [name, manifest, pattern] of [
+    ['file dependency', { dependencies: { alpha: 'file:../alpha.tgz' } }, /unsupported dependency source/],
+    ['git dependency', { devDependencies: { alpha: 'git+https://example.test/repo.git' } }, /unsupported dependency source/],
+    ['github shorthand', { peerDependencies: { alpha: 'octocat/example#v1' } }, /unsupported dependency source/],
+    ['override tarball', { overrides: { alpha: 'https://example.test/alpha.tgz' } }, /unsupported dependency source/],
+    ['resolution alias', { resolutions: { alpha: 'npm:beta@1.0.0' } }, /unsupported dependency source/],
+    ['workspaces', { workspaces: ['packages/*'] }, /unsupported workspaces audit input/],
+    ['pnpm config', { pnpm: { overrides: { alpha: '1.0.0' } } }, /unsupported pnpm audit input/],
+  ]) {
+    assert.throws(
+      () => validateManifestObject(manifest, 'package.json'),
+      pattern,
+      name,
+    );
+  }
+});
+
+test('lockfile validation rejects non-registry sources, links, and workspace-like package paths', () => {
+  const safeLockfile = {
+    name: 'audit-fixture',
+    lockfileVersion: 3,
+    requires: true,
+    packages: {
+      '': {
+        dependencies: { alpha: '^1.0.0' },
+      },
+      'node_modules/alpha': {
+        version: '1.0.0',
+        resolved: 'https://registry.npmjs.org/alpha/-/alpha-1.0.0.tgz',
+        integrity: 'sha512-abc',
+      },
+    },
+  };
+  assert.doesNotThrow(() => validateLockfileObject(safeLockfile, 'package-lock.json'));
+
+  for (const [name, lockfile, pattern] of [
+    [
+      'unsupported lockfile version',
+      { ...safeLockfile, lockfileVersion: 1 },
+      /unsupported lockfileVersion/,
+    ],
+    [
+      'workspace package path',
+      {
+        ...safeLockfile,
+        packages: {
+          ...safeLockfile.packages,
+          'packages/app': {
+            version: '1.0.0',
+            resolved: 'https://registry.npmjs.org/app/-/app-1.0.0.tgz',
+            integrity: 'sha512-def',
+          },
+        },
+      },
+      /unsupported package path/,
+    ],
+    [
+      'external resolved host',
+      {
+        ...safeLockfile,
+        packages: {
+          ...safeLockfile.packages,
+          'node_modules/alpha': {
+            version: '1.0.0',
+            resolved: 'https://example.test/alpha.tgz',
+            integrity: 'sha512-abc',
+          },
+        },
+      },
+      /resolved URL must stay on https:\/\/registry\.npmjs\.org\//,
+    ],
+    [
+      'linked dependency',
+      {
+        ...safeLockfile,
+        packages: {
+          ...safeLockfile.packages,
+          'node_modules/alpha': {
+            version: '1.0.0',
+            link: true,
+          },
+        },
+      },
+      /linked packages are not supported/,
+    ],
+    [
+      'source-form version',
+      {
+        ...safeLockfile,
+        packages: {
+          ...safeLockfile.packages,
+          'node_modules/alpha': {
+            version: 'file:../alpha',
+            resolved: 'https://registry.npmjs.org/alpha/-/alpha-1.0.0.tgz',
+            integrity: 'sha512-abc',
+          },
+        },
+      },
+      /unsupported dependency source/,
+    ],
+    [
+      'missing integrity',
+      {
+        ...safeLockfile,
+        packages: {
+          ...safeLockfile.packages,
+          'node_modules/alpha': {
+            version: '1.0.0',
+            resolved: 'https://registry.npmjs.org/alpha/-/alpha-1.0.0.tgz',
+          },
+        },
+      },
+      /resolved packages must carry integrity/,
+    ],
+    [
+      'legacy dependency graph source',
+      {
+        ...safeLockfile,
+        dependencies: {
+          alpha: {
+            version: 'workspace:*',
+          },
+        },
+      },
+      /unsupported dependency source/,
+    ],
+  ]) {
+    assert.throws(
+      () => validateLockfileObject(lockfile, 'package-lock.json'),
+      pattern,
+      name,
+    );
+  }
+});
+
 test('gitleaks reports never carry secret material', () => {
   const sanitized = sanitizeGitleaks([
     {
@@ -1605,6 +1761,47 @@ test('local Dockerfiles require immutable frontend and external base images', ()
   assert.equal(dynamicRegistry[0].reason, 'not-digest-pinned');
 });
 
+test('local Dockerfiles reject remote ADD and validate explicit external stage imports', () => {
+  const floating = checkDockerfileSource(
+    [
+      `FROM node@sha256:${'1'.repeat(64)} AS build`,
+      'ADD https://example.test/tool.tgz /tmp/tool.tgz',
+      'COPY --from=ghcr.io/example/tool:latest /bin/tool /bin/tool',
+      'RUN --mount=type=bind,from=ghcr.io/example/cache:latest,target=/cache true',
+      '',
+    ].join('\n'),
+    'Dockerfile',
+  );
+  assert.deepEqual(
+    floating.map((entry) => entry.reason),
+    ['unsupported-remote-source', 'not-digest-pinned', 'not-digest-pinned'],
+  );
+
+  const pinned = checkDockerfileSource(
+    [
+      `FROM node@sha256:${'2'.repeat(64)} AS build`,
+      'COPY --from=build /workspace/out /app/out',
+      'COPY --from=0 /workspace/out /app/out-from-index',
+      `COPY --from=ghcr.io/example/tool@sha256:${'3'.repeat(64)} /bin/tool /bin/tool`,
+      `RUN --mount=type=bind,from=ghcr.io/example/cache@sha256:${'4'.repeat(64)},target=/cache true`,
+      '',
+    ].join('\n'),
+    'Dockerfile',
+  );
+  assert.deepEqual(pinned, []);
+
+  const jsonAdd = checkDockerfileSource(
+    [
+      `FROM node@sha256:${'5'.repeat(64)}`,
+      'ADD ["https://example.test/tool.tgz", "/tmp/tool.tgz"]',
+      '',
+    ].join('\n'),
+    'Dockerfile',
+  );
+  assert.equal(jsonAdd.length, 1);
+  assert.equal(jsonAdd[0].reason, 'unsupported-remote-source');
+});
+
 test('local Dockerfile references fail closed when missing, escaping, or malformed', () => {
   for (const [name, image, setup, pattern] of [
     ['missing', 'Dockerfile', () => {}, /could not be read/],
@@ -1649,6 +1846,10 @@ test('local Dockerfile references fail closed when missing, escaping, or malform
         'Dockerfile',
       ),
     /heredocs are not supported/,
+  );
+  assert.throws(
+    () => checkDockerfileSource('FROM scratch\nCOPY --from=7 /tmp/file /tmp/file\n', 'Dockerfile'),
+    /unsupported Docker stage reference/,
   );
 });
 

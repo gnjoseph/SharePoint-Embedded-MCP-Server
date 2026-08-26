@@ -152,7 +152,10 @@ jobs:
       # Copy only the package manifests into a runner-owned directory. This
       # prevents an audited `.npmrc` or unrelated project content from affecting
       # either npm command. Empty runner-owned user/global config files plus an
-      # explicit public registry close the remaining npm configuration inputs.
+      # explicit public registry close the remaining npm configuration inputs,
+      # while the trusted preflight validator rejects unsupported source forms
+      # before npm runs. The audit itself stays lockfile-only and never installs
+      # target-controlled tarballs in this privileged job.
       - name: Prepare isolated dependency workspace
         env:
           AUDIT_NPM_DIR: ${{ runner.temp }}/security-audit-npm
@@ -165,22 +168,6 @@ jobs:
           cp target/package.json target/package-lock.json "${AUDIT_NPM_DIR}/"
           : > "${NPM_USER_CONFIG}"
           : > "${NPM_GLOBAL_CONFIG}"
-
-      # `--ignore-scripts`: the audit path must never execute repository or
-      # dependency lifecycle scripts from the commit under audit.
-      - name: Install dependencies without lifecycle scripts
-        working-directory: ${{ runner.temp }}/security-audit-npm
-        env:
-          NPM_USER_CONFIG: ${{ runner.temp }}/security-audit-npm/user.npmrc
-          NPM_GLOBAL_CONFIG: ${{ runner.temp }}/security-audit-npm/global.npmrc
-        run: |
-          npm ci \
-            --ignore-scripts \
-            --no-audit \
-            --fund=false \
-            --registry=https://registry.npmjs.org/ \
-            --userconfig="${NPM_USER_CONFIG}" \
-            --globalconfig="${NPM_GLOBAL_CONFIG}"
 
       # The report is written to the controller-owned workspace root so the
       # sanitizer never reads from, or writes into, the audited tree. `--json`
@@ -196,6 +183,13 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p "${GITHUB_WORKSPACE}/.security-audit"
+          validate_status=0
+          node "${GITHUB_WORKSPACE}/scripts/security-audit/validate-npm-audit-inputs.mjs" \
+            --dir . \
+            > "${GITHUB_WORKSPACE}/.security-audit/npm-audit-inputs.log" 2>&1 ||
+            validate_status=$?
+          rm -f "${GITHUB_WORKSPACE}/.security-audit/npm-audit-inputs.log"
+          [ "${validate_status}" -eq 0 ] || exit 1
           npm audit \
             --package-lock-only \
             --audit-level=high \

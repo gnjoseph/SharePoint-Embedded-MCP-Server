@@ -49,6 +49,7 @@ const DOCKER_DIGEST_RE = new RegExp(
 const CONTAINER_IMAGE_DIGEST_RE = new RegExp(
   `^${STATIC_IMAGE_PREFIX}@sha256:[0-9a-fA-F]{64}$`,
 );
+const REMOTE_SOURCE_RE = /^(?:[A-Za-z][A-Za-z0-9+.-]*:|git@)/u;
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'coverage', '.security-audit']);
 const ACTION_METADATA_NAMES = new Set(['action.yml', 'action.yaml']);
 
@@ -283,8 +284,204 @@ function extractLocalDockerImage(parsed, file) {
 }
 
 /**
- * Parses a Dockerfile conservatively and checks every external frontend and
- * `FROM` image. Local stage aliases and `scratch` are not registry references.
+ * Split an instruction shell fragment into tokens.
+ *
+ * Supports the quoting needed by the repository's Dockerfiles and rejects
+ * unterminated quotes or dangling escapes fail-closed.
+ *
+ * @param {string} text
+ * @param {string} file
+ * @param {number} line
+ * @returns {string[]}
+ */
+function splitShellWords(text, file, line) {
+  /** @type {string[]} */
+  const tokens = [];
+  let current = '';
+  let quote = '';
+  let escaped = false;
+
+  for (const character of text) {
+    if (escaped) {
+      current += character;
+      escaped = false;
+      continue;
+    }
+    if (quote === "'") {
+      if (character === "'") {
+        quote = '';
+      } else {
+        current += character;
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"') {
+        quote = '';
+      } else if (character === '\\') {
+        escaped = true;
+      } else {
+        current += character;
+      }
+      continue;
+    }
+    if (/\s/u.test(character)) {
+      if (current !== '') {
+        tokens.push(current);
+        current = '';
+      }
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      continue;
+    }
+    if (character === '\\') {
+      escaped = true;
+      continue;
+    }
+    current += character;
+  }
+
+  if (escaped || quote !== '') {
+    throw new Error(`${file}:${line}: unsupported Dockerfile quoting or escaping`);
+  }
+  if (current !== '') tokens.push(current);
+  return tokens;
+}
+
+/**
+ * @param {string} text
+ * @param {string} file
+ * @param {number} line
+ * @returns {{ options: string[], remainder: string }}
+ */
+function consumeInstructionOptions(text, file, line) {
+  const options = [];
+  let remainder = text.trim();
+  while (remainder.startsWith('--')) {
+    const match = /^(--[A-Za-z][A-Za-z0-9-]*(?:=[^\s]+)?)(?:\s+|$)/u.exec(remainder);
+    if (!match) {
+      throw new Error(`${file}:${line}: unsupported Dockerfile option syntax`);
+    }
+    options.push(match[1]);
+    remainder = remainder.slice(match[0].length).trimStart();
+  }
+  return { options, remainder };
+}
+
+/**
+ * @param {string} text
+ * @param {string} file
+ * @param {number} line
+ * @param {string} instruction
+ * @returns {string[]}
+ */
+function parseJsonStringArray(text, file, line, instruction) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error(`${file}:${line}: unsupported ${instruction} JSON-array syntax`);
+  }
+  if (
+    !Array.isArray(parsed) ||
+    parsed.length < 2 ||
+    parsed.some((value) => typeof value !== 'string')
+  ) {
+    throw new Error(`${file}:${line}: unsupported ${instruction} JSON-array syntax`);
+  }
+  return parsed;
+}
+
+/**
+ * @param {string} text
+ * @param {string} file
+ * @param {number} line
+ * @param {'ADD' | 'COPY'} instruction
+ * @returns {{ options: string[], sources: string[] }}
+ */
+function parseCopyLikeInstruction(text, file, line, instruction) {
+  const { options, remainder } = consumeInstructionOptions(text, file, line);
+  if (remainder === '') {
+    throw new Error(`${file}:${line}: ${instruction} sources are missing`);
+  }
+  if (remainder.startsWith('[')) {
+    const values = parseJsonStringArray(remainder, file, line, instruction);
+    return { options, sources: values.slice(0, -1) };
+  }
+
+  const tokens = splitShellWords(remainder, file, line);
+  if (tokens.length < 2) {
+    throw new Error(`${file}:${line}: ${instruction} sources are missing`);
+  }
+  return { options, sources: tokens.slice(0, -1) };
+}
+
+/**
+ * @param {string} option
+ * @param {string} key
+ * @returns {string | null}
+ */
+function optionValue(option, key) {
+  return option.startsWith(`--${key}=`) ? option.slice(key.length + 3) : null;
+}
+
+/**
+ * @param {string} value
+ * @param {string} file
+ * @param {number} line
+ * @returns {Map<string, string>}
+ */
+function parseMountSpec(value, file, line) {
+  const options = new Map();
+  for (const fragment of value.split(',')) {
+    if (fragment === '') {
+      throw new Error(`${file}:${line}: unsupported Dockerfile mount syntax`);
+    }
+    const separator = fragment.indexOf('=');
+    if (separator === -1) {
+      options.set(fragment, '');
+      continue;
+    }
+    const key = fragment.slice(0, separator);
+    const setting = fragment.slice(separator + 1);
+    if (key === '' || setting === '') {
+      throw new Error(`${file}:${line}: unsupported Dockerfile mount syntax`);
+    }
+    options.set(key, setting);
+  }
+  return options;
+}
+
+/**
+ * @param {string} reference
+ * @param {string} file
+ * @param {number} line
+ * @param {Set<string>} stageAliases
+ * @param {number} stageCount
+ * @returns {Array<{ file: string, line: number, uses: string, reason: string }>}
+ */
+function validateDockerImageReference(reference, file, line, stageAliases, stageCount) {
+  const normalized = reference.toLowerCase();
+  if (normalized === 'scratch') return [];
+  if (/^\d+$/u.test(reference)) {
+    if (Number(reference) >= stageCount) {
+      throw new Error(`${file}:${line}: unsupported Docker stage reference`);
+    }
+    return [];
+  }
+  if (stageAliases.has(normalized)) return [];
+  if (CONTAINER_IMAGE_DIGEST_RE.test(reference)) return [];
+  return [{ file, line, uses: reference, reason: 'not-digest-pinned' }];
+}
+
+/**
+ * Parses a Dockerfile conservatively and checks every explicit external
+ * frontend/image reference plus every Dockerfile construct that can import
+ * external content declaratively (`ADD`, `COPY --from`, `RUN --mount=from`).
+ * Local stage aliases, prior numeric stage indexes, and `scratch` are treated
+ * as in-repository / in-file references rather than registry inputs.
  *
  * @param {string} text
  * @param {string} file
@@ -296,6 +493,7 @@ export function checkDockerfileSource(text, file) {
   /** @type {Array<{ line: number, value: string }>} */
   const instructions = [];
   const stageAliases = new Set();
+  let stageCount = 0;
   const lines = text.split(/\r?\n/);
   let pending = '';
   let pendingLine = 0;
@@ -356,49 +554,102 @@ export function checkDockerfileSource(text, file) {
       throw new Error(`${file}:${instruction.line}: Dockerfile heredocs are not supported`);
     }
 
-    const from = /^FROM\s+(.+)$/i.exec(instruction.value);
-    if (!from) continue;
+    const match = /^([A-Za-z]+)\s+(.+)$/u.exec(instruction.value);
+    if (!match) {
+      throw new Error(`${file}:${instruction.line}: unsupported Dockerfile instruction`);
+    }
 
-    const tokens = from[1].trim().split(/\s+/);
-    while (tokens[0]?.startsWith('--')) {
-      const option = tokens.shift();
-      if (!/^--[A-Za-z][A-Za-z0-9-]*=\S+$/.test(option)) {
-        throw new Error(`${file}:${instruction.line}: unsupported Dockerfile FROM option`);
+    const keyword = match[1].toUpperCase();
+    const body = match[2].trim();
+    if (keyword === 'FROM') {
+      const tokens = splitShellWords(body, file, instruction.line);
+      while (tokens[0]?.startsWith('--')) {
+        const option = tokens.shift();
+        if (!/^--[A-Za-z][A-Za-z0-9-]*=\S+$/u.test(option)) {
+          throw new Error(`${file}:${instruction.line}: unsupported Dockerfile FROM option`);
+        }
+      }
+      const image = tokens.shift();
+      if (!image) {
+        throw new Error(`${file}:${instruction.line}: Dockerfile FROM image is missing`);
+      }
+
+      let alias = '';
+      if (tokens.length > 0) {
+        if (
+          tokens.length !== 2 ||
+          tokens[0].toLowerCase() !== 'as' ||
+          !/^[A-Za-z0-9_.-]+$/u.test(tokens[1])
+        ) {
+          throw new Error(`${file}:${instruction.line}: unsupported Dockerfile FROM syntax`);
+        }
+        alias = tokens[1].toLowerCase();
+      }
+
+      violations.push(
+        ...validateDockerImageReference(
+          image,
+          file,
+          instruction.line,
+          stageAliases,
+          stageCount,
+        ),
+      );
+
+      if (alias !== '') stageAliases.add(alias);
+      stageCount += 1;
+      continue;
+    }
+
+    if (keyword === 'ADD' || keyword === 'COPY') {
+      const parsed = parseCopyLikeInstruction(body, file, instruction.line, keyword);
+      for (const option of parsed.options) {
+        const from = optionValue(option, 'from');
+        if (from !== null) {
+          violations.push(
+            ...validateDockerImageReference(
+              from,
+              file,
+              instruction.line,
+              stageAliases,
+              stageCount,
+            ),
+          );
+        }
+      }
+      if (keyword === 'ADD') {
+        for (const source of parsed.sources) {
+          if (REMOTE_SOURCE_RE.test(source)) {
+            violations.push({
+              file,
+              line: instruction.line,
+              uses: source,
+              reason: 'unsupported-remote-source',
+            });
+          }
+        }
+      }
+      continue;
+    }
+
+    if (keyword === 'RUN') {
+      const { options } = consumeInstructionOptions(body, file, instruction.line);
+      for (const option of options) {
+        const mount = optionValue(option, 'mount');
+        if (mount === null) continue;
+        const settings = parseMountSpec(mount, file, instruction.line);
+        if (!settings.has('from')) continue;
+        violations.push(
+          ...validateDockerImageReference(
+            settings.get('from'),
+            file,
+            instruction.line,
+            stageAliases,
+            stageCount,
+          ),
+        );
       }
     }
-    const image = tokens.shift();
-    if (!image) {
-      throw new Error(`${file}:${instruction.line}: Dockerfile FROM image is missing`);
-    }
-
-    let alias = '';
-    if (tokens.length > 0) {
-      if (
-        tokens.length !== 2 ||
-        tokens[0].toLowerCase() !== 'as' ||
-        !/^[A-Za-z0-9_.-]+$/.test(tokens[1])
-      ) {
-        throw new Error(`${file}:${instruction.line}: unsupported Dockerfile FROM syntax`);
-      }
-      alias = tokens[1].toLowerCase();
-    }
-
-    const normalized = image.toLowerCase();
-    const isLocalStage = stageAliases.has(normalized);
-    if (
-      normalized !== 'scratch' &&
-      !isLocalStage &&
-      !CONTAINER_IMAGE_DIGEST_RE.test(image)
-    ) {
-      violations.push({
-        file,
-        line: instruction.line,
-        uses: image,
-        reason: 'not-digest-pinned',
-      });
-    }
-
-    if (alias !== '') stageAliases.add(alias);
   }
 
   return violations;

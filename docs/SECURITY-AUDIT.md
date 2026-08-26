@@ -46,15 +46,17 @@ The audit has two layers:
 | Job | What it does | Notes |
 | --- | --- | --- |
 | `validate-inputs` | Normalizes and validates the dispatch payload | Target must be a 40-hex SHA reachable from `main`; scope and model come from allowlists. Scheduled runs and omitted payload fields supply no ref, so the current `origin/main` tip is resolved to a full SHA and then validated by the same rules |
-| `dependency-audit` | `npm audit --audit-level=high` | The raw JSON never leaves the runner. It is reduced in-job to severity **counts only** — no package names, versions, advisory identifiers or advisory URLs — and the counts are not published either |
+| `dependency-audit` | `npm audit --package-lock-only --audit-level=high` | The workflow validates `package.json` / `package-lock.json` first, then audits the lockfile without installing target-controlled packages. The raw JSON never leaves the runner. It is reduced in-job to severity **counts only** — no package names, versions, advisory identifiers or advisory URLs — and the counts are not published either |
 | `secret-scan` | Gitleaks **CLI**, downloaded at a pinned version and SHA256-verified | Nothing is published. Rule identifiers, file paths, line numbers, commit metadata and the matched secret never leave the runner; the raw report and the scanner console output are discarded inside the job. Counts are computed for in-job gating only |
-| `action-pins` | Fails if any workflow or local action uses a mutable external ref | Parses workflow/local-action YAML and enforces 40-hex commit pinning for `uses:` values and a 64-hex `sha256` digest for Docker references, including external `runs.image` values in local Docker actions. It scans `.github/workflows` and every `action.yml`/`action.yaml`, including hidden action directories. Detailed local CLI diagnostics are captured and deleted unread in CI; the workflow emits only the generic failure literal |
+| `action-pins` | Fails if any workflow or local action uses a mutable external ref | Parses workflow/local-action YAML and enforces 40-hex commit pinning for `uses:` values plus fail-closed Dockerfile validation for explicit external references (`# syntax`, `FROM`, `COPY --from`, `RUN --mount=from`; remote `ADD` sources are rejected). It scans `.github/workflows` and every `action.yml`/`action.yaml`, including hidden action directories. Detailed local CLI diagnostics are captured and deleted unread in CI; the workflow emits only the generic failure literal |
 | `summary` | Emits the generic public pass/fail literal | Fails the run if any deterministic job did not succeed or an enabled model job failed or was cancelled. It renders no job names, targets, scopes or counts |
 
-Dependency installation and audit run from a runner-owned directory containing only
-`package.json` and `package-lock.json`. Both npm commands use empty runner-owned user/global
-configuration files, the explicit public npm registry, and `--ignore-scripts` for installation,
-so a target `.npmrc`, unrelated project content, and lifecycle scripts cannot influence the check.
+Dependency validation and audit run from a runner-owned directory containing only
+`package.json` and `package-lock.json`. The trusted preflight validator rejects unsupported source
+forms and workspace-like expansion before npm runs, and `npm audit --package-lock-only` uses empty
+runner-owned user/global configuration files plus the explicit public npm registry. A target
+`.npmrc`, unrelated project content, and dependency tarballs therefore do not execute or install in
+the audit job.
 
 ### Code scanning is not part of this workflow
 
@@ -263,9 +265,10 @@ regardless of repository-variable values while the hard-disable is present.
    artifacts are world-readable. Start triage from the job list (which job is red) and reproduce
    locally.
 2. **Dependency findings reproduce locally.** Clone the repository, check out the audited commit,
-   then run `npm ci --ignore-scripts && npm audit --audit-level=high`. The workflow writes the raw
-   JSON report to the runner's workspace, reduces it to counts, and deletes it — the report is
-   never uploaded and the counts are never published.
+   then run `node scripts/security-audit/validate-npm-audit-inputs.mjs && npm audit
+   --package-lock-only --audit-level=high`. The workflow writes the raw JSON report to the runner's
+   workspace, reduces it to counts, and deletes it — the report is never uploaded and the counts
+   are never published.
 3. **Secret-scan hits publish nothing at all.** Neither rule identifiers nor file paths nor counts
    leave the job. A rule id paired with a path states which file holds which class of credential,
    which is exactly the pre-rotation disclosure an attacker wants — and the scanner's console
@@ -413,6 +416,8 @@ private report names the audited commit explicitly — see [Result attribution](
 - Workflow-level permissions are `{}` (deny-all); each job re-grants only what it needs.
 - Every action is pinned to a 40-hex commit SHA with the version in a trailing comment, and
   `action-pins` fails the run if that ever regresses.
+- Dependency audit stays lockfile-only: the workflow validates copied manifests first and never
+  installs target-controlled packages in the privileged audit job.
 - Checkouts use `persist-credentials: false`.
 - Audit logic always executes from the protected `main` controller checkout; the audited commit is
   mounted at `target/` and treated as data.

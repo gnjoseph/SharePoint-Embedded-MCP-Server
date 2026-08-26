@@ -404,13 +404,13 @@ test('no helper script is ever executed from the target checkout', () => {
   for (const invocation of invocations) {
     assert.match(
       invocation,
-      /node\s+scripts\/security-audit\//,
-      `helper invocations must be controller-relative: ${invocation}`,
+      /node\s+(?:"\$\{GITHUB_WORKSPACE\}\/)?scripts\/security-audit\//,
+      `helper invocations must stay on the controller checkout: ${invocation}`,
     );
   }
 });
 
-test('dependency commands use runner-owned workspaces and npm configuration', () => {
+test('dependency audit stays lockfile-only inside a runner-owned workspace', () => {
   for (const [label, workflow, jobName, packagePrefix] of [
     ['weekly audit', audit, 'dependency-audit', 'target/'],
     ['pull-request gate', security, 'audit', 'target/'],
@@ -427,27 +427,24 @@ test('dependency commands use runner-owned workspaces and npm configuration', ()
     assert.match(prepare.run, /: > "\$\{NPM_USER_CONFIG\}"/);
     assert.match(prepare.run, /: > "\$\{NPM_GLOBAL_CONFIG\}"/);
 
-    const npmSteps = (job.steps ?? []).filter((step) =>
-      /^\s*npm (?:ci|audit)\b/m.test(step.run ?? ''),
+    const npmAudit = (job.steps ?? []).find((step) => /^\s*npm audit\b/m.test(step.run ?? ''));
+    assert.ok(npmAudit, `${label}: expected an npm audit step`);
+    assert.equal(
+      npmAudit['working-directory'],
+      '${{ runner.temp }}/security-audit-npm',
+      `${label}/${npmAudit.name}: npm must not run in the checked-out project`,
     );
-    assert.equal(npmSteps.length, 2, `${label}: expected npm ci and npm audit`);
-    for (const step of npmSteps) {
-      assert.equal(
-        step['working-directory'],
-        '${{ runner.temp }}/security-audit-npm',
-        `${label}/${step.name}: npm must not run in the checked-out project`,
-      );
-      assert.match(step.run, /--registry=https:\/\/registry\.npmjs\.org\//);
-      assert.match(step.run, /--userconfig="\$\{NPM_USER_CONFIG\}"/);
-      assert.match(step.run, /--globalconfig="\$\{NPM_GLOBAL_CONFIG\}"/);
-    }
-
-    const install = npmSteps.find((step) => /^\s*npm ci\b/m.test(step.run));
-    assert.match(install.run, /--ignore-scripts/);
-    assert.match(install.run, /--no-audit/);
-    assert.match(install.run, /--fund=false/);
-
-    const npmAudit = npmSteps.find((step) => /^\s*npm audit\b/m.test(step.run));
+    assert.match(npmAudit.run, /validate-npm-audit-inputs\.mjs/);
+    assert.match(npmAudit.run, /npm-audit-inputs\.log/);
+    assert.match(npmAudit.run, /rm -f "[^"]*npm-audit-inputs\.log"/);
+    assert.match(npmAudit.run, /--registry=https:\/\/registry\.npmjs\.org\//);
+    assert.match(npmAudit.run, /--userconfig="\$\{NPM_USER_CONFIG\}"/);
+    assert.match(npmAudit.run, /--globalconfig="\$\{NPM_GLOBAL_CONFIG\}"/);
+    assert.equal(
+      /\bnpm ci\b/.test(npmAudit.run),
+      false,
+      `${label}: dependency audit must not install target-controlled packages`,
+    );
     assert.match(npmAudit.run, /--package-lock-only/);
     assert.match(npmAudit.run, /> "[^"]*npm-audit\.json" 2>\/dev\/null/);
 
@@ -726,6 +723,7 @@ test('pull-request gates expose no finding-dependent result channel', () => {
   const npmSteps = security.doc.jobs.audit.steps;
   const npmAudit = npmSteps.find((step) => /^\s*npm audit\b/m.test(step.run ?? ''));
   assert.ok(npmAudit, 'the protected npm audit step must exist');
+  assert.match(npmAudit.run, /validate-npm-audit-inputs\.mjs/);
   assert.match(npmAudit.run, /\[ "\$\{status\}" -ne 0 \] && \[ "\$\{status\}" -ne 1 \]/);
   assert.match(npmAudit.run, /exit 0\s*$/);
   assert.equal(npmAudit['continue-on-error'], undefined);

@@ -43,8 +43,10 @@ jobs:
 
       # The audited checkout controls `.npmrc` and every non-manifest project
       # file. Copy only the package manifests to a runner-owned directory and
-      # use empty runner-owned config files plus an explicit registry for both
-      # npm commands.
+      # use empty runner-owned config files plus an explicit registry. The
+      # trusted validator rejects unsupported source forms before npm runs, and
+      # the audit stays lockfile-only: no target-controlled tarball is ever
+      # installed in this privileged job.
       - name: Prepare isolated dependency workspace
         env:
           AUDIT_NPM_DIR: ${{ runner.temp }}/security-audit-npm
@@ -57,21 +59,6 @@ jobs:
           cp target/package.json target/package-lock.json "${AUDIT_NPM_DIR}/"
           : > "${NPM_USER_CONFIG}"
           : > "${NPM_GLOBAL_CONFIG}"
-
-      # `--ignore-scripts` prevents dependency lifecycle code from executing.
-      - name: Install dependencies without lifecycle scripts
-        working-directory: ${{ runner.temp }}/security-audit-npm
-        env:
-          NPM_USER_CONFIG: ${{ runner.temp }}/security-audit-npm/user.npmrc
-          NPM_GLOBAL_CONFIG: ${{ runner.temp }}/security-audit-npm/global.npmrc
-        run: |
-          npm ci \
-            --ignore-scripts \
-            --no-audit \
-            --fund=false \
-            --registry=https://registry.npmjs.org/ \
-            --userconfig="${NPM_USER_CONFIG}" \
-            --globalconfig="${NPM_GLOBAL_CONFIG}"
 
       # `npm audit` prints advisory titles, severities, package names, versions
       # and GHSA advisory URLs. On a public repository the Actions log and check
@@ -89,6 +76,13 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p "${GITHUB_WORKSPACE}/.security-audit"
+          validate_status=0
+          node "${GITHUB_WORKSPACE}/scripts/security-audit/validate-npm-audit-inputs.mjs" \
+            --dir . \
+            > "${GITHUB_WORKSPACE}/.security-audit/npm-audit-inputs.log" 2>&1 ||
+            validate_status=$?
+          rm -f "${GITHUB_WORKSPACE}/.security-audit/npm-audit-inputs.log"
+          [ "${validate_status}" -eq 0 ] || exit 1
           npm audit \
             --package-lock-only \
             --audit-level=high \
