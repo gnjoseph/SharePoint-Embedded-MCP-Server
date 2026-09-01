@@ -229,6 +229,7 @@ describe("dependency hygiene: runtime dependency budget", () => {
     "@azure/msal-node",
     "@modelcontextprotocol/sdk",
     "commander",
+    "cross-spawn",
     "open",
     "zod",
     "zod-to-json-schema",
@@ -239,8 +240,8 @@ describe("dependency hygiene: runtime dependency budget", () => {
     expect(actual).toEqual([...EXPECTED_RUNTIME_DEPENDENCIES].sort());
   });
 
-  it("keeps the runtime dependency count at 6", () => {
-    expect(Object.keys(pkg.dependencies ?? {})).toHaveLength(6);
+  it("keeps the runtime dependency count at 7", () => {
+    expect(Object.keys(pkg.dependencies ?? {})).toHaveLength(7);
   });
 
   it("adds no update-check or semver dependency", () => {

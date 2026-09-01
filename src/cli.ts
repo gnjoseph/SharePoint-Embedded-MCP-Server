@@ -148,7 +148,7 @@ program
       if (options.reset) {
         await clearCachedToken();
         const { removeUpdateCache } = await import("./update-check.js");
-        removeUpdateCache();
+        await removeUpdateCache();
         console.log("Cleared cached tokens before authenticating.");
       }
       await authenticateInteractively();
@@ -179,7 +179,7 @@ program
       // including the update-check cache (which holds no identifiers, but is
       // still local state the user asked us to forget).
       const { removeUpdateCache } = await import("./update-check.js");
-      removeUpdateCache();
+      await removeUpdateCache();
       console.log("Logged out. Cached tokens and the update-check cache have been cleared.");
     } catch (error) {
       console.error("Failed to clear cached tokens:");

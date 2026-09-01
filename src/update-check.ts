@@ -705,16 +705,48 @@ function readDeletionGeneration(): string | null {
 function advanceDeletionGeneration(): boolean {
   try {
     ensureSecureDir(getDataDir());
-    const current = readDeletionGeneration();
-    const parsed = current === null ? 0 : Number(current);
-    const next = Math.max(
-      Date.now(),
-      Number.isSafeInteger(parsed) && parsed >= 0 ? parsed + 1 : 1,
-    );
-    writeSecureFileAtomic(getDeletionGenerationFile(), String(next));
+    // Every deletion gets an independently generated value. A read/increment/write
+    // counter can lose an update when separate logout processes race.
+    writeSecureFileAtomic(getDeletionGenerationFile(), randomUUID());
     return true;
   } catch {
     return false;
+  }
+}
+
+/** Prefix for unique markers that block cache writes while deletion is active. */
+function getDeletionMarkerPrefix(): string {
+  return `${getUpdateCacheFile()}.deleting-`;
+}
+
+function createDeletionMarker(): string | null {
+  const id = randomUUID();
+  const file = `${getDeletionMarkerPrefix()}${id}`;
+  const marker = JSON.stringify({ pid: process.pid, createdAt: Date.now(), id });
+  try {
+    ensureSecureDir(getDataDir());
+    return tryCreateSecureFileExclusive(file, marker) ? file : null;
+  } catch {
+    return null;
+  }
+}
+
+function hasDeletionMarker(): boolean {
+  const prefix = basename(getDeletionMarkerPrefix());
+  try {
+    return readdirSync(getDataDir()).some(
+      (name) => name.startsWith(prefix) && !name.includes(".tmp-"),
+    );
+  } catch {
+    return true;
+  }
+}
+
+function releaseDeletionMarker(file: string): void {
+  try {
+    unlinkSync(file);
+  } catch {
+    // A surviving marker fails closed by continuing to block cache writes.
   }
 }
 
@@ -735,9 +767,9 @@ function writeCacheForGeneration(
   cache: UpdateCache,
   deletionGeneration: string | null,
 ): boolean {
-  if (readDeletionGeneration() !== deletionGeneration) return false;
+  if (hasDeletionMarker() || readDeletionGeneration() !== deletionGeneration) return false;
   if (!writeCache(cache)) return false;
-  if (readDeletionGeneration() === deletionGeneration) return true;
+  if (!hasDeletionMarker() && readDeletionGeneration() === deletionGeneration) return true;
   try {
     removeCacheFileOnly();
   } catch {
@@ -1048,7 +1080,10 @@ function isCacheFresh(cache: UpdateCache, registry: string, now: number): boolea
  * cached registry result and cancels in-flight cache writers. Best-effort and
  * never throws: a missing or unremovable file is not an error.
  */
-export function removeUpdateCache(): void {
+export async function removeUpdateCache(): Promise<void> {
+  let deletionMarker: string | null = null;
+  let refreshLock: string | null = null;
+  let deletionCompleted = false;
   try {
     const file = getUpdateCacheFile();
     // Do not create a data directory solely for an empty tombstone. If the data
@@ -1056,25 +1091,40 @@ export function removeUpdateCache(): void {
     // between writing its fully formed temp lock and atomically publishing it,
     // during which neither the final lock nor cache exists yet.
     if (!existsSync(getDataDir())) return;
-    if (!advanceDeletionGeneration()) return;
+    deletionMarker = createDeletionMarker();
+    if (!deletionMarker) return;
+    advanceDeletionGeneration();
+    removeCacheFileOnly();
+
+    const deadline = Date.now() + REFRESH_LOCK_STALE_MS + REQUEST_TIMEOUT_MS;
+    while (!refreshLock && Date.now() < deadline) {
+      refreshLock = acquireRefreshLock(Date.now());
+      if (!refreshLock) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+    if (!refreshLock) return;
+
+    // A writer may have completed after the first removal but before observing
+    // the marker. Repeating the removal under the shared lock closes that gap.
     removeCacheFileOnly();
 
     // Cache replacement temps are never synchronization points. Removing one
     // that belongs to an in-flight writer makes its atomic rename fail closed.
     const prefix = `${basename(file)}.tmp-`;
-    try {
-      for (const name of readdirSync(getDataDir())) {
-        if (!name.startsWith(prefix)) continue;
-        const candidate = join(getDataDir(), name);
-        const stat = lstatSync(candidate);
-        if (stat.isFile() && !stat.isSymbolicLink()) unlinkSync(candidate);
-      }
-    } catch {
-      // Best-effort cleanup; the generation still prevents resurrection.
+    for (const name of readdirSync(getDataDir())) {
+      if (!name.startsWith(prefix)) continue;
+      const candidate = join(getDataDir(), name);
+      const stat = lstatSync(candidate);
+      if (stat.isFile() && !stat.isSymbolicLink()) unlinkSync(candidate);
     }
+    deletionCompleted = true;
     logger.debug("Removed update-check cache.");
   } catch {
     // Best-effort: leaving the file behind is not a failure worth surfacing.
+  } finally {
+    if (deletionCompleted && deletionMarker) releaseDeletionMarker(deletionMarker);
+    if (refreshLock) releaseRefreshLock(refreshLock);
   }
 }
 
@@ -1688,6 +1738,10 @@ export const __testing = {
   readCappedText,
   readCache,
   writeCache,
+  readDeletionGeneration,
+  writeCacheForGeneration,
+  getDeletionMarkerPrefix,
+  hasDeletionMarker,
   getRefreshLockPrefix,
   listRefreshLocks,
   getDeletionGenerationFile,

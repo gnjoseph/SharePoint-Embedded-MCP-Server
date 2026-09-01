@@ -652,18 +652,18 @@ describe("runUpdateCheck", () => {
   it.runIf(CHANNEL === "alpha")(
     "announces GA when alpha is unchanged after an earlier alpha notice",
     async () => {
-      const alpha2 = `${CURRENT.major}.${CURRENT.minor}.${CURRENT.patch}-alpha.2`;
-      const ga = `${CURRENT.major + 1}.0.0`;
+      const newerAlpha = NEWER_CHANNEL!;
+      const ga = NEWER_STABLE;
 
-      respondWith(packument({ alpha: alpha2 }));
+      respondWith(packument({ alpha: newerAlpha }));
       await __testing.runUpdateCheck({});
       const alphaNotice = takePendingUpdateNotice();
       expect(alphaNotice?.updateAvailable).toMatchObject({
-        latest: alpha2,
+        latest: newerAlpha,
         target: "channel",
         channel: "alpha",
       });
-      expect(readCacheFile()["notifiedFor"]).toEqual([`channel:alpha:${alpha2}`]);
+      expect(readCacheFile()["notifiedFor"]).toEqual([`channel:alpha:${newerAlpha}`]);
 
       // Restart after the TTL. The alpha target is unchanged, but `latest` has
       // advanced to GA. Stable suppression must be independent from alpha.
@@ -675,7 +675,7 @@ describe("runUpdateCheck", () => {
         JSON.stringify({ ...stale, checkedAt: Date.now() - CHECK_TTL_MS }),
         "utf8",
       );
-      respondWith(packument({ alpha: alpha2, latest: ga }));
+      respondWith(packument({ alpha: newerAlpha, latest: ga }));
 
       await __testing.runUpdateCheck({});
       const gaNotice = takePendingUpdateNotice();
@@ -686,10 +686,10 @@ describe("runUpdateCheck", () => {
       });
       expect(gaNotice?.updateAvailable.stable).toBeUndefined();
       expect(gaNotice?.text).toContain(`${PACKAGE_VERSION} -> ${ga}`);
-      expect(gaNotice?.text).not.toContain(alpha2);
+      expect(gaNotice?.text).not.toContain(newerAlpha);
       expect(gaNotice?.text).not.toContain("(alpha channel)");
       expect(readCacheFile()["notifiedFor"]).toEqual([
-        `channel:alpha:${alpha2}`,
+        `channel:alpha:${newerAlpha}`,
         `stable:${ga}`,
       ]);
     },
@@ -1580,16 +1580,42 @@ describe("privacy: cache retention and deletion", () => {
     await __testing.runUpdateCheck({});
     expect(cacheExists()).toBe(true);
 
-    removeUpdateCache();
+    await removeUpdateCache();
     expect(cacheExists()).toBe(false);
   });
 
-  it("is a safe no-op when no cache exists and never throws", () => {
+  it("is a safe no-op when no cache exists and never throws", async () => {
     expect(cacheExists()).toBe(false);
-    expect(() => {
-      removeUpdateCache();
-      removeUpdateCache();
-    }).not.toThrow();
+    await expect(removeUpdateCache()).resolves.toBeUndefined();
+    await expect(removeUpdateCache()).resolves.toBeUndefined();
+  });
+
+  it("writes a unique deletion generation for every cache removal", async () => {
+    await removeUpdateCache();
+    const first = readFileSync(__testing.getDeletionGenerationFile(), "utf8");
+
+    await removeUpdateCache();
+    const second = readFileSync(__testing.getDeletionGenerationFile(), "utf8");
+
+    expect(first).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(second).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(second).not.toBe(first);
+  });
+
+  it("blocks cache writers while a deletion marker is active", async () => {
+    respondWith(packument(tagsFixture()));
+    await __testing.runUpdateCheck({});
+    const cache = __testing.readCache();
+    expect(cache).not.toBeNull();
+
+    const generation = __testing.readDeletionGeneration();
+    const marker = `${__testing.getDeletionMarkerPrefix()}test`;
+    writeFileSync(marker, "active", "utf8");
+    rmSync(getUpdateCacheFile(), { force: true });
+
+    expect(__testing.hasDeletionMarker()).toBe(true);
+    expect(__testing.writeCacheForGeneration(cache!, generation)).toBe(false);
+    expect(cacheExists()).toBe(false);
   });
 
   // Deleting the cached registry result is a privacy promise. A small local
@@ -1600,7 +1626,7 @@ describe("privacy: cache retention and deletion", () => {
     await __testing.runUpdateCheck({});
     expect(cacheExists()).toBe(true);
 
-    removeUpdateCache();
+    await removeUpdateCache();
     expect(cacheExists()).toBe(false);
 
     const notice = takePendingUpdateNotice();
@@ -1621,12 +1647,12 @@ describe("privacy: cache retention and deletion", () => {
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     expect(cacheExists(), "pre-egress reservation should exist").toBe(true);
 
-    removeUpdateCache();
+    const removal = removeUpdateCache();
     expect(cacheExists()).toBe(false);
     expect(existsSync(__testing.getDeletionGenerationFile())).toBe(true);
 
     finishFetch?.(new Response(packument(tagsFixture()), { status: 200 }));
-    await check;
+    await Promise.all([check, removal]);
 
     expect(cacheExists(), "post-fetch write must not undo logout").toBe(false);
     expect(takePendingUpdateNotice()).toBeNull();
@@ -1666,10 +1692,15 @@ describe("privacy: cache retention and deletion", () => {
     );
     const staleTime = new Date(createdAt);
     utimesSync(lock, staleTime, staleTime);
+    let removal: Promise<void> | undefined;
+    let logoutStarted = false;
     vi.spyOn(process, "kill").mockImplementation(
       ((candidate: number) => {
         if (candidate === deadPid) {
-          removeUpdateCache();
+          if (!logoutStarted) {
+            logoutStarted = true;
+            removal = removeUpdateCache();
+          }
           throw Object.assign(new Error("no such process"), { code: "ESRCH" });
         }
         return true;
@@ -1677,6 +1708,7 @@ describe("privacy: cache retention and deletion", () => {
     );
 
     await __testing.runUpdateCheck({});
+    await removal;
 
     expect(fetchMock).not.toHaveBeenCalled();
     expect(cacheExists(), "pre-lock logout must remain authoritative").toBe(false);
@@ -1820,7 +1852,7 @@ describe("notice delivery is what marks a version as notified", () => {
     respondWith(packument(tagsFixture()));
     await __testing.runUpdateCheck({});
 
-    removeUpdateCache();
+    await removeUpdateCache();
     expect(cacheExists()).toBe(false);
 
     // Returning it without a durable claim could duplicate it in another
