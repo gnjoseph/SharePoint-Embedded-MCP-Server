@@ -10,14 +10,14 @@
  *   - A failed process launch (spawn error / ENOENT) is reflected as isError
  *     instead of a false "running" success.
  *
- * node:child_process and node:fs are mocked so nothing actually spawns.
+ * ../proc-exec.js and node:fs are mocked so nothing actually spawns.
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { EventEmitter } from "node:events";
 
 let files: Record<string, string> = {};
-let spawnBehavior: "spawn" | "error" | "exit-nonzero" = "spawn";
+let spawnBehavior: "spawn" | "error" | "exit-nonzero" | "throw" = "spawn";
 const spawnError = "spawn npm ENOENT";
 
 vi.mock("node:fs", () => ({
@@ -29,16 +29,21 @@ vi.mock("node:fs", () => ({
   }),
 }));
 
-vi.mock("node:child_process", () => ({
-  spawn: vi.fn(() => {
+vi.mock("../proc-exec.js", () => ({
+  spawnProcess: vi.fn(() => {
+    if (spawnBehavior === "throw") {
+      throw Object.assign(new Error("untrusted executable resolution"), {
+        code: "ERR_UNTRUSTED_EXECUTABLE",
+      });
+    }
     const child = new EventEmitter() as EventEmitter & { unref: () => void };
     child.unref = () => {};
     queueMicrotask(() => {
       if (spawnBehavior === "error") {
         child.emit("error", new Error(spawnError));
       } else if (spawnBehavior === "exit-nonzero") {
-        // win32 shell:true false-success path: the OS spawns cmd.exe ('spawn'
-        // fires), then the shell exits non-zero because the toolchain is missing.
+        // Early non-zero exit path: 'spawn' fires, then the child exits
+        // non-zero because the toolchain is missing.
         child.emit("spawn");
         child.emit("exit", 1, null);
       } else {
@@ -60,7 +65,7 @@ vi.mock("../server-readiness.js", () => ({
   waitForServerReady: vi.fn(async () => serverReady),
 }));
 
-import { spawn } from "node:child_process";
+import { spawnProcess } from "../proc-exec.js";
 import { waitForServerReady } from "../server-readiness.js";
 import { runLocalTool } from "../tools/run-local.js";
 
@@ -110,14 +115,14 @@ describe("project_run_local — URL/port detection", () => {
 
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain("http://localhost:5000");
-    expect(spawn).toHaveBeenCalledWith("dotnet", ["run"], expect.objectContaining({ detached: true }));
+    expect(spawnProcess).toHaveBeenCalledWith("dotnet", ["run"], expect.objectContaining({ detached: true }));
   });
 
   it("errors when no runnable project is present", async () => {
     files = {};
     const result = await runLocalTool.handler({ projectDir: "/proj" });
     expect(result.isError).toBe(true);
-    expect(spawn).not.toHaveBeenCalled();
+    expect(spawnProcess).not.toHaveBeenCalled();
   });
 });
 
@@ -143,7 +148,7 @@ describe("project_run_local — start-outcome reflection", () => {
     expect(result.content[0].text).toContain("failed to start");
   });
 
-  it("surfaces a non-zero early EXIT as isError (win32 shell:true false-success path, Node)", async () => {
+  it("surfaces a non-zero early EXIT as isError (early-exit false-success path, Node)", async () => {
     files = { "package.json": pkg({ dev: "vite" }) };
     spawnBehavior = "exit-nonzero";
 
@@ -162,6 +167,16 @@ describe("project_run_local — start-outcome reflection", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("failed to start");
+  });
+
+  it("surfaces a synchronous executable-resolution failure", async () => {
+    files = { "Program.cs": "// app" };
+    spawnBehavior = "throw";
+
+    const result = await runLocalTool.handler({ projectDir: "/proj" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("untrusted executable resolution");
   });
 });
 

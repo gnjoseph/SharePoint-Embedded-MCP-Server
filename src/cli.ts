@@ -95,7 +95,7 @@ program
   )
   .option(
     "--no-install-attribution",
-    "Do not add install-source metadata to outbound requests, even when install attribution is configured.",
+    "Do not add install-source or self-reported agent-host metadata to outbound requests.",
   )
   .option("--data-dir <path>", DATA_DIR_OPTION)
   .action(async (options: {

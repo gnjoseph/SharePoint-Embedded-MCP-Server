@@ -5,19 +5,30 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   USER_AGENT,
   __testing,
+  applyProductUserAgent,
   appendUserAgent,
   classifyAgentHost,
   configureAzureUserAgentEnvironment,
   getUserAgent,
+  isProductUserAgent,
+  productUserAgent,
   resolveAgentHostAttribution,
   resolveInstallAttribution,
   setAgentHostAttribution,
   setInstallAttribution,
+  telemetryEnabled,
 } from "./user-agent.js";
+
+const saved = process.env.SPE_MCP_COLLECT_TELEMETRY;
 
 describe("install attribution User-Agent", () => {
   afterEach(() => {
     __testing.reset();
+    if (saved === undefined) {
+      delete process.env.SPE_MCP_COLLECT_TELEMETRY;
+    } else {
+      process.env.SPE_MCP_COLLECT_TELEMETRY = saved;
+    }
   });
 
   it("keeps the historical product-only value when attribution is absent", () => {
@@ -149,5 +160,106 @@ describe("install attribution User-Agent", () => {
     expect(env.AZURE_DEV_USER_AGENT).toMatch(
       /^existing-azd\/1\.0 spe-mcp-server\/\S+ spe-install-source\/github-readme.*spe-agent-host\/vscode/,
     );
+  });
+
+  it("suppresses all attribution tokens on telemetry opt-out", () => {
+    setInstallAttribution(
+      resolveInstallAttribution({ source: "github-readme", content: "readme-install" }),
+    );
+    setAgentHostAttribution("vscode");
+    process.env.SPE_MCP_COLLECT_TELEMETRY = "false";
+    const env: NodeJS.ProcessEnv = {
+      AZURE_HTTP_USER_AGENT:
+        "caller/1.0 spe-mcp-server/old spe-install-source/microsoft-learn spe-agent-host/cursor",
+      AZURE_DEV_USER_AGENT: "spe-mcp-server/old spe-install-campaign/docs-install-buttons",
+    };
+
+    expect(getUserAgent()).toBeUndefined();
+    configureAzureUserAgentEnvironment(env);
+
+    expect(env.AZURE_HTTP_USER_AGENT).toBe("caller/1.0");
+    expect(env.AZURE_DEV_USER_AGENT).toBeUndefined();
+  });
+});
+
+/**
+ * Telemetry opt-out tests.
+ *
+ * All attribution tokens are gated behind `SPE_MCP_COLLECT_TELEMETRY`. They are
+ * on by default and suppressed only when the variable is explicitly falsy.
+ */
+
+afterEach(() => {
+  if (saved === undefined) {
+    delete process.env.SPE_MCP_COLLECT_TELEMETRY;
+  } else {
+    process.env.SPE_MCP_COLLECT_TELEMETRY = saved;
+  }
+});
+
+describe("telemetry opt-out (SPE_MCP_COLLECT_TELEMETRY)", () => {
+  it("is on by default when the variable is unset", () => {
+    delete process.env.SPE_MCP_COLLECT_TELEMETRY;
+    expect(telemetryEnabled()).toBe(true);
+    expect(productUserAgent()).toBe(USER_AGENT);
+  });
+
+  it.each(["false", "0", "no", "off", "FALSE", " Off "])(
+    "opts out when set to %j (drops the product token)",
+    (value) => {
+      process.env.SPE_MCP_COLLECT_TELEMETRY = value;
+      expect(telemetryEnabled()).toBe(false);
+      expect(productUserAgent()).toBeUndefined();
+    },
+  );
+
+  it.each(["true", "1", "yes", "on", ""])(
+    "stays on for non-falsy value %j",
+    (value) => {
+      process.env.SPE_MCP_COLLECT_TELEMETRY = value;
+      expect(telemetryEnabled()).toBe(true);
+      expect(productUserAgent()).toBe(USER_AGENT);
+    },
+  );
+});
+
+describe("isProductUserAgent", () => {
+  it("recognizes this tool's product token for any version", () => {
+    expect(isProductUserAgent(USER_AGENT)).toBe(true);
+    expect(isProductUserAgent("spe-mcp-server/9.9.9-test")).toBe(true);
+  });
+
+  it("does not match unrelated or empty values", () => {
+    expect(isProductUserAgent(undefined)).toBe(false);
+    expect(isProductUserAgent("")).toBe(false);
+    expect(isProductUserAgent("azsdk-js-arm/1.0.0")).toBe(false);
+    expect(isProductUserAgent("my-own-tool/2.0")).toBe(false);
+  });
+});
+
+describe("applyProductUserAgent (opt-out enforcement)", () => {
+  it("stamps the product token when telemetry is on", () => {
+    delete process.env.SPE_MCP_COLLECT_TELEMETRY;
+    const headers = applyProductUserAgent({ "Content-Type": "application/json" });
+    expect(headers["User-Agent"]).toBe(USER_AGENT);
+  });
+
+  it("does not overwrite a caller-supplied User-Agent when on", () => {
+    delete process.env.SPE_MCP_COLLECT_TELEMETRY;
+    const headers = applyProductUserAgent({ "User-Agent": "caller/1.0" });
+    expect(headers["User-Agent"]).toBe("caller/1.0");
+  });
+
+  it("strips any User-Agent (both casings) when opted out", () => {
+    process.env.SPE_MCP_COLLECT_TELEMETRY = "false";
+    const headers = applyProductUserAgent({
+      Authorization: "Bearer x",
+      "User-Agent": "caller/1.0",
+      "user-agent": "caller/1.0",
+    });
+    expect(headers["User-Agent"]).toBeUndefined();
+    expect(headers["user-agent"]).toBeUndefined();
+    // Unrelated headers are left intact.
+    expect(headers.Authorization).toBe("Bearer x");
   });
 });

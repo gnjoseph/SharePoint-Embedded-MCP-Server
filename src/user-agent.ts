@@ -2,18 +2,19 @@
 // Licensed under the MIT license.
 
 /**
- * Product and optional install-attribution identifiers stamped on outbound
+ * Product and optional bounded attribution identifiers stamped on outbound
  * Microsoft Graph and Azure CLI (`az` / `azd`) requests.
  *
- * The install fields are deliberately bounded, non-personal labels supplied by
- * the MCP client configuration. They open no separate telemetry channel and ride
- * only on API calls the tool already makes on the user's behalf. Omitting the
- * install arguments keeps the historical product/version-only User-Agent.
+ * They carry no per-user, per-tenant, or personal data, open no separate
+ * telemetry channel, and ride only on calls the tool already makes. All tokens
+ * are suppressed by the `SPE_MCP_COLLECT_TELEMETRY` opt-out.
  */
 import { ValidationError } from "./errors.js";
 import { PACKAGE_VERSION } from "./version.js";
 
-export const USER_AGENT = `spe-mcp-server/${PACKAGE_VERSION}`;
+const PRODUCT_NAME = "spe-mcp-server";
+
+export const USER_AGENT = `${PRODUCT_NAME}/${PACKAGE_VERSION}`;
 
 export const INSTALL_SOURCES = [
   "microsoft-learn",
@@ -184,7 +185,24 @@ export function setAgentHostAttribution(agentHost: AgentHost | undefined): void 
   activeAgentHost = agentHost;
 }
 
-export function getUserAgent(): string {
+export function telemetryEnabled(
+  value: string | undefined = process.env.SPE_MCP_COLLECT_TELEMETRY,
+): boolean {
+  if (value === undefined) return true;
+  return !["0", "false", "no", "off"].includes(value.trim().toLowerCase());
+}
+
+export function productUserAgent(): string | undefined {
+  return telemetryEnabled() ? USER_AGENT : undefined;
+}
+
+export function isProductUserAgent(value: string | undefined): boolean {
+  return typeof value === "string" && value.startsWith(`${PRODUCT_NAME}/`);
+}
+
+export function getUserAgent(): string | undefined {
+  if (!telemetryEnabled()) return undefined;
+
   const tokens: string[] = [];
   if (activeAttribution) {
     tokens.push(`spe-install-source/${activeAttribution.source}`);
@@ -201,31 +219,51 @@ export function getUserAgent(): string {
   return tokens.length > 0 ? `${USER_AGENT} ${tokens.join(" ")}` : USER_AGENT;
 }
 
-export function appendUserAgent(existing: string | undefined, value: string): string {
-  const currentTokens = existing?.trim().split(/\s+/).filter(Boolean) ?? [];
-  const preserved = currentTokens.filter(
-    (token) =>
-      !token.startsWith("spe-mcp-server/") &&
-      !token.startsWith("spe-install-source/") &&
-      !token.startsWith("spe-install-content/") &&
-      !token.startsWith("spe-install-campaign/") &&
-      !token.startsWith("spe-agent-host/"),
+function isOwnedUserAgentToken(token: string): boolean {
+  return (
+    isProductUserAgent(token) ||
+    token.startsWith("spe-install-source/") ||
+    token.startsWith("spe-install-content/") ||
+    token.startsWith("spe-install-campaign/") ||
+    token.startsWith("spe-agent-host/")
   );
-  return [...preserved, value].join(" ");
+}
+
+export function appendUserAgent(
+  existing: string | undefined,
+  value: string | undefined,
+): string | undefined {
+  const currentTokens = existing?.trim().split(/\s+/).filter(Boolean) ?? [];
+  const preserved = currentTokens.filter((token) => !isOwnedUserAgentToken(token));
+  const combined = [...preserved, ...(value ? value.split(/\s+/) : [])].join(" ");
+  return combined || undefined;
+}
+
+export function applyProductUserAgent(
+  headers: Record<string, string>,
+): Record<string, string> {
+  const userAgent = getUserAgent();
+  if (userAgent) {
+    if (headers["User-Agent"] === undefined && headers["user-agent"] === undefined) {
+      headers["User-Agent"] = userAgent;
+    }
+  } else {
+    delete headers["User-Agent"];
+    delete headers["user-agent"];
+  }
+  return headers;
 }
 
 export function configureAzureUserAgentEnvironment(
   env: NodeJS.ProcessEnv = process.env,
 ): void {
   const userAgent = getUserAgent();
-  env.AZURE_HTTP_USER_AGENT = appendUserAgent(
-    env.AZURE_HTTP_USER_AGENT,
-    userAgent,
-  );
-  env.AZURE_DEV_USER_AGENT = appendUserAgent(
-    env.AZURE_DEV_USER_AGENT,
-    userAgent,
-  );
+  const azureUserAgent = appendUserAgent(env.AZURE_HTTP_USER_AGENT, userAgent);
+  const azureDevUserAgent = appendUserAgent(env.AZURE_DEV_USER_AGENT, userAgent);
+  if (azureUserAgent) env.AZURE_HTTP_USER_AGENT = azureUserAgent;
+  else delete env.AZURE_HTTP_USER_AGENT;
+  if (azureDevUserAgent) env.AZURE_DEV_USER_AGENT = azureDevUserAgent;
+  else delete env.AZURE_DEV_USER_AGENT;
 }
 
 export const __testing = {

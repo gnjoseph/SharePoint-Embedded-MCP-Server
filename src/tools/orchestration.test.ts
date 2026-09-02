@@ -67,6 +67,9 @@ import { hydrateConfigTool } from "../tools/hydrate-config.js";
 import { grantContentAccessTool, revokeContentAccessTool, isContentAccessGranted } from "../tools/content-access.js";
 import { cleanupTool } from "../tools/cleanup.js";
 
+const VALID_SUBSCRIPTION_ID = "11111111-1111-1111-1111-111111111111";
+const OTHER_SUBSCRIPTION_ID = "22222222-2222-2222-2222-222222222222";
+
 beforeEach(() => {
   vi.clearAllMocks();
   for (const k of Object.keys(stateStore)) delete stateStore[k];
@@ -122,9 +125,9 @@ describe("project_provision", () => {
       { name: "rg-y", location: "westus", id: "/subscriptions/sub-1/resourceGroups/rg-y" },
     ]);
 
-    const r = await provisionTool.handler({ appDisplayName: "App", billingClassification: "standard", azureSubscriptionId: "sub-1" });
+    const r = await provisionTool.handler({ appDisplayName: "App", billingClassification: "standard", azureSubscriptionId: VALID_SUBSCRIPTION_ID });
 
-    expect(azureCli.listResourceGroups).toHaveBeenCalledWith("sub-1");
+    expect(azureCli.listResourceGroups).toHaveBeenCalledWith(VALID_SUBSCRIPTION_ID);
     expect(r.content[0].text).toContain("resourceGroup=rg-x");
     expect(r.content[0].text).toContain("resourceGroup=rg-y");
     expect(graph.createApplication).not.toHaveBeenCalled();
@@ -194,10 +197,10 @@ describe("project_provision", () => {
     vi.mocked(graph.createContainerType).mockResolvedValue({ containerTypeId: "ct-1", owningAppId: "app-1", displayName: "App Container Type", billingClassification: "standard" });
     vi.mocked(graph.createContainer).mockResolvedValue({ id: "c-1", displayName: "Default Container", containerTypeId: "ct-1", status: "active" });
 
-    const r = await provisionTool.handler({ appDisplayName: "App", billingClassification: "standard", azureSubscriptionId: "sub-1", resourceGroup: "rg-1", region: "eastus", confirmBilling: true });
+    const r = await provisionTool.handler({ appDisplayName: "App", billingClassification: "standard", azureSubscriptionId: VALID_SUBSCRIPTION_ID, resourceGroup: "rg-1", region: "eastus", confirmBilling: true });
 
-    expect(azureCli.ensureSyntexProviderRegistered).toHaveBeenCalledWith("sub-1");
-    expect(azureCli.createSyntexAccount).toHaveBeenCalledWith("sub-1", "rg-1", "eastus", "ct-1");
+    expect(azureCli.ensureSyntexProviderRegistered).toHaveBeenCalledWith(VALID_SUBSCRIPTION_ID);
+    expect(azureCli.createSyntexAccount).toHaveBeenCalledWith(VALID_SUBSCRIPTION_ID, "rg-1", "eastus", "ct-1");
     expect(graph.registerContainerType).toHaveBeenCalledWith("ct-1", "app-1");
     expect(r.content[0].text).toContain("SPE Provisioned");
     expect(stateStore.syntexAccountResourceId).toBe("/subscriptions/sub-1/resourceGroups/rg-1/providers/Microsoft.Syntex/accounts/acc-1");
@@ -208,10 +211,10 @@ describe("project_provision", () => {
   it("requires confirmBilling before the chargeable standard path — preview only, nothing created", async () => {
     vi.mocked(graph.findApplicationByName).mockResolvedValue(null);
 
-    const r = await provisionTool.handler({ appDisplayName: "App", billingClassification: "standard", azureSubscriptionId: "sub-1", resourceGroup: "rg-1", region: "eastus" });
+    const r = await provisionTool.handler({ appDisplayName: "App", billingClassification: "standard", azureSubscriptionId: VALID_SUBSCRIPTION_ID, resourceGroup: "rg-1", region: "eastus" });
 
     expect(r.content[0].text).toContain("confirmBilling=true");
-    expect(r.content[0].text).toContain("sub-1");
+    expect(r.content[0].text).toContain(VALID_SUBSCRIPTION_ID);
     // No owning app, container type, or billing account created without confirmation.
     expect(graph.createApplication).not.toHaveBeenCalled();
     expect(graph.createContainerType).not.toHaveBeenCalled();
@@ -223,7 +226,7 @@ describe("project_provision", () => {
     // account already exists for the reused container type.
     stateStore.appId = "app-1";
     stateStore.appDisplayName = "App";
-    stateStore.azureSubscriptionId = "sub-1";
+    stateStore.azureSubscriptionId = VALID_SUBSCRIPTION_ID;
     stateStore.resourceGroup = "rg-1";
     stateStore.containerTypeId = "ct-1";
     stateStore.syntexAccountResourceId = "/subscriptions/sub-1/resourceGroups/rg-1/providers/Microsoft.Syntex/accounts/acc-1";
@@ -235,7 +238,7 @@ describe("project_provision", () => {
     ]);
     vi.mocked(graph.createContainer).mockResolvedValueOnce({ id: "c-1", displayName: "Default Container", containerTypeId: "ct-1", status: "active" });
 
-    const r = await provisionTool.handler({ appDisplayName: "App", billingClassification: "standard", azureSubscriptionId: "sub-1", resourceGroup: "rg-1", region: "eastus" });
+    const r = await provisionTool.handler({ appDisplayName: "App", billingClassification: "standard", azureSubscriptionId: VALID_SUBSCRIPTION_ID, resourceGroup: "rg-1", region: "eastus" });
 
     // Already-configured, same-target billing must not re-prompt, and must NOT
     // create a new chargeable account (it reuses the existing one).
@@ -253,7 +256,7 @@ describe("project_provision", () => {
     stateStore.resourceGroup = "old-rg";
     vi.mocked(graph.findApplicationByName).mockResolvedValue(null);
 
-    const r = await provisionTool.handler({ appDisplayName: "NewApp", appSelection: "new", billingClassification: "standard", azureSubscriptionId: "sub-2", resourceGroup: "rg-2", region: "eastus" });
+    const r = await provisionTool.handler({ appDisplayName: "NewApp", appSelection: "new", billingClassification: "standard", azureSubscriptionId: OTHER_SUBSCRIPTION_ID, resourceGroup: "rg-2", region: "eastus" });
 
     expect(r.content[0].text).toContain("confirmBilling=true");
     expect(graph.createApplication).not.toHaveBeenCalled();
@@ -268,7 +271,7 @@ describe("project_provision", () => {
     // The region must be validated up front so nothing is created.
     vi.mocked(graph.findApplicationByName).mockResolvedValue(null);
 
-    const r = await provisionTool.handler({ appDisplayName: "App", billingClassification: "standard", azureSubscriptionId: "sub-1", resourceGroup: "rg-1", region: "westus2", confirmBilling: true });
+    const r = await provisionTool.handler({ appDisplayName: "App", billingClassification: "standard", azureSubscriptionId: VALID_SUBSCRIPTION_ID, resourceGroup: "rg-1", region: "westus2", confirmBilling: true });
 
     expect(r.isError).toBe(true);
     expect(r.content[0].text).toMatch(/not available for Microsoft\.Syntex/i);
@@ -284,7 +287,7 @@ describe("project_provision", () => {
     vi.mocked(graph.createContainerType).mockResolvedValue({ containerTypeId: "ct-1", owningAppId: "app-1", displayName: "App Container Type", billingClassification: "standard" });
     vi.mocked(azureCli.createSyntexAccount).mockRejectedValueOnce(new Error("ARM 409"));
 
-    const r = await provisionTool.handler({ appDisplayName: "App", billingClassification: "standard", azureSubscriptionId: "sub-1", resourceGroup: "rg-1", region: "eastus", confirmBilling: true });
+    const r = await provisionTool.handler({ appDisplayName: "App", billingClassification: "standard", azureSubscriptionId: VALID_SUBSCRIPTION_ID, resourceGroup: "rg-1", region: "eastus", confirmBilling: true });
 
     expect(graph.deleteContainerType).toHaveBeenCalledWith("ct-1");
     expect(r.isError).toBe(true);

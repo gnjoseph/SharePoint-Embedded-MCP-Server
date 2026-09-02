@@ -23,6 +23,10 @@ const pkgRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const pkgVersion = (
   JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf8")) as { version: string }
 ).version;
+const serverManifest = JSON.parse(readFileSync(join(pkgRoot, "server.json"), "utf8")) as {
+  version: string;
+  packages: Array<{ version: string }>;
+};
 
 describe("version: single source of truth", () => {
   it("sources PACKAGE_VERSION from package.json", () => {
@@ -32,5 +36,11 @@ describe("version: single source of truth", () => {
   it("derives USER_AGENT from package.json in the spe-mcp-server/<version> format", () => {
     expect(USER_AGENT).toBe(`spe-mcp-server/${pkgVersion}`);
     expect(getUserAgent()).toBe(USER_AGENT);
+  });
+
+  it("keeps the MCP registry manifest aligned with package.json", () => {
+    expect(serverManifest.version).toBe(pkgVersion);
+    expect(serverManifest.packages).toHaveLength(1);
+    expect(serverManifest.packages[0]?.version).toBe(pkgVersion);
   });
 });

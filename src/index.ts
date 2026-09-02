@@ -434,7 +434,8 @@ export async function startServer(config: ServerConfig) {
   }
 
   // Azure CLI (`az`) and Azure Developer CLI (`azd`) consume different
-  // User-Agent environment variables. Preserve caller values in both.
+  // User-Agent environment variables. Preserve unrelated caller values in both
+  // and remove all of this tool's tokens when telemetry is opted out.
   configureAzureUserAgentEnvironment();
 
   // Connect transport first so MCP `initialize` handshake works immediately
