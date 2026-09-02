@@ -235,17 +235,22 @@ export function appendUserAgent(
 ): string | undefined {
   const currentTokens = existing?.trim().split(/\s+/).filter(Boolean) ?? [];
   const preserved = currentTokens.filter((token) => !isOwnedUserAgentToken(token));
-  const combined = [...preserved, ...(value ? value.split(/\s+/) : [])].join(" ");
+  const combined = [
+    ...new Set([...preserved, ...(value ? value.split(/\s+/) : [])]),
+  ].join(" ");
   return combined || undefined;
 }
 
 export function applyProductUserAgent(
   headers: Record<string, string>,
 ): Record<string, string> {
-  const existing = headers["User-Agent"] ?? headers["user-agent"];
+  const userAgentKeys = Object.keys(headers).filter(
+    (key) => key.toLowerCase() === "user-agent",
+  );
+  const existing =
+    userAgentKeys.map((key) => headers[key]).filter(Boolean).join(" ") || undefined;
   const userAgent = appendUserAgent(existing, getUserAgent());
-  delete headers["User-Agent"];
-  delete headers["user-agent"];
+  for (const key of userAgentKeys) delete headers[key];
   if (userAgent) headers["User-Agent"] = userAgent;
   return headers;
 }

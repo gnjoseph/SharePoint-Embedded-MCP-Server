@@ -254,12 +254,15 @@ describe("applyProductUserAgent (opt-out enforcement)", () => {
   it("replaces stale owned tokens without duplicating them", () => {
     setInstallAttribution(resolveInstallAttribution({ source: "github-readme" }));
     const headers = applyProductUserAgent({
-      "User-Agent": `caller/1.0 ${USER_AGENT} spe-install-source/microsoft-learn`,
+      "User-agent": `caller/1.0 ${USER_AGENT} spe-install-source/microsoft-learn`,
+      "USER-AGENT": "caller/1.0 extension/2.0",
     });
 
     expect(headers["User-Agent"]).toBe(
-      `caller/1.0 ${USER_AGENT} spe-install-source/github-readme`,
+      `caller/1.0 extension/2.0 ${USER_AGENT} spe-install-source/github-readme`,
     );
+    expect(headers["User-agent"]).toBeUndefined();
+    expect(headers["USER-AGENT"]).toBeUndefined();
   });
 
   it("strips owned tokens but preserves unrelated User-Agent content when opted out", () => {
