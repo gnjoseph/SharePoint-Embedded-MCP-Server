@@ -2,42 +2,189 @@
 // Licensed under the MIT license.
 
 /**
- * Static product identifier stamped on outbound Microsoft Graph and Azure CLI
- * (`az` / `azd`) requests for aggregate traffic attribution.
+ * Product and optional bounded attribution identifiers stamped on outbound
+ * Microsoft Graph and Azure CLI (`az` / `azd`) requests.
  *
- * This is a constant product/version token. It carries NO per-user, per-tenant,
- * or personal data, opens NO separate telemetry channel, and rides only on the
- * Graph/ARM calls the tool already makes on the user's behalf (e.g. creating a
- * container type). The SharePoint Embedded service can filter request logs on
- * this token to measure how much traffic this tool drives.
- *
- * Because it is the only Microsoft-bound attribution signal this build emits,
- * it is treated as telemetry for opt-out purposes: it is ON by default and is
- * suppressed via the `SPE_MCP_COLLECT_TELEMETRY` environment variable (see
- * {@link telemetryEnabled} / {@link productUserAgent}).
- *
- * The version segment is derived from package.json (the single source of truth)
- * via {@link PACKAGE_VERSION}, so it can never drift out of sync on release.
+ * They carry no per-user, per-tenant, or personal data, open no separate
+ * telemetry channel, and ride only on calls the tool already makes. All tokens
+ * are suppressed by the `SPE_MCP_COLLECT_TELEMETRY` opt-out.
  */
+import { ValidationError } from "./errors.js";
 import { PACKAGE_VERSION } from "./version.js";
 
-/**
- * Product-name segment of {@link USER_AGENT}, without the version. Kept as a
- * single source of truth so the emitted token and the prefix checks used to
- * recognize/strip it (see {@link isProductUserAgent}) can never drift apart.
- */
 const PRODUCT_NAME = "spe-mcp-server";
 
 export const USER_AGENT = `${PRODUCT_NAME}/${PACKAGE_VERSION}`;
 
+export const INSTALL_SOURCES = [
+  "microsoft-learn",
+  "github-readme",
+  "github-release",
+  "mcp-registry",
+  "npm",
+  "other",
+] as const;
+
+export type InstallSource = (typeof INSTALL_SOURCES)[number];
+
+export const INSTALL_CONTENTS = [
+  "readme-install",
+  "sharepoint-embedded-mcp-server",
+  "quickstart-vscode",
+  "create-container-type",
+  "create-manage-containers",
+] as const;
+
+export const INSTALL_CAMPAIGNS = ["docs-install-buttons"] as const;
+
+export const AGENT_HOSTS = [
+  "vscode",
+  "visual-studio",
+  "cursor",
+  "claude-code",
+  "claude-desktop",
+  "codex",
+  "github-copilot-cli",
+  "azure-ai-foundry",
+  "other",
+  "unknown",
+] as const;
+
+export type AgentHost = (typeof AGENT_HOSTS)[number];
+
+export interface InstallAttribution {
+  source: InstallSource;
+  content?: (typeof INSTALL_CONTENTS)[number];
+  campaign?: (typeof INSTALL_CAMPAIGNS)[number];
+}
+
+export interface InstallAttributionInput {
+  source?: string;
+  content?: string;
+  campaign?: string;
+  enabled?: boolean;
+}
+
+const ATTRIBUTION_ID_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/;
+let activeAttribution: InstallAttribution | undefined;
+let activeAgentHost: AgentHost | undefined;
+
+function normalizeOptionalId(value: string | undefined, field: string): string | undefined {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (!ATTRIBUTION_ID_PATTERN.test(normalized)) {
+    throw new ValidationError(
+      `${field} must be a 1-64 character lowercase identifier using only letters, numbers, '.', '_' or '-'.`,
+    );
+  }
+  return normalized;
+}
+
+export function resolveInstallAttribution(
+  input: InstallAttributionInput,
+): InstallAttribution | undefined {
+  if (input.enabled === false) return undefined;
+
+  const source = normalizeOptionalId(input.source, "install source");
+  const content = normalizeOptionalId(input.content, "install content");
+  const campaign = normalizeOptionalId(input.campaign, "install campaign");
+
+  if (!source) {
+    if (content || campaign) {
+      throw new ValidationError(
+        "--install-content and --install-campaign require --install-source.",
+      );
+    }
+    return undefined;
+  }
+
+  if (!INSTALL_SOURCES.includes(source as InstallSource)) {
+    throw new ValidationError(
+      `install source must be one of: ${INSTALL_SOURCES.join(", ")}.`,
+    );
+  }
+  if (
+    content &&
+    !INSTALL_CONTENTS.includes(content as (typeof INSTALL_CONTENTS)[number])
+  ) {
+    throw new ValidationError(
+      `install content must be one of: ${INSTALL_CONTENTS.join(", ")}.`,
+    );
+  }
+  if (
+    campaign &&
+    !INSTALL_CAMPAIGNS.includes(campaign as (typeof INSTALL_CAMPAIGNS)[number])
+  ) {
+    throw new ValidationError(
+      `install campaign must be one of: ${INSTALL_CAMPAIGNS.join(", ")}.`,
+    );
+  }
+
+  return {
+    source: source as InstallSource,
+    ...(content
+      ? { content: content as (typeof INSTALL_CONTENTS)[number] }
+      : {}),
+    ...(campaign
+      ? { campaign: campaign as (typeof INSTALL_CAMPAIGNS)[number] }
+      : {}),
+  };
+}
+
+export function setInstallAttribution(attribution: InstallAttribution | undefined): void {
+  activeAttribution = attribution;
+}
+
 /**
- * Whether the product `User-Agent` attribution token should be stamped on
- * outbound Graph/ARM requests.
- *
- * Attribution is ON by default and is opted out by setting
- * `SPE_MCP_COLLECT_TELEMETRY` to a falsy value (`false`, `0`, `no`, or `off`,
- * case-insensitive). Any other value — or leaving it unset — keeps it on.
+ * Classify the self-reported MCP `initialize.params.clientInfo.name` into a
+ * bounded analytics dimension. This is advisory attribution only, never a
+ * security signal. Unknown raw values are not transmitted.
  */
+export function classifyAgentHost(clientName: string | undefined): AgentHost {
+  const name = clientName?.trim().toLowerCase() ?? "";
+  if (!name || name === "mcp") return "unknown";
+  if (
+    name.includes("visual studio code") ||
+    name.startsWith("code - oss")
+  ) {
+    return "vscode";
+  }
+  if (name.includes("cursor")) return "cursor";
+  if (name === "claude-code" || name.includes("claude code")) {
+    return "claude-code";
+  }
+  if (
+    name === "claude" ||
+    name === "claude-ai" ||
+    name.includes("claude desktop") ||
+    name.startsWith("local-agent-mode-")
+  ) {
+    return "claude-desktop";
+  }
+  if (
+    name.includes("github copilot cli") ||
+    name.includes("copilot-cli") ||
+    name === "github-copilot-developer"
+  ) {
+    return "github-copilot-cli";
+  }
+  if (name.includes("codex")) return "codex";
+  if (name.includes("visual studio")) return "visual-studio";
+  if (name.includes("foundry")) return "azure-ai-foundry";
+  return "other";
+}
+
+export function resolveAgentHostAttribution(
+  clientName: string | undefined,
+  enabled: boolean,
+): AgentHost | undefined {
+  return enabled ? classifyAgentHost(clientName) : undefined;
+}
+
+export function setAgentHostAttribution(agentHost: AgentHost | undefined): void {
+  activeAgentHost = agentHost;
+}
+
 export function telemetryEnabled(
   value: string | undefined = process.env.SPE_MCP_COLLECT_TELEMETRY,
 ): boolean {
@@ -45,47 +192,84 @@ export function telemetryEnabled(
   return !["0", "false", "no", "off"].includes(value.trim().toLowerCase());
 }
 
-/**
- * The product `User-Agent` token to stamp on outbound requests, or `undefined`
- * when attribution is opted out via {@link telemetryEnabled}. Callers omit the
- * header entirely when this returns `undefined`.
- */
 export function productUserAgent(): string | undefined {
   return telemetryEnabled() ? USER_AGENT : undefined;
 }
 
-/**
- * Whether `value` is this tool's product attribution token, for any version
- * (i.e. `spe-mcp-server/<anything>`). Used to recognize — and strip on opt-out —
- * a token this process may have left in the environment on a prior run, without
- * disturbing any unrelated value the user set for their own attribution.
- */
 export function isProductUserAgent(value: string | undefined): boolean {
   return typeof value === "string" && value.startsWith(`${PRODUCT_NAME}/`);
 }
 
-/**
- * Apply the product `User-Agent` attribution policy to an outbound header set,
- * mutating and returning it.
- *
- * - Attribution ON: stamp the product token, but only when the caller has not
- *   already supplied a `User-Agent` (a caller-supplied header still wins,
- *   preserving prior precedence).
- * - Opted out: guarantee no `User-Agent` survives — including one supplied by a
- *   caller — so the documented opt-out cannot be bypassed, accidentally or by a
- *   future call site. Both header-name casings are removed.
- */
+export function getUserAgent(): string | undefined {
+  if (!telemetryEnabled()) return undefined;
+
+  const tokens: string[] = [];
+  if (activeAttribution) {
+    tokens.push(`spe-install-source/${activeAttribution.source}`);
+    if (activeAttribution.content) {
+      tokens.push(`spe-install-content/${activeAttribution.content}`);
+    }
+    if (activeAttribution.campaign) {
+      tokens.push(`spe-install-campaign/${activeAttribution.campaign}`);
+    }
+  }
+  if (activeAgentHost) {
+    tokens.push(`spe-agent-host/${activeAgentHost}`);
+  }
+  return tokens.length > 0 ? `${USER_AGENT} ${tokens.join(" ")}` : USER_AGENT;
+}
+
+function isOwnedUserAgentToken(token: string): boolean {
+  return (
+    isProductUserAgent(token) ||
+    token.startsWith("spe-install-source/") ||
+    token.startsWith("spe-install-content/") ||
+    token.startsWith("spe-install-campaign/") ||
+    token.startsWith("spe-agent-host/")
+  );
+}
+
+export function appendUserAgent(
+  existing: string | undefined,
+  value: string | undefined,
+): string | undefined {
+  const currentTokens = existing?.trim().split(/\s+/).filter(Boolean) ?? [];
+  const preserved = currentTokens.filter((token) => !isOwnedUserAgentToken(token));
+  const combined = [
+    ...new Set([...preserved, ...(value ? value.split(/\s+/) : [])]),
+  ].join(" ");
+  return combined || undefined;
+}
+
 export function applyProductUserAgent(
   headers: Record<string, string>,
 ): Record<string, string> {
-  const ua = productUserAgent();
-  if (ua) {
-    if (headers["User-Agent"] === undefined && headers["user-agent"] === undefined) {
-      headers["User-Agent"] = ua;
-    }
-  } else {
-    delete headers["User-Agent"];
-    delete headers["user-agent"];
-  }
+  const userAgentKeys = Object.keys(headers).filter(
+    (key) => key.toLowerCase() === "user-agent",
+  );
+  const existing =
+    userAgentKeys.map((key) => headers[key]).filter(Boolean).join(" ") || undefined;
+  const userAgent = appendUserAgent(existing, getUserAgent());
+  for (const key of userAgentKeys) delete headers[key];
+  if (userAgent) headers["User-Agent"] = userAgent;
   return headers;
 }
+
+export function configureAzureUserAgentEnvironment(
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  const userAgent = getUserAgent();
+  const azureUserAgent = appendUserAgent(env.AZURE_HTTP_USER_AGENT, userAgent);
+  const azureDevUserAgent = appendUserAgent(env.AZURE_DEV_USER_AGENT, userAgent);
+  if (azureUserAgent) env.AZURE_HTTP_USER_AGENT = azureUserAgent;
+  else delete env.AZURE_HTTP_USER_AGENT;
+  if (azureDevUserAgent) env.AZURE_DEV_USER_AGENT = azureDevUserAgent;
+  else delete env.AZURE_DEV_USER_AGENT;
+}
+
+export const __testing = {
+  reset(): void {
+    activeAttribution = undefined;
+    activeAgentHost = undefined;
+  },
+};

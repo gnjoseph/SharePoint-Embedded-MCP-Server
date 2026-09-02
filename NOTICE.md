@@ -18,22 +18,23 @@ help documentation and our privacy statement. Your use of the software operates 
 consent to these practices.
 
 > **What this build sends.** `@microsoft/spe-mcp` opens **no separate telemetry channel** and
-> sends **no usage analytics or personal, tenant, or per-user data** to Microsoft. The only
-> Microsoft-bound signal is a static product `User-Agent` token
-> (`spe-mcp-server/<version>`) attached to the Microsoft Graph and Azure Resource Manager
-> requests you already make on your own behalf; it carries no personal, tenant, or usage
-> data and is used only for aggregate traffic attribution. It is **on by default** and can be
+> sends **no usage analytics or personal, tenant, or per-user data** to Microsoft. Its only
+> Microsoft-bound signals are a product `User-Agent` token (`spe-mcp-server/<version>`) and
+> optional bounded install-source, content, campaign, and self-reported agent-host tokens
+> attached to the Microsoft Graph and Azure Resource Manager requests you already make on your
+> own behalf. They carry no personal, tenant, or usage data and are used only for aggregate
+> traffic attribution. Attribution is **on by default** and can be
 > suppressed with `SPE_MCP_COLLECT_TELEMETRY=false` (see below). See [PRIVACY.md](PRIVACY.md) and
 > [docs/DATA-FLOW.md](docs/DATA-FLOW.md) for the full data-flow description.
 
 ## Telemetry configuration
 
 Telemetry collection is controlled by the `SPE_MCP_COLLECT_TELEMETRY` environment variable and is
-**on by default**. The only telemetry this build emits is the static product `User-Agent`
-token (`spe-mcp-server/<version>`) stamped on outbound Graph/ARM requests for aggregate traffic
-attribution — there is no usage-analytics channel and no personal, tenant, or per-user data. To
-opt out, set `SPE_MCP_COLLECT_TELEMETRY=false` in your environment; the product token is then
-omitted from all outbound requests.
+**on by default**. The only telemetry this build emits is the product and optional bounded
+attribution tokens in the `User-Agent` stamped on outbound Graph/ARM requests for aggregate
+traffic attribution — there is no usage-analytics channel and no personal, tenant, or per-user
+data. To opt out, set `SPE_MCP_COLLECT_TELEMETRY=false` in your environment; all attribution
+tokens are then omitted from outbound requests.
 
 ## Compliance responsibility
 
