@@ -151,10 +151,8 @@ async function graphRequest<T>(
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
     };
-    // Merge caller headers first, then apply the product User-Agent attribution
-    // policy: stamp the token when telemetry is on (a caller-supplied User-Agent
-    // still wins) and strip any User-Agent when opted out, so the documented
-    // opt-out can't be bypassed by current or future call sites.
+    // Merge caller headers first, then replace this tool's attribution tokens
+    // while preserving unrelated caller User-Agent content.
     const headers = applyProductUserAgent({ ...baseHeaders, ...customHeaders });
 
     const options: RequestInit = { method, headers };

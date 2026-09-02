@@ -190,6 +190,7 @@ describe("install attribution User-Agent", () => {
  */
 
 afterEach(() => {
+  __testing.reset();
   if (saved === undefined) {
     delete process.env.SPE_MCP_COLLECT_TELEMETRY;
   } else {
@@ -244,20 +245,30 @@ describe("applyProductUserAgent (opt-out enforcement)", () => {
     expect(headers["User-Agent"]).toBe(USER_AGENT);
   });
 
-  it("does not overwrite a caller-supplied User-Agent when on", () => {
+  it("preserves a caller-supplied User-Agent and appends attribution when on", () => {
     delete process.env.SPE_MCP_COLLECT_TELEMETRY;
     const headers = applyProductUserAgent({ "User-Agent": "caller/1.0" });
-    expect(headers["User-Agent"]).toBe("caller/1.0");
+    expect(headers["User-Agent"]).toBe(`caller/1.0 ${USER_AGENT}`);
   });
 
-  it("strips any User-Agent (both casings) when opted out", () => {
+  it("replaces stale owned tokens without duplicating them", () => {
+    setInstallAttribution(resolveInstallAttribution({ source: "github-readme" }));
+    const headers = applyProductUserAgent({
+      "User-Agent": `caller/1.0 ${USER_AGENT} spe-install-source/microsoft-learn`,
+    });
+
+    expect(headers["User-Agent"]).toBe(
+      `caller/1.0 ${USER_AGENT} spe-install-source/github-readme`,
+    );
+  });
+
+  it("strips owned tokens but preserves unrelated User-Agent content when opted out", () => {
     process.env.SPE_MCP_COLLECT_TELEMETRY = "false";
     const headers = applyProductUserAgent({
       Authorization: "Bearer x",
-      "User-Agent": "caller/1.0",
-      "user-agent": "caller/1.0",
+      "user-agent": `caller/1.0 ${USER_AGENT} spe-agent-host/vscode`,
     });
-    expect(headers["User-Agent"]).toBeUndefined();
+    expect(headers["User-Agent"]).toBe("caller/1.0");
     expect(headers["user-agent"]).toBeUndefined();
     // Unrelated headers are left intact.
     expect(headers.Authorization).toBe("Bearer x");

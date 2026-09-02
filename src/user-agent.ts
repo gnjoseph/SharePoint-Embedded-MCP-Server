@@ -242,15 +242,11 @@ export function appendUserAgent(
 export function applyProductUserAgent(
   headers: Record<string, string>,
 ): Record<string, string> {
-  const userAgent = getUserAgent();
-  if (userAgent) {
-    if (headers["User-Agent"] === undefined && headers["user-agent"] === undefined) {
-      headers["User-Agent"] = userAgent;
-    }
-  } else {
-    delete headers["User-Agent"];
-    delete headers["user-agent"];
-  }
+  const existing = headers["User-Agent"] ?? headers["user-agent"];
+  const userAgent = appendUserAgent(existing, getUserAgent());
+  delete headers["User-Agent"];
+  delete headers["user-agent"];
+  if (userAgent) headers["User-Agent"] = userAgent;
   return headers;
 }
 
