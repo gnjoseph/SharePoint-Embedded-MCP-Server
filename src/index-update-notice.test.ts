@@ -87,8 +87,17 @@ describe("withUpdateNotice", () => {
 
     expect(result.content).toHaveLength(2);
     expect(result.content[1]?.text).toContain(LATEST);
+    expect(result.content[1]?.text).toContain("update the MCP server manually");
+    expect(result.content[1]?.text).toContain("No command should run automatically");
+    expect(result.content[1]?.text).toContain("Silence with --no-update-check.");
+    expect(result.content[1]?.text).not.toMatch(/\b(?:npm|npx|pnpm|yarn)\b/i);
     expect(result.structuredContent).toMatchObject({
-      updateAvailable: { latest: LATEST, current: PACKAGE_VERSION },
+      updateAvailable: {
+        latest: LATEST,
+        current: PACKAGE_VERSION,
+        target: "stable",
+        packageSpec: `${PACKAGE_NAME}@latest`,
+      },
     });
   });
 

@@ -117,11 +117,16 @@ These never leave your machine:
 
 ## Telemetry
 
-The server opens **no usage-analytics channel** and does **not** collect telemetry — it only
-adds a product `User-Agent` for aggregate product-usage attribution. That signal is a static
-product `User-Agent` (`spe-mcp-server/<version>`) with no personal, tenant, or usage data,
-stamped on outbound Graph/ARM requests. It is **on by default**; set
-`SPE_MCP_COLLECT_TELEMETRY=false` to omit it. Opting out neither silences the request nor adds a
+The server opens **no separate telemetry channel**. Each authenticated Graph/ARM request
+carries a product `User-Agent` (`spe-mcp-server/<version>`). Install configurations can
+add bounded source, content, and campaign labels to that request header. The labels contain
+no personal or tenant identifiers. The MCP handshake's self-reported client name is also
+mapped to a bounded agent-host label; the raw name and client version are not transmitted
+in the request metadata. Microsoft services can associate these labels with the authenticated
+request in normal service logs. Users can omit install and agent-host labels with
+`--no-install-attribution`. All attribution is **on by default**; set
+`SPE_MCP_COLLECT_TELEMETRY=false` to omit every product and bounded attribution token.
+Opting out neither silences the request nor adds a
 new signal — outbound calls simply fall back to the underlying tool's default `User-Agent`
 (the Azure CLI's own token for `az`/`azd`; the Node runtime default for direct Graph calls),
 whose logging is governed by those services' own terms. The npm update check is **not**

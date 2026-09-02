@@ -71,6 +71,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ships `NOTICE.md`, `PRIVACY.md`, `CHANGELOG.md`, `SUPPORT.md`, `SECURITY.md`,
   `CONTRIBUTING.md`, `docs/DATA-FLOW.md`, `docs/SECURITY-CONTROLS.md`, and
   `docs/TROUBLESHOOTING.md`, so the disclosure links in the installed `README.md` resolve.
+- **Bounded install-source attribution.** The `start` command accepts optional
+  `--install-source`, `--install-content`, and `--install-campaign` arguments (plus
+  environment-variable equivalents) and appends their validated, non-personal labels to
+  the existing Graph/ARM request `User-Agent`. After MCP initialization, the server also
+  maps the self-reported client name to a bounded agent-host label (for example `vscode`
+  or `claude-code`); unknown raw client names are never transmitted.
+  `--no-install-attribution` provides an explicit opt-out for all attribution labels. The
+  README install links declare `github-readme` as their source.
 - **Per-instance data directory.** New `--data-dir <path>` flag and `SPE_DATA_DIR`
   environment variable select where the provisioning `state.json` and MSAL token
   cache are stored (precedence: flag > env > default `~/.spe-mcp`). Point each

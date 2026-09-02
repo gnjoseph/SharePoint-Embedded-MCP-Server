@@ -26,7 +26,12 @@ import { initializeAuth, setAuthConfig } from "./auth.js";
 import { assertAzCli, getSignedInIdentity } from "./bootstrap.js";
 import { byoAppStartupNote, azLoginNotSignedInMessage } from "./onboarding-messages.js";
 import { readState } from "./state.js";
-import { productUserAgent, isProductUserAgent } from "./user-agent.js";
+import {
+  configureAzureUserAgentEnvironment,
+  resolveAgentHostAttribution,
+  setAgentHostAttribution,
+  setInstallAttribution,
+} from "./user-agent.js";
 import { PACKAGE_VERSION } from "./version.js";
 import { startUpdateCheck, takePendingUpdateNotice, type UpdateAvailable } from "./update-check.js";
 import type { McpTool, ServerConfig } from "./types.js";
@@ -273,6 +278,7 @@ function toListToolEntry(tool: McpTool) {
  * startServer(). See docs/SECURITY-CONTROLS.md for the control-code legend.
  */
 let activePolicy: ResolvedToolPolicy | null = null;
+let attributionEnabled = true;
 
 /** Tools advertised to the client, filtered by the active policy. */
 function listVisibleTools() {
@@ -305,6 +311,22 @@ const server = new Server(
 // boundary where the concrete `Server` meets our interface — rather than
 // importing the SDK request type throughout the codebase.
 wireElicitation(server as unknown as ElicitationCapableServer);
+
+server.oninitialized = () => {
+  const agentHost = resolveAgentHostAttribution(
+    server.getClientVersion()?.name,
+    attributionEnabled,
+  );
+  setAgentHostAttribution(agentHost);
+  // Graph reads the User-Agent lazily per request. Refresh the Azure CLI
+  // variables now so future az/azd child processes carry the host as well.
+  configureAzureUserAgentEnvironment();
+  if (agentHost) {
+    console.error(
+      `[SPE MCP Server] Agent host attribution: ${agentHost} (self-reported MCP clientInfo)`,
+    );
+  }
+};
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   const tools = listVisibleTools();
@@ -430,6 +452,13 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 
 export async function startServer(config: ServerConfig) {
   log("Starting SharePoint Embedded MCP Server...");
+  attributionEnabled = config.attributionEnabled ?? true;
+  // Do not carry a prior MCP client's host label into startup requests if this
+  // module is reused for another server lifecycle in the same process.
+  setAgentHostAttribution(undefined);
+  setInstallAttribution(
+    attributionEnabled ? config.installAttribution : undefined,
+  );
 
   // SAFE-003 (read-only mode) / SAFE-004 (tool allowlist): build the tool policy
   // once from config (read-only mode and/or an allowlist profile or CSV). When
@@ -446,22 +475,10 @@ export async function startServer(config: ServerConfig) {
     );
   }
 
-  // Stamp outbound `az` / `azd` traffic for aggregate attribution. The Azure
-  // CLI and Developer CLI append AZURE_HTTP_USER_AGENT to their User-Agent on
-  // every ARM request. Respect any value the user already set, and honor the
-  // `SPE_MCP_COLLECT_TELEMETRY` opt-out: when opted out, also strip a stale product
-  // token left in the environment by a prior (non-opted-out) run so the opt-out
-  // is reliably enforced.
-  const armUserAgent = productUserAgent();
-  if (armUserAgent) {
-    if (!process.env.AZURE_HTTP_USER_AGENT) {
-      process.env.AZURE_HTTP_USER_AGENT = armUserAgent;
-    }
-  } else if (isProductUserAgent(process.env.AZURE_HTTP_USER_AGENT)) {
-    // Only our own product token is removed; an unrelated value the user set for
-    // their own attribution is left untouched.
-    delete process.env.AZURE_HTTP_USER_AGENT;
-  }
+  // Azure CLI (`az`) and Azure Developer CLI (`azd`) consume different
+  // User-Agent environment variables. Preserve unrelated caller values in both
+  // and remove all of this tool's tokens when telemetry is opted out.
+  configureAzureUserAgentEnvironment();
 
   // Connect transport first so MCP `initialize` handshake works immediately
   const transport = new StdioServerTransport();

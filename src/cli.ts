@@ -16,6 +16,12 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
+import {
+  INSTALL_CAMPAIGNS,
+  INSTALL_CONTENTS,
+  INSTALL_SOURCES,
+  resolveInstallAttribution,
+} from "./user-agent.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -75,6 +81,22 @@ program
     "--tools <profileOrCsv>",
     "Restrict exposed tools: a built-in profile (readOnly, docsOnly, provisioning, content, admin) or a comma-separated list of tool names. Can also be set via SPE_TOOLS.",
   )
+  .option(
+    "--install-source <source>",
+    `Bounded install surface added to existing Graph/ARM requests (${INSTALL_SOURCES.join(", ")}). Can also be set via SPE_INSTALL_SOURCE.`,
+  )
+  .option(
+    "--install-content <id>",
+    `Optional bounded content identifier (${INSTALL_CONTENTS.join(", ")}). Requires --install-source. Can also be set via SPE_INSTALL_CONTENT.`,
+  )
+  .option(
+    "--install-campaign <id>",
+    `Optional bounded campaign identifier (${INSTALL_CAMPAIGNS.join(", ")}). Requires --install-source. Can also be set via SPE_INSTALL_CAMPAIGN.`,
+  )
+  .option(
+    "--no-install-attribution",
+    "Do not add install-source or self-reported agent-host metadata to outbound requests.",
+  )
   .option("--data-dir <path>", DATA_DIR_OPTION)
   .option(
     "--no-update-check",
@@ -86,6 +108,10 @@ program
       tenantId?: string;
       readOnly?: boolean;
       tools?: string;
+      installSource?: string;
+      installContent?: string;
+      installCampaign?: string;
+      installAttribution?: boolean;
       dataDir?: string;
       updateCheck?: boolean;
     }) => {
@@ -99,6 +125,17 @@ program
         const readOnly = options.readOnly === true || isTruthyEnv(process.env.SPE_READ_ONLY);
         // Tool allowlist/profile: CLI flag wins; otherwise SPE_TOOLS env.
         const tools = options.tools || process.env.SPE_TOOLS;
+        const attributionEnabled =
+          options.installAttribution !== false &&
+          !["0", "false", "no", "off"].includes(
+            (process.env.SPE_INSTALL_ATTRIBUTION ?? "").trim().toLowerCase(),
+          );
+        const installAttribution = resolveInstallAttribution({
+          source: options.installSource || process.env.SPE_INSTALL_SOURCE,
+          content: options.installContent || process.env.SPE_INSTALL_CONTENT,
+          campaign: options.installCampaign || process.env.SPE_INSTALL_CAMPAIGN,
+          enabled: attributionEnabled,
+        });
         // Update awareness: commander sets updateCheck=false for --no-update-check.
         // Environment opt-outs are applied inside the update checker itself.
         const updateCheck = options.updateCheck !== false;
@@ -107,7 +144,15 @@ program
         // the Azure CLI provides the control-plane token and the owning app is
         // provisioned on demand.
         const { startServer } = await import("./index.js");
-        await startServer({ clientId, tenantId, readOnly, tools, updateCheck });
+        await startServer({
+          clientId,
+          tenantId,
+          readOnly,
+          tools,
+          updateCheck,
+          installAttribution,
+          attributionEnabled,
+        });
       } catch (error) {
         console.error("Failed to start SPE MCP server:");
         if (error instanceof Error) {

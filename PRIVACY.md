@@ -10,12 +10,12 @@ organization's agreements with Microsoft.
 ## What the tool collects and sends
 
 **The tool opens no dedicated usage-analytics channel and sends no personal, tenant, or
-per-user data to Microsoft.** The only Microsoft-bound attribution signal is a static product
-`User-Agent` token, which is on by default and can be turned off (see
+per-user data to Microsoft.** Its Microsoft-bound attribution signals are bounded `User-Agent`
+tokens, which are on by default and can be turned off (see
 [Turning it off](#turning-it-off)). The only destination that is **not a Microsoft 365 or Azure
-Online Service** is an unauthenticated public-package lookup — sent without a user identifier —
-on the npm registry used to notify you of
-newer releases, which can also be turned off. Specifically:
+Online Service** is an unauthenticated public-package lookup on the configured npm registry,
+sent without a user identifier to notify you of newer releases; it can also be turned off.
+Specifically:
 
 - **No telemetry channel.** The tool does not implement application telemetry and does not
   "phone home." Diagnostic logs are written to the local process's **stderr only**, with
@@ -29,12 +29,16 @@ newer releases, which can also be turned off. Specifically:
   endpoints — Microsoft Graph and Azure Resource Manager — **on your behalf**, in **your**
   tenant and subscription. The content and directory data involved flow between your machine
   and those Microsoft services; the tool adds no additional recipients.
-- **Product `User-Agent`.** Outbound Graph/ARM requests are stamped with a static
-  `User-Agent` of the form `spe-mcp-server/<version>` (`src/user-agent.ts`). It contains
-  **no personal, tenant, or usage information** and exists only so the service can measure
-  aggregate traffic driven by this tool. It is a request header on calls you already make —
-  not a separate data feed — and it is **on by default**; set `SPE_MCP_COLLECT_TELEMETRY=false`
-  to omit it (see [Turning it off](#turning-it-off)).
+- **Product and install-source `User-Agent`.** Outbound Graph/ARM requests are stamped
+  with `spe-mcp-server/<version>` (`src/user-agent.ts`). Install links can also configure
+  bounded source, content, and campaign labels such as `microsoft-learn` and an article
+  slug. The MCP handshake's self-reported client name is mapped to a bounded agent-host
+  label; the raw name and client version are not transmitted in the request metadata.
+  These labels contain **no personal or tenant identifiers**, but they accompany each
+  authenticated request and Microsoft services can associate them with that request in
+  normal service logs. They exist so the service can measure aggregate traffic driven by
+  published install surfaces and agent hosts; they are not a separate data feed. Attribution
+  is **on by default**; set `SPE_MCP_COLLECT_TELEMETRY=false` to omit all of these tokens.
 - **Update check (public npm registry by default; configurable).** At most once every 24 hours
   for the same running package version and registry, across server processes sharing the same
   retained data-directory cache, the tool reads the
@@ -145,7 +149,6 @@ newer releases, which can also be turned off. Specifically:
   `HTTPS_PROXY` / `NO_PROXY` when it is enabled with `NODE_USE_ENV_PROXY=1` or
   `--use-env-proxy`; Node 22 may ignore those variables and attempt a direct connection. If
   proxy routing is required, enforce it at the runtime or network layer, or disable the check.
-
 See [docs/DATA-FLOW.md](docs/DATA-FLOW.md) for the full list of network endpoints and what
 travels to each.
 
@@ -153,7 +156,7 @@ travels to each.
 > software "may collect information about you and your use of the software and send it to
 > Microsoft" (full text in [NOTICE.md](NOTICE.md#data-collection)). It is reproduced for
 > completeness; **this build opens no usage-analytics channel** — the only Microsoft-bound
-> signal is the product `User-Agent` attribution token described above, which is on by default
+> signals are the bounded `User-Agent` attribution tokens described above, which are on by default
 > and can be turned off (see [Turning it off](#turning-it-off) and the
 > [Telemetry configuration](NOTICE.md#telemetry-configuration) note). Separately from anything
 > sent to Microsoft, the default-on update check contacts the public npm registry by default,
@@ -183,10 +186,14 @@ terms, which are outside the control of this project.
 
 ## Turning it off
 
-The product `User-Agent` attribution token (`spe-mcp-server/<version>`) is the only
-Microsoft-bound telemetry signal, and it is **on by default**. To opt out, set
-`SPE_MCP_COLLECT_TELEMETRY=false` in your environment; the tool then omits the token from all
-outbound Graph and Azure Resource Manager requests. Those requests still go out — they simply
+Because the tool has no telemetry channel, there is no separate telemetry stream to opt out
+of. To omit install-source labels while retaining the product token, remove the
+`--install-source`, `--install-content`, and `--install-campaign` arguments from the MCP
+client configuration. To omit both install-source and agent-host labels, add
+`--no-install-attribution`. All attribution is **on by default**. To opt out, set
+`SPE_MCP_COLLECT_TELEMETRY=false` in your environment; the tool then omits the product,
+install-source, content, campaign, and agent-host tokens from all outbound Graph and Azure
+Resource Manager requests. Those requests still go out — they simply
 carry the underlying tool's default `User-Agent` instead (e.g. the Azure CLI's own token for
 `az`/`azd`, or the Node runtime default for direct Graph calls), whose logging is governed by
 those services' own terms.

@@ -273,12 +273,24 @@ describe("update notice delivery over spawned JSON-RPC (AB#3219517)", () => {
       );
       expect(first.text).toContain(EXPECTED_LATEST);
       expect(first.text).toContain(pkg.version);
+      if (CHANNEL_TAG) {
+        expect(first.text).toContain(`(${CHANNEL_TAG} channel)`);
+      } else {
+        expect(first.text).not.toContain("(stable channel)");
+      }
+      expect(first.text).toContain("update the MCP server manually");
+      expect(first.text).toContain("No command should run automatically");
+      expect(first.text).toContain("Silence with --no-update-check.");
+      expect(first.text).not.toMatch(/\b(?:npm|npx|pnpm|yarn)\b/i);
       // F8: the structured twin is created even though this tool returns none.
       const update = first.structured?.["updateAvailable"] as Record<string, unknown> | undefined;
       expect(update, "structuredContent.updateAvailable should be created").toBeDefined();
       expect(update?.["latest"]).toBe(EXPECTED_LATEST);
       expect(update?.["current"]).toBe(pkg.version);
       expect(update?.["target"]).toBe(CHANNEL_TAG ? "channel" : "stable");
+      expect(update?.["packageSpec"]).toBe(
+        `${pkg.name}@${CHANNEL_TAG ?? "latest"}`,
+      );
 
       const second = await callSafeTool(client);
       expect(second.text, "the notice must not repeat within a session").not.toMatch(

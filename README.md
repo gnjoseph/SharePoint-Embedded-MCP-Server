@@ -77,6 +77,24 @@ The server exposes **40 tools**, plus an MCP **Prompt** (`provision_spe_app`) an
 Run the published npm package directly from your MCP client with `npx`; no
 global install is required.
 
+### One-click install
+
+[Install in Visual Studio Code](https://aka.ms/spe-mcp/install/github/vscode)
+
+One-click install is also available for [Visual Studio Code Insiders](https://aka.ms/spe-mcp/install/github/vscode-insiders), [Visual Studio](https://aka.ms/spe-mcp/install/github/visual-studio), and [Cursor](https://aka.ms/spe-mcp/install/github/cursor). From the command line, run `claude mcp add spe -- npx -y @microsoft/spe-mcp start --install-source github-readme --install-content readme-install --install-campaign docs-install-buttons` for Claude Code or `codex mcp add spe -- npx -y @microsoft/spe-mcp start --install-source github-readme --install-content readme-install --install-campaign docs-install-buttons` for the Codex CLI.
+
+These configurations add bounded, non-personal install-source labels to the
+existing Graph and Azure request `User-Agent`; they create no separate telemetry
+channel. Remove the three install-attribution arguments, or add
+`--no-install-attribution`, to omit the labels.
+
+After the MCP handshake, the server also maps the client's self-reported
+`clientInfo.name` to a bounded agent-host value such as `vscode`, `cursor`, or
+`claude-code`. Unrecognized names become `other`; missing or generic SDK values
+become `unknown`. The raw client name and client version are not transmitted, and
+the classification is used only for attribution—not for authorization or any
+security decision.
+
 ### VS Code / Cursor
 
 Add an MCP server entry to `.vscode/mcp.json` (VS Code) or your Cursor MCP
@@ -88,7 +106,17 @@ configuration:
     "spe": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@microsoft/spe-mcp"]
+      "args": [
+        "-y",
+        "@microsoft/spe-mcp",
+        "start",
+        "--install-source",
+        "github-readme",
+        "--install-content",
+        "readme-install",
+        "--install-campaign",
+        "docs-install-buttons"
+      ]
     }
   }
 }
@@ -106,7 +134,17 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or
   "mcpServers": {
     "spe": {
       "command": "npx",
-      "args": ["-y", "@microsoft/spe-mcp"]
+      "args": [
+        "-y",
+        "@microsoft/spe-mcp",
+        "start",
+        "--install-source",
+        "github-readme",
+        "--install-content",
+        "readme-install",
+        "--install-campaign",
+        "docs-install-buttons"
+      ]
     }
   }
 }
@@ -141,8 +179,8 @@ running package version and registry while the cache is retained:
 
 ```text
 Update available: @microsoft/spe-mcp 0.2.0-alpha.1 -> 0.2.0-alpha.4 (alpha channel).
-This notice is informational only — nothing is installed or changed automatically, and no command should be run in response to it. Updating requires a person to change the MCP client configuration or the installed package: point the client at @microsoft/spe-mcp@alpha by updating or pinning the package spec in the client config (for example the npx args), or have the copy that is actually launched (a global or project-local installation, for instance) reinstalled at that same spec. An unpinned npx launch may keep starting a cached build.
-Nothing was downloaded, installed, or executed; this is a notification only, not an instruction to run any command. Disable this check with --no-update-check or SPE_MCP_UPDATE_CHECK=false.
+Note: This is just a notice. If you choose to update, update the MCP server manually. No command should run automatically.
+Silence with --no-update-check.
 ```
 
 The current version and the update state are also reported by `status_get`, so
@@ -296,10 +334,14 @@ The server accepts configuration via CLI flags or environment variables:
 | `--tenant-id` | `SPE_TENANT_ID` | Entra ID Tenant ID |
 | `--read-only` | `SPE_READ_ONLY` | Advertise/allow only read/list/get/search tools; reject mutating calls |
 | `--tools` | `SPE_TOOLS` | Restrict exposed tools to a profile (`readOnly`, `docsOnly`, `provisioning`, `content`, `admin`) or a comma-separated tool list |
+| `--install-source` | `SPE_INSTALL_SOURCE` | Optional bounded install surface: `microsoft-learn`, `github-readme`, `github-release`, `mcp-registry`, `npm`, or `other` |
+| `--install-content` | `SPE_INSTALL_CONTENT` | Optional bounded content identifier: `readme-install`, `sharepoint-embedded-mcp-server`, `quickstart-vscode`, `create-container-type`, or `create-manage-containers`; requires an install source |
+| `--install-campaign` | `SPE_INSTALL_CAMPAIGN` | Optional bounded campaign identifier: `docs-install-buttons`; requires an install source |
+| `--no-install-attribution` | `SPE_INSTALL_ATTRIBUTION=off` | Omit install-source and agent-host labels from outbound request metadata |
 | `--data-dir` | `SPE_DATA_DIR` | Directory for the token cache + provisioning state (default `~/.spe-mcp`). Point each instance at a unique **absolute** path (or `~/...`; CWD-relative paths are rejected) to run multiple servers without clobbering state |
 | `--no-update-check` | `SPE_MCP_UPDATE_CHECK=false` | Disable the once-a-day npm version check that tells you when a newer server release is published (see [Update notifications](#update-notifications)). Also honours `SPE_NO_UPDATE_CHECK=1` (**legacy alias**), the community-standard `NO_UPDATE_NOTIFIER=1`, and `SPE_MCP_COLLECT_TELEMETRY=false`. When disabled, no network request, stderr notice, or cache write occurs |
 | _(none)_ | `SPE_NPM_REGISTRY` | Registry base URL for the update check (default `https://registry.npmjs.org` — npm, Inc./GitHub, **not a Microsoft 365 or Azure Online Service** and outside the Microsoft 365 / Azure compliance boundary). **HTTPS only**; credentials, query strings, and fragments are rejected |
-| _(none)_ | `SPE_MCP_COLLECT_TELEMETRY` | Product `User-Agent` attribution token on outbound Graph/ARM requests. On by default; set to `false` to opt out — this also suppresses the update-check request entirely (see [PRIVACY.md](PRIVACY.md)) |
+| _(none)_ | `SPE_MCP_COLLECT_TELEMETRY` | Product and optional bounded `User-Agent` attribution tokens on outbound Graph/ARM requests. On by default; set to `false` to opt out — this also suppresses the update-check request entirely (see [PRIVACY.md](PRIVACY.md)) |
 
 > The CLI flag wins when both a flag and its env var are set. Run
 > `spe-mcp start --help` to see the authoritative option list and descriptions.
@@ -379,7 +421,7 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or `~/Library/App
 
 ```bash
 # Start the MCP server (stdio transport)
-spe-mcp start [--client-id ID] [--tenant-id ID] [--read-only] [--tools <profileOrCsv>] [--no-update-check]
+spe-mcp start [--client-id ID] [--tenant-id ID] [--read-only] [--tools <profileOrCsv>] [--install-source <source>] [--no-update-check]
 
 # Authenticate interactively (cache tokens for headless use)
 spe-mcp auth --client-id ID --tenant-id ID [--reset]
@@ -398,6 +440,10 @@ Every command has built-in help — run `spe-mcp <command> --help` (e.g.
 | `--read-only` | Read-only mode: only read/list/get/search tools are exposed and callable. |
 | `--tools <profileOrCsv>` | Tool allowlist: a profile (`readOnly`, `docsOnly`, `provisioning`, `content`, `admin`) or a comma-separated list of tool names. |
 | `--no-update-check` | Disable the daily npm version check (see [Update notifications](#update-notifications)). |
+| `--install-source <source>` | Add a bounded install surface to the existing Graph/ARM request `User-Agent`. |
+| `--install-content <id>` | Add one of the bounded content identifiers listed in [Configuration](#configuration); requires `--install-source`. |
+| `--install-campaign <id>` | Add the bounded `docs-install-buttons` campaign identifier; requires `--install-source`. |
+| `--no-install-attribution` | Omit install-source and agent-host labels from outbound request metadata. |
 
 ## Authentication
 
@@ -444,12 +490,32 @@ The data directory holds a single provisioning `state.json` plus the token cache
   "servers": {
     "spe-tenantA": {
       "command": "npx",
-      "args": ["-y", "@microsoft/spe-mcp", "start"],
+      "args": [
+        "-y",
+        "@microsoft/spe-mcp",
+        "start",
+        "--install-source",
+        "github-readme",
+        "--install-content",
+        "readme-install",
+        "--install-campaign",
+        "docs-install-buttons"
+      ],
       "env": { "SPE_DATA_DIR": "~/.spe-mcp-tenantA", "SPE_TENANT_ID": "<tenant-A>" }
     },
     "spe-tenantB": {
       "command": "npx",
-      "args": ["-y", "@microsoft/spe-mcp", "start"],
+      "args": [
+        "-y",
+        "@microsoft/spe-mcp",
+        "start",
+        "--install-source",
+        "github-readme",
+        "--install-content",
+        "readme-install",
+        "--install-campaign",
+        "docs-install-buttons"
+      ],
       "env": { "SPE_DATA_DIR": "~/.spe-mcp-tenantB", "SPE_TENANT_ID": "<tenant-B>" }
     }
   }
@@ -490,7 +556,7 @@ src/
 ├── resources.ts            — MCP Resources (reference architectures)
 ├── reference-architectures.ts — Reference-architecture catalog (reads ../samples/)
 ├── elicitation.ts          — Interactive consent / step-up prompts
-├── user-agent.ts           — Product User-Agent token + SPE_MCP_COLLECT_TELEMETRY opt-out
+├── user-agent.ts           — Product/bounded User-Agent attribution + telemetry opt-out
 ├── types.ts                — Shared TypeScript types
 └── tools/                  — 31 tools across 28 modules (one McpTool per export)
     ├── status.ts                   — status_get
@@ -694,14 +760,17 @@ Resource Manager — **on your behalf**; the content and directory data involved
 between your machine, your MCP client, and those Microsoft services in your own
 tenant/subscription.
 
-The server opens **no separate telemetry channel** and sends **no usage analytics** to
-Microsoft. Outbound Graph/ARM requests carry a **static product `User-Agent`**
-(`spe-mcp-server/<version>`) that contains **no personal, tenant, or usage data** and is
-used only for aggregate traffic attribution. That attribution token is **on by default** and
-can be suppressed with `SPE_MCP_COLLECT_TELEMETRY=false` (see **Telemetry configuration** below).
-Authentication tokens are cached locally with owner-only permissions (**SEC-003**). For
-details see [PRIVACY.md](PRIVACY.md) and [docs/DATA-FLOW.md](docs/DATA-FLOW.md); Microsoft's
-handling of data you send to its online services is described in the
+The server opens **no separate telemetry channel**. Each authenticated Graph/ARM request
+carries a product `User-Agent` (`spe-mcp-server/<version>`). An install configuration can
+add bounded source, content, campaign, and self-reported agent-host labels to that
+request header. The raw MCP client name and version are not sent in these labels.
+The labels contain no personal or tenant identifiers, but Microsoft services can
+associate them with the authenticated request in normal service logs. Omit install and
+agent-host labels with `--no-install-attribution`, or all attribution tokens with
+`SPE_MCP_COLLECT_TELEMETRY=false`. Authentication tokens are cached locally with owner-only
+permissions (**SEC-003**). For details see [PRIVACY.md](PRIVACY.md) and
+[docs/DATA-FLOW.md](docs/DATA-FLOW.md); Microsoft's handling of data you send to its online
+services is described in the
 [Microsoft Privacy Statement](https://privacy.microsoft.com/privacystatement).
 
 The one destination contacted by default that is **not a Microsoft 365 or Azure Online Service**
@@ -738,9 +807,9 @@ to npm/GitHub or classify it as inside or outside a particular boundary.
 you and your use of the software and send it to Microsoft; Microsoft may use this information
 to provide and improve products and services, and your use of the software operates as your
 consent to these practices (full text in [NOTICE.md](NOTICE.md#data-collection)). **This
-build opens no usage-analytics channel** — the only Microsoft-bound signal is the product
-`User-Agent` attribution token described above, which you can turn off with
-`SPE_MCP_COLLECT_TELEMETRY=false`. Separately from anything sent to Microsoft, the default-on
+build opens no usage-analytics channel** — its only Microsoft-bound signals are the bounded
+`User-Agent` attribution tokens described above, which you can turn off with
+`SPE_MCP_COLLECT_TELEMETRY=false`. Separately, the default-on
 [update check](#update-notifications) contacts the **public npm registry by default**
 (`registry.npmjs.org`, operated by npm, Inc./GitHub). That endpoint is **not a Microsoft 365 or
 Azure Online Service**: it sits **outside the Microsoft 365 / Azure compliance boundary** and is
@@ -750,10 +819,11 @@ Addendum (DPA), or the EU Data Boundary. See the npm registry disclosure above a
 is and is not disclosed, how configured registries are handled, and how to turn it off.
 
 **Telemetry configuration.** Attribution is gated by the `SPE_MCP_COLLECT_TELEMETRY` environment
-variable and is **on by default**. The only telemetry emitted is the static product
-`User-Agent` token on outbound Graph/ARM requests (aggregate traffic attribution — no usage
-analytics, no personal/tenant/per-user data). Set `SPE_MCP_COLLECT_TELEMETRY=false` to omit the
-token from all outbound requests; those requests then fall back to the underlying tool's
+variable and is **on by default**. The only telemetry emitted is the product and optional
+bounded attribution tokens in the `User-Agent` on outbound Graph/ARM requests (aggregate
+traffic attribution — no usage analytics or personal/tenant/per-user data). Set
+`SPE_MCP_COLLECT_TELEMETRY=false` to omit all attribution tokens from outbound requests;
+those requests then fall back to the underlying tool's
 default `User-Agent` (the Azure CLI's own token for `az`/`azd`; the Node runtime default for
 direct Graph calls).
 

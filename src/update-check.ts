@@ -109,7 +109,7 @@ import {
   writeSecureFileAtomic,
 } from "./secure-fs.js";
 import { isNewer, parseSemver, releaseChannel, type SemVer } from "./semver.js";
-import { applyProductUserAgent } from "./user-agent.js";
+import { productUserAgent } from "./user-agent.js";
 import { PACKAGE_NAME, PACKAGE_VERSION } from "./version.js";
 
 /** Default public registry. Overridable only by an explicit HTTPS URL. */
@@ -571,15 +571,17 @@ async function fetchDistTags(
   emitCollectionNotice(registry);
 
   try {
+    const userAgent = productUserAgent();
     const response = await fetch(url, {
       method: "GET",
       redirect: "error",
       credentials: "omit",
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      headers: applyProductUserAgent({
+      headers: {
         // The abbreviated packument is orders of magnitude smaller than the full one.
         accept: "application/vnd.npm.install-v1+json",
-      }),
+        ...(userAgent ? { "User-Agent": userAgent } : {}),
+      },
     });
     if (!response.ok) return null;
 
@@ -1226,33 +1228,22 @@ function buildUpdateAvailable(
  *    read by agents as well as humans, so it must not look like a shell command to
  *    execute. Updating is a human decision that changes MCP client configuration or
  *    a package installation; this server never performs it.
- * 2. It is **execution-mode neutral**. This server is commonly launched by an MCP
- *    client through an unpinned `npx -y @microsoft/spe-mcp`, in which case updating a
- *    global installation would update something the client never runs. We therefore
- *    name the package *spec* to move to and let a person apply it to whichever launch
- *    mechanism they actually configured.
+ * 2. It is **execution-mode neutral**. The structured result carries the package
+ *    specs for clients that can present installation-specific guidance safely; the
+ *    human-readable notice does not guess how this server was launched.
  */
 function renderNotice(update: UpdateAvailable): string {
+  const channel =
+    update.target === "channel" && update.channel ? ` (${update.channel} channel)` : "";
   const lines = [
-    `Update available: ${update.package} ${update.current} -> ${update.latest}` +
-      `${update.target === "channel" && update.channel ? ` (${update.channel} channel)` : ""}.`,
-    `This notice is informational only — nothing is installed or changed ` +
-      `automatically, and no command should be run in response to it. Updating ` +
-      `requires a person to change the MCP client configuration or the installed ` +
-      `package: point the client at ${update.packageSpec} by updating or pinning the ` +
-      `package spec in the client config (for example the npx args), or have the copy ` +
-      `that is actually launched (a global or project-local installation, for ` +
-      `instance) reinstalled at that same spec. An unpinned npx launch may keep ` +
-      `starting a cached build.`,
+    `Update available: ${update.package} ${update.current} -> ${update.latest}${channel}.`,
+    "Note: This is just a notice. If you choose to update, update the MCP server manually. " +
+      "No command should run automatically.",
   ];
   if (update.stable && update.stablePackageSpec) {
-    lines.push(`Latest stable release: ${update.stable} (spec ${update.stablePackageSpec}).`);
+    lines.push(`Stable release also available: ${update.package} ${update.stable}.`);
   }
-  lines.push(
-    "Nothing was downloaded, installed, or executed; this is a notification only, " +
-      "not an instruction to run any command. Disable this check with " +
-      "--no-update-check or SPE_MCP_UPDATE_CHECK=false.",
-  );
+  lines.push("Silence with --no-update-check.");
   return lines.join("\n");
 }
 

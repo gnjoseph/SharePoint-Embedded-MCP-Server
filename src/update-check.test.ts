@@ -39,6 +39,13 @@ import {
   takePendingUpdateNotice,
 } from "./update-check.js";
 import { parseSemver, releaseChannel } from "./semver.js";
+import {
+  USER_AGENT,
+  resolveInstallAttribution,
+  setAgentHostAttribution,
+  setInstallAttribution,
+  __testing as userAgentTesting,
+} from "./user-agent.js";
 import { PACKAGE_NAME, PACKAGE_VERSION } from "./version.js";
 import {
   getUpdateCacheFile,
@@ -116,6 +123,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   __testing.reset();
+  userAgentTesting.reset();
   pathsTesting.reset();
   rmSync(dataDir, { recursive: true, force: true });
   for (const key of ENV_KEYS) {
@@ -493,7 +501,7 @@ describe("cache", () => {
 // ---------------------------------------------------------------------------
 
 describe("renderNotice", () => {
-  it("names the channel and the package spec to move to", () => {
+  it("renders the concise notice with versions, channel, manual action, and opt-out", () => {
     const text = __testing.renderNotice({
       package: PACKAGE_NAME,
       current: "1.0.0-alpha.1",
@@ -502,17 +510,17 @@ describe("renderNotice", () => {
       channel: "alpha",
       packageSpec: `${PACKAGE_NAME}@alpha`,
     });
-    expect(text).toContain("1.0.0-alpha.1 -> 1.0.0-alpha.2");
-    expect(text).toContain("(alpha channel)");
-    expect(text).toContain(`${PACKAGE_NAME}@alpha`);
-    expect(text).toContain("--no-update-check");
-    expect(text).not.toContain("Latest stable release");
+    expect(text).toBe(
+      `Update available: ${PACKAGE_NAME} 1.0.0-alpha.1 -> 1.0.0-alpha.2 (alpha channel).\n` +
+        "Note: This is just a notice. If you choose to update, update the MCP server manually. " +
+        "No command should run automatically.\n" +
+        "Silence with --no-update-check.",
+    );
+    expect(text).not.toContain(`${PACKAGE_NAME}@alpha`);
+    expect(text).not.toContain("Stable release also available");
   });
 
-  // B1: the server is usually launched by an MCP client through an unpinned
-  // `npx -y @microsoft/spe-mcp`. Guidance that names ONLY a global install would
-  // tell the user to update something the client never runs.
-  it("gives execution-mode neutral remediation, not a bare global install", () => {
+  it("remains agent-safe without installation or environment-specific commands", () => {
     const text = __testing.renderNotice({
       package: PACKAGE_NAME,
       current: "1.0.0-alpha.1",
@@ -521,38 +529,11 @@ describe("renderNotice", () => {
       channel: "alpha",
       packageSpec: `${PACKAGE_NAME}@alpha`,
     });
-    // Points at the client configuration first...
-    expect(text).toContain("MCP client");
-    expect(text).toMatch(/package spec/i);
-    // ...warns about the unpinned npx caching trap...
-    expect(text).toMatch(/npx/i);
-    expect(text).toMatch(/cached build/i);
-    // ...and names the installation modes without dictating a shell command.
-    expect(text).toMatch(/global or project-local installation/i);
-    expect(text).toMatch(/reinstalled/i);
-    // Still explicitly notify-only.
-    expect(text).toContain("Nothing was downloaded, installed, or executed");
-  });
-
-  // CELA R2: the notice rides a tool result an agent may act on, so it must read
-  // as information, never as a command an autonomous client should execute.
-  it("frames remediation as informational and human-driven, not an executable command", () => {
-    const text = __testing.renderNotice({
-      package: PACKAGE_NAME,
-      current: "1.0.0-alpha.1",
-      latest: "1.0.0-alpha.2",
-      target: "channel",
-      channel: "alpha",
-      packageSpec: `${PACKAGE_NAME}@alpha`,
-    });
-    expect(text).toMatch(/informational only/i);
-    expect(text).toMatch(/no command should be run in response/i);
-    expect(text).toMatch(/not an instruction to run any command/i);
-    // Updating is a person changing config, not the server acting.
-    expect(text).toMatch(/requires a person/i);
-    // No copy-pasteable install command anywhere in the notice.
-    expect(text).not.toMatch(/npm install/i);
-    expect(text).not.toMatch(/npm i\b/i);
+    expect(text).toContain("just a notice");
+    expect(text).toContain("update the MCP server manually");
+    expect(text).toContain("No command should run automatically");
+    expect(text).not.toMatch(/\b(?:npm|npx|pnpm|yarn)\b/i);
+    expect(text).not.toMatch(/\b(?:install|reinstall)\b/i);
   });
 
   it("calls out a separate stable target when one exists", () => {
@@ -566,11 +547,11 @@ describe("renderNotice", () => {
       packageSpec: `${PACKAGE_NAME}@alpha`,
       stablePackageSpec: `${PACKAGE_NAME}@latest`,
     });
-    expect(text).toContain("Latest stable release: 2.0.0");
-    expect(text).toContain(`spec ${PACKAGE_NAME}@latest`);
+    expect(text).toContain(`Stable release also available: ${PACKAGE_NAME} 2.0.0.`);
+    expect(text).not.toContain(`${PACKAGE_NAME}@latest`);
   });
 
-  it("omits the channel clause for a stable build", () => {
+  it("labels a stable target and omits the optional stable-release line", () => {
     const text = __testing.renderNotice({
       package: PACKAGE_NAME,
       current: "1.0.0",
@@ -579,8 +560,10 @@ describe("renderNotice", () => {
       channel: null,
       packageSpec: `${PACKAGE_NAME}@latest`,
     });
-    expect(text).not.toContain("channel)");
-    expect(text).toContain(`${PACKAGE_NAME}@latest`);
+    expect(text).toContain(`Update available: ${PACKAGE_NAME} 1.0.0 -> 1.1.0.`);
+    expect(text).not.toContain("(stable channel)");
+    expect(text).not.toContain("Stable release also available");
+    expect(text).not.toContain(`${PACKAGE_NAME}@latest`);
   });
 });
 
@@ -626,6 +609,26 @@ describe("runUpdateCheck", () => {
     expect(Object.keys(headers).map((k) => k.toLowerCase())).not.toContain("authorization");
     expect(Object.keys(headers).map((k) => k.toLowerCase())).not.toContain("cookie");
     expect(REQUEST_TIMEOUT_MS).toBe(2_000);
+  });
+
+  it("does not send install-source or agent-host attribution to the npm registry", async () => {
+    setInstallAttribution(
+      resolveInstallAttribution({
+        source: "github-readme",
+        content: "readme-install",
+        campaign: "docs-install-buttons",
+      }),
+    );
+    setAgentHostAttribution("vscode");
+    respondWith(packument(tagsFixture()));
+
+    await __testing.runUpdateCheck({});
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const headers = init.headers as Record<string, string>;
+    expect(headers["User-Agent"]).toBe(USER_AGENT);
+    expect(headers["User-Agent"]).not.toContain("spe-install-");
+    expect(headers["User-Agent"]).not.toContain("spe-agent-host/");
   });
 
   it("does not notify twice for the same target across restarts", async () => {
@@ -718,7 +721,11 @@ describe("runUpdateCheck", () => {
         packageSpec: `${PACKAGE_NAME}@latest`,
       });
       expect(notice?.text).not.toContain("(alpha channel)");
-      expect(notice?.text).toContain(`${PACKAGE_NAME}@latest`);
+      expect(notice?.text).toContain(
+        `Update available: ${PACKAGE_NAME} ${PACKAGE_VERSION} -> ${ga}.`,
+      );
+      expect(notice?.text).not.toContain("(stable channel)");
+      expect(notice?.text).not.toContain(`${PACKAGE_NAME}@latest`);
       expect(readCacheFile()["notifiedFor"]).toEqual([`stable:${ga}`]);
     },
   );
